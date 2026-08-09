@@ -18,6 +18,7 @@ describe("session project memory rebinding", () => {
     const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-project-rebind-target-"));
     const previousAgentRoot = process.env.PI_CODING_AGENT_DIR;
     const previousCwd = process.cwd();
+    let mockPi: MockPi | undefined;
     try {
       await fs.writeFile(
         path.join(agentRoot, "hermes-memory-config.json"),
@@ -46,7 +47,7 @@ describe("session project memory rebinding", () => {
       process.chdir(launchDir);
       // Import after setting PI_CODING_AGENT_DIR so AGENT_ROOT is test-local.
       const { default: registerExtension } = await import("../src/index.js");
-      const mockPi: MockPi = {
+      mockPi = {
         handlers: {},
         on(event, handler) {
           (this.handlers[event] ??= []).push(handler);
@@ -60,6 +61,7 @@ describe("session project memory rebinding", () => {
       const beforeAgentStart = mockPi.handlers.before_agent_start?.[0];
       assert.ok(sessionStart);
       assert.ok(beforeAgentStart);
+      assert.ok(mockPi.handlers.session_shutdown?.[0]);
 
       await sessionStart(
         {},
@@ -73,6 +75,11 @@ describe("session project memory rebinding", () => {
       assert.match(result.systemPrompt, /active-session memory/);
       assert.doesNotMatch(result.systemPrompt, /launch-directory memory/);
     } finally {
+      // Teardown is part of the contract: cancel/await deferred backfill before
+      // removing the agent root, otherwise its late DB open races fs.rm.
+      for (const shutdown of mockPi?.handlers.session_shutdown ?? []) {
+        await shutdown({}, { sessionManager: { getSessionFile: () => undefined } });
+      }
       process.chdir(previousCwd);
       if (previousAgentRoot === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentRoot;

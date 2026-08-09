@@ -18,7 +18,7 @@ import {
 import { AGENT_ROOT, normalizeConfiguredMemoryDir, normalizeProjectsMemoryDir } from "./paths.js";
 
 const MEMORY_OVERFLOW_STRATEGIES: readonly MemoryOverflowStrategy[] = ["auto-consolidate", "reject", "fifo-evict"];
-const SESSION_SEARCH_VARIANTS: readonly SessionSearchVariant[] = ["legacy", "anchors"];
+const SESSION_SEARCH_VARIANTS: readonly SessionSearchVariant[] = ["legacy", "structured", "anchors"];
 const REVIEW_TRANSPORTS: readonly ReviewTransport[] = ["direct", "subprocess"];
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 

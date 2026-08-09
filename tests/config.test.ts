@@ -302,7 +302,7 @@ describe("loadConfig", () => {
   it("accepts valid sessionSearch variants", () => {
     fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
 
-    for (const variant of ["legacy", "anchors"] as const) {
+    for (const variant of ["legacy", "structured", "anchors"] as const) {
       fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ sessionSearch: { variant } }));
       const config = loadConfig(TEST_CONFIG_PATH);
       assert.deepStrictEqual(config.sessionSearch, { variant });

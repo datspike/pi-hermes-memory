@@ -19,8 +19,18 @@ type DatabaseLike = {
 
 type DatabaseCtor = new (dbPath: string) => DatabaseLike;
 
+type LockOwner = {
+  lock_key: string;
+  token: string;
+  pid: number;
+  incarnation: string | null;
+  acquired_at: number;
+};
+
 export interface AtomicLockOptions {
   staleMs: number;
+  /** Only recovery reconciliation may reclaim a proven-dead publication row. */
+  reconcileDeadPublication?: boolean;
 }
 
 export interface AtomicLockLease {
@@ -124,72 +134,209 @@ export class AtomicLockCoordinator {
       ?? null;
   }
 
+  private isMutationKey(key: string): boolean {
+    return key.startsWith('mutation:') && key.lastIndexOf(':') > 'mutation:'.length;
+  }
+
+  private isBarrierKey(key: string): boolean {
+    return key.startsWith('recovery:') || key.startsWith('publication:');
+  }
+
+  private barrierResource(key: string): string | null {
+    if (key.startsWith('recovery:')) return key.slice('recovery:'.length);
+    if (key.startsWith('publication:')) return key.slice('publication:'.length);
+    if (this.isMutationKey(key)) return key.slice('mutation:'.length, key.lastIndexOf(':'));
+    return null;
+  }
+
+  private holderIsLive(owner: { pid: number; incarnation: string | null }): boolean {
+    const observedIncarnation = this.probeIncarnation(owner.pid);
+    if (observedIncarnation !== null) {
+      return owner.incarnation === null || owner.incarnation === observedIncarnation;
+    }
+    return processIsAlive(owner.pid);
+  }
+
+  /**
+   * A publication row without an incarnation is not enough evidence to block
+   * recovery forever: its PID may already belong to a successor process. Keep
+   * the conservative holderIsLive path for ordinary owners and mutation
+   * fencing; only journal reconciliation uses this stricter identity rule.
+   */
+  private publicationHolderIsLive(owner: LockOwner): boolean {
+    if (owner.incarnation === null) return false;
+    return this.holderIsLive(owner);
+  }
+
+  /** Acquire a short-lived mutation lease for one exact filesystem resource. */
+  acquireMutation(resource: string, options: AtomicLockOptions): AtomicLockLease | null {
+    return this.acquireResource('mutation', resource, options);
+  }
+
+  /** Acquire the recovery barrier, reclaiming dead mutation owners in the same transaction. */
+  acquireRecovery(resource: string, options: AtomicLockOptions): AtomicLockLease | null {
+    return this.acquireResource('recovery', resource, options);
+  }
+
+  /** Acquire recovery while explicitly reconciling a validated publication journal. */
+  acquireRecoveryForReconciliation(resource: string, options: AtomicLockOptions): AtomicLockLease | null {
+    return this.acquireResource('recovery', resource, { ...options, reconcileDeadPublication: true });
+  }
+
+  /** Acquire publication only as a token-fenced transition from the current recovery owner. */
+  acquirePublication(resource: string, recoveryToken: string, options: AtomicLockOptions): AtomicLockLease | null {
+    return this.acquireResource('publication', resource, options, recoveryToken);
+  }
+
   tryAcquire(key: string, options: AtomicLockOptions): AtomicLockLease | null {
+    if (this.isMutationKey(key)) {
+      const resource = key.slice('mutation:'.length, key.lastIndexOf(':'));
+      return this.acquireResourceWithKey('mutation', resource, key, options);
+    }
+    if (key.startsWith('recovery:')) return this.acquireRecovery(key.slice('recovery:'.length), options);
+    if (key.startsWith('publication:')) {
+      // Publication lineage is deliberately explicit. Never infer another
+      // process's recovery token from the lock database.
+      return null;
+    }
+    return this.acquireGeneric(key, options);
+  }
+
+  private acquireResource(
+    kind: 'mutation' | 'recovery' | 'publication',
+    resource: string,
+    options: AtomicLockOptions,
+    recoveryToken?: string,
+  ): AtomicLockLease | null {
+    const key = kind === 'mutation' ? `mutation:${resource}:${randomUUID()}` : `${kind}:${resource}`;
+    return this.acquireResourceWithKey(kind, resource, key, options, recoveryToken);
+  }
+
+  private acquireResourceWithKey(
+    kind: 'mutation' | 'recovery' | 'publication',
+    resource: string,
+    key: string,
+    options: AtomicLockOptions,
+    recoveryToken?: string,
+  ): AtomicLockLease | null {
+    if (kind === 'mutation') this.retryPendingMutationReleases(resource);
+    else this.retryPendingReleases(key);
+    if (kind !== 'mutation') this.retryPendingReleases(`publication:${resource}`);
+    const token = randomUUID();
+    const now = Date.now();
+    const db = this.open();
+    this.sweepDeadLocks(db, now);
+    let acquired = false;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const owner = db.prepare('SELECT token, pid, incarnation, acquired_at FROM locks WHERE lock_key = ?').get(key) as LockOwner | undefined;
+      const recovery = db.prepare('SELECT token, pid, incarnation, acquired_at FROM locks WHERE lock_key = ?').get(`recovery:${resource}`) as LockOwner | undefined;
+      const publication = db.prepare('SELECT token, pid, incarnation, acquired_at FROM locks WHERE lock_key = ?').get(`publication:${resource}`) as LockOwner | undefined;
+      const mutationRows = db.prepare("SELECT lock_key, token, pid, incarnation, acquired_at FROM locks WHERE lock_key GLOB 'mutation:*'").all() as LockOwner[];
+      const mutations = mutationRows.filter((row) => row.lock_key.startsWith(`mutation:${resource}:`));
+      const liveMutations = mutations.filter((row) => this.holderIsLive(row));
+      const liveRecovery = recovery ? this.holderIsLive(recovery) : false;
+      const livePublication = publication ? this.holderIsLive(publication) : false;
+      const reconciliationPublicationLive = publication ? this.publicationHolderIsLive(publication) : false;
+
+      if (kind === 'mutation') {
+        // A pending publication journal is itself a durable fence. It can remain
+        // after the publication row is lost, so normal writes must wait for
+        // startup reconciliation rather than mutate a generation that may be
+        // replaced by the candidate.
+        const pendingPublication = fs.existsSync(`${resource}.publication-state.json`);
+        // Dead publication is deliberately retained: only recovery reconciliation
+        // may clear it, so a normal write cannot enter a half-published window.
+        if (!pendingPublication && !liveRecovery && !livePublication && !publication && (!owner || !this.holderIsLive(owner))) {
+          if (owner) db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(key, owner.token);
+          db.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)')
+            .run(key, token, this.pid, this.incarnation, now);
+          acquired = true;
+        }
+      } else if (kind === 'recovery') {
+        for (const row of mutations) {
+          if (!this.holderIsLive(row)) db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(row.lock_key, row.token);
+        }
+        const unknownLivePublicationNeedsGrace = Boolean(
+          publication
+          && publication.incarnation === null
+          && processIsAlive(publication.pid)
+          && options.staleMs > 0
+          && now - publication.acquired_at < options.staleMs,
+        );
+        const publicationCanBeReclaimed = Boolean(
+          options.reconcileDeadPublication
+          && publication
+          && !reconciliationPublicationLive
+          && !unknownLivePublicationNeedsGrace,
+        );
+        if ((!publication || publicationCanBeReclaimed) && liveMutations.length === 0 && (!recovery || !liveRecovery || (options.staleMs > 0 && now - recovery.acquired_at >= options.staleMs))) {
+          if (publicationCanBeReclaimed) {
+            db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(`publication:${resource}`, publication!.token);
+          }
+          if (recovery) db.prepare('UPDATE locks SET token = ?, pid = ?, incarnation = ?, acquired_at = ? WHERE lock_key = ? AND token = ?').run(token, this.pid, this.incarnation, now, key, recovery.token);
+          else db.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)').run(key, token, this.pid, this.incarnation, now);
+          acquired = true;
+        }
+      } else if (
+        recovery
+        && recovery.token === recoveryToken
+        && recovery.pid === this.pid
+        && recovery.incarnation === this.incarnation
+        && liveRecovery
+        && !publication
+      ) {
+        // Publication CAS is bound to the exact recovery owner identity, not
+        // merely to a token copied from another process.
+        db.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)')
+          .run(key, token, this.pid, this.incarnation, now);
+        acquired = true;
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { this.discardCachedDb(); }
+      throw error;
+    }
+    return acquired ? { token, release: () => this.release(key, token), renew: () => this.renew(key, token) } : null;
+  }
+
+  private acquireGeneric(key: string, options: AtomicLockOptions): AtomicLockLease | null {
     this.retryPendingReleases(key);
     const token = randomUUID();
     const now = Date.now();
     const db = this.open();
     this.sweepDeadLocks(db, now);
     let acquired = false;
-
     db.exec('BEGIN IMMEDIATE');
     try {
-      const owner = db.prepare(`
-          SELECT token, pid, incarnation, acquired_at
-          FROM locks
-          WHERE lock_key = ?
-        `).get(key) as { token: string; pid: number; incarnation: string | null; acquired_at: number } | undefined;
-
-        if (!owner) {
-          db.prepare(`
-            INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at)
-            VALUES (?, ?, ?, ?, ?)
-          `).run(key, token, this.pid, this.incarnation, now);
-          acquired = true;
-        } else {
-          const observedIncarnation = this.probeIncarnation(owner.pid);
-          const alive = observedIncarnation !== null || processIsAlive(owner.pid);
-          const sameIncarnation = alive
-            && owner.incarnation !== null
-            && observedIncarnation !== null
-            && owner.incarnation === observedIncarnation;
-          const unknownIncarnation = alive && (owner.incarnation === null || observedIncarnation === null);
-          // A lease is reclaimable once it has been held for longer than staleMs,
-          // regardless of whether the owning process is still alive — it may be
-          // making no progress (blocked I/O, wedged, suspended) rather than dead.
-          // This is the sole backstop for that case: liveness/incarnation checks
-          // alone cannot distinguish "alive and working" from "alive and stuck".
-          // staleMs <= 0 disables time-based takeover (liveness checks only).
-          const stale = options.staleMs > 0 && now - owner.acquired_at >= options.staleMs;
-          if (stale || (!sameIncarnation && !unknownIncarnation)) {
-            db.prepare(`
-              UPDATE locks
-              SET token = ?, pid = ?, incarnation = ?, acquired_at = ?
-              WHERE lock_key = ? AND token = ?
-            `).run(token, this.pid, this.incarnation, now, key, owner.token);
-            acquired = true;
-          }
-        }
-
-        db.exec('COMMIT');
-    } catch (error) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        // The transaction is still open on a connection we are about to hand
-        // to the next caller, whose BEGIN IMMEDIATE would then fail forever.
-        // Drop the handle so open() rebuilds it.
-        this.discardCachedDb();
+      const owner = db.prepare('SELECT token, pid, incarnation, acquired_at FROM locks WHERE lock_key = ?').get(key) as LockOwner | undefined;
+      if (!owner) {
+        db.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)').run(key, token, this.pid, this.incarnation, now);
+        acquired = true;
+      } else if (!this.holderIsLive(owner) || (options.staleMs > 0 && now - owner.acquired_at >= options.staleMs)) {
+        db.prepare('UPDATE locks SET token = ?, pid = ?, incarnation = ?, acquired_at = ? WHERE lock_key = ? AND token = ?').run(token, this.pid, this.incarnation, now, key, owner.token);
+        acquired = true;
       }
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { this.discardCachedDb(); }
       throw error;
     }
+    return acquired ? { token, release: () => this.release(key, token), renew: () => this.renew(key, token) } : null;
+  }
 
-    if (!acquired) return null;
-    return {
-      token,
-      release: () => this.release(key, token),
-      renew: () => this.renew(key, token),
-    };
+  private readOwner(key: string): LockOwner | undefined {
+    return this.open().prepare('SELECT token, pid, incarnation, acquired_at FROM locks WHERE lock_key = ?').get(key) as LockOwner | undefined;
+  }
+
+  /** Read only whether an active publication row exists for startup fencing. */
+  hasPublication(resource: string): boolean {
+    return Boolean(this.readOwner(`publication:${resource}`));
+  }
+
+  /** Read only whether the recovery barrier is currently held. */
+  hasRecovery(resource: string): boolean {
+    return Boolean(this.readOwner(`recovery:${resource}`));
   }
 
   /**
@@ -206,6 +353,26 @@ export class AtomicLockCoordinator {
     const db = this.open();
     const row = db.prepare('SELECT token FROM locks WHERE lock_key = ?').get(key) as { token: string } | undefined;
     return row?.token === token;
+  }
+
+  /**
+   * Execute a destructive filesystem action while the ownership row is held by
+   * an IMMEDIATE transaction. This closes the check-then-act window: a stale
+   * takeover cannot commit until the rename/remove has finished.
+   */
+  withCurrentOwner<T>(key: string, token: string, action: () => T): T {
+    const db = this.open();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = db.prepare('SELECT token FROM locks WHERE lock_key = ?').get(key) as { token: string } | undefined;
+      if (row?.token !== token) throw new Error(`SQLite recovery lease lost for ${key}`);
+      const result = action();
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { this.discardCachedDb(); }
+      throw error;
+    }
   }
 
   /**
@@ -281,7 +448,7 @@ export class AtomicLockCoordinator {
           pid: number;
           acquired_at: number;
         }>;
-      const dead = rows.filter((row) => this.holderIsGone(row.pid));
+      const dead = rows.filter((row) => !row.lock_key.startsWith('publication:') && this.holderIsGone(row.pid));
       if (dead.length === 0) return;
       const remove = db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ? AND acquired_at = ?');
       for (const row of dead) {
@@ -302,6 +469,13 @@ export class AtomicLockCoordinator {
 
   private retryPendingReleases(key: string): void {
     const prefix = `${path.resolve(this.dbPath)}\0${key}\0`;
+    for (const [pendingKey, release] of [...pendingReleases.entries()]) {
+      if (pendingKey.startsWith(prefix)) release();
+    }
+  }
+
+  private retryPendingMutationReleases(resource: string): void {
+    const prefix = `${path.resolve(this.dbPath)}\0mutation:${resource}:`;
     for (const [pendingKey, release] of [...pendingReleases.entries()]) {
       if (pendingKey.startsWith(prefix)) release();
     }

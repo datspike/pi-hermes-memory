@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { DatabaseManager } from '../store/db.js';
-import { searchSessions, getIndexedMessageCount } from '../store/session-search.js';
+import { searchSessionEvidence, searchSessions, getIndexedMessageCount, SESSION_SEARCH_EVIDENCE_MAX_BYTES } from '../store/session-search.js';
 import { searchSessionAnchors } from '../store/session-anchor-search.js';
 import type { SessionAnchorRange, SessionAnchorSearchResult } from '../store/session-anchor-search.js';
 import type { SessionSearchConfig } from '../types.js';
@@ -25,6 +25,7 @@ interface SearchResult {
 
 interface SessionSearchToolOptions {
   sessionsDir?: string;
+  currentSessionId?: string | (() => string | undefined);
 }
 
 const DEFAULT_SESSIONS_DIR = path.join(AGENT_ROOT, 'sessions');
@@ -59,8 +60,12 @@ export function registerSessionSearchTool(
     registerAnchorSessionSearchTool(pi, options.sessionsDir ?? DEFAULT_SESSIONS_DIR);
     return;
   }
+  if (sessionSearchConfig.variant === 'structured') {
+    registerStructuredSessionSearchTool(pi, dbManager, options);
+    return;
+  }
 
-  registerLegacySessionSearchTool(pi, dbManager);
+  registerLegacySessionSearchTool(pi, dbManager, options.sessionsDir);
 }
 
 function registerAnchorSessionSearchTool(pi: ExtensionAPI, sessionsDir: string): void {
@@ -143,7 +148,87 @@ function compactReason(reason: string | undefined): string {
   return oneLine.length <= 180 ? oneLine : `${oneLine.slice(0, 177)}...`;
 }
 
-function registerLegacySessionSearchTool(pi: ExtensionAPI, dbManager: DatabaseManager): void {
+function registerStructuredSessionSearchTool(pi: ExtensionAPI, dbManager: DatabaseManager, options: SessionSearchToolOptions): void {
+  pi.registerTool({
+    name: 'session_search',
+    label: 'Session Search',
+    description: 'Search canonical Pi session JSONL evidence. Results contain stable session_id and entry_id anchors that can be opened later with session_get. Current-session, service, and tool-output rows are opt-in.',
+    promptSnippet: 'Search past sessions for canonical structured evidence',
+    promptGuidelines: [
+      'Use this mode when exact session evidence and an entry anchor are needed.',
+      'Pass includeCurrentSession, includeService, or includeToolOutput explicitly when those rows are required.',
+      'Use session_id for an exact ID or a bounded, unambiguous prefix; do not guess among ambiguous prefixes.',
+    ],
+    renderResult: createSharedToolResultRenderer(searchResultView),
+    parameters: Type.Object({
+      query: Type.String({ description: 'Search terms.' }),
+      session_id: Type.Optional(Type.String({ description: 'Exact session ID or an unambiguous prefix.' })),
+      project: Type.Optional(Type.String({ description: 'Filter by project.' })),
+      role: Type.Optional(StringEnum(['user', 'assistant', 'system'] as const)),
+      since: Type.Optional(Type.String({ description: 'ISO timestamp lower bound.' })),
+      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
+      include_current_session: Type.Optional(Type.Boolean()),
+      include_service: Type.Optional(Type.Boolean()),
+      include_tool_output: Type.Optional(Type.Boolean()),
+      snippet_chars: Type.Optional(Type.Number({ minimum: 80, maximum: 4000 })),
+    }),
+    execute: async (_id: string, args: { query: string; session_id?: string; project?: string; role?: string; since?: string; limit?: number; include_current_session?: boolean; include_service?: boolean; include_tool_output?: boolean; snippet_chars?: number }) => {
+      if (!args.query?.trim()) {
+        const result: SearchResult = { success: false, message: 'query is required' };
+        return { content: [{ type: 'text' as const, text: result.message! }], details: result };
+      }
+      const currentSessionId = typeof options.currentSessionId === 'function' ? options.currentSessionId() : options.currentSessionId;
+      let outcome: ReturnType<typeof searchSessionEvidence>;
+      try {
+        outcome = searchSessionEvidence(dbManager, args.query, {
+          sessionId: args.session_id, project: args.project, role: args.role, since: args.since, limit: args.limit, sessionsDir: options.sessionsDir,
+          currentSessionId, includeCurrentSession: args.include_current_session === true, includeService: args.include_service === true,
+          includeToolOutput: args.include_tool_output === true, snippetChars: args.snippet_chars,
+        });
+      } catch (error) {
+        if (error instanceof Error && (error.name === 'SessionEvidenceUnavailableError' || (error as Error & { code?: string }).code === 'SESSION_EVIDENCE_UNAVAILABLE' || /migration pending|evidence unavailable/i.test(error.message))) {
+          const result = { success: false, error: 'session_evidence_unavailable' };
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], details: result };
+        }
+        throw error;
+      }
+      if (outcome.ambiguousSessionIds.length > 0) {
+        const candidates: string[] = [];
+        for (const candidate of outcome.ambiguousSessionIds) {
+          const next = [...candidates, candidate];
+          const candidateText = JSON.stringify({ error: 'ambiguous_session_id', count: next.length, candidates: next });
+          if (Buffer.byteLength(candidateText, 'utf8') > SESSION_SEARCH_EVIDENCE_MAX_BYTES) break;
+          candidates.push(candidate);
+        }
+        const message = JSON.stringify({ error: 'ambiguous_session_id', count: candidates.length, candidates });
+        return { content: [{ type: 'text' as const, text: message }], details: { success: false, count: candidates.length, candidates } };
+      }
+      const lines = outcome.results.map((e) => JSON.stringify({
+        session_id: e.sessionId, entry_id: e.entryId, project: e.project, cwd: e.cwd, name: e.name,
+        role: e.role, kind: e.kind, tool: e.tool, tool_call_id: e.tool_call_id, timestamp: e.timestamp, snippet: e.snippet,
+        score: e.score, score_mode: e.scoreMode, anchor: e.anchor,
+      }));
+      let output = '';
+      let count = 0;
+      for (const line of lines) {
+        const candidate = output ? `${output}\n${line}` : line;
+        if (Buffer.byteLength(candidate, 'utf8') > SESSION_SEARCH_EVIDENCE_MAX_BYTES) break;
+        output = candidate;
+        count += 1;
+      }
+      const details = {
+        success: true,
+        count,
+        outputBytes: Buffer.byteLength(output, 'utf8'),
+        outputTruncated: count < lines.length,
+        sessionIds: [...new Set(outcome.results.slice(0, count).map((entry) => entry.sessionId))],
+      };
+      return { content: [{ type: 'text' as const, text: output || 'No results found.' }], details };
+    },
+  });
+}
+
+function registerLegacySessionSearchTool(pi: ExtensionAPI, dbManager: DatabaseManager, sessionsDir?: string): void {
   pi.registerTool({
     name: 'session_search',
     label: 'Session Search',
@@ -192,13 +277,23 @@ Returns bounded conversation snippets with session dates and project context. La
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
+      try {
+        dbManager.assertSessionEvidenceAvailable();
+      } catch (error) {
+        if (error instanceof Error && (error.name === 'SessionEvidenceUnavailableError' || (error as Error & { code?: string }).code === 'SESSION_EVIDENCE_UNAVAILABLE' || /migration pending|evidence unavailable/i.test(error.message))) {
+          const result = { success: false, error: 'session_evidence_unavailable' } as const;
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], details: result };
+        }
+        throw error;
+      }
+
       const totalMessages = getIndexedMessageCount(dbManager);
       if (totalMessages === 0) {
         const result: SearchResult = { success: false, message: 'No sessions indexed yet. Run /memory-index-sessions to import past sessions.' };
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
-      const results = searchSessions(dbManager, query, { project, role, limit });
+      const results = searchSessions(dbManager, query, { project, role, limit, sessionsDir });
 
       if (results.length === 0) {
         const output = capLegacyOutput('No results found. Try a different search term or broader query.');

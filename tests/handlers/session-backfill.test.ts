@@ -69,7 +69,7 @@ describe('session backfill handler', () => {
     assert.equal(dbManager.getStats().messages, 1);
   });
 
-  it('does not schedule backfill when counts match and timestamp is recent', () => {
+  it('still schedules metadata discovery when the completion watermark is recent', async () => {
     writeJsonlSession(sessionsDir, 'project-a', 's1');
     indexAllSessions(dbManager, sessionsDir);
     touchBackfillTimestamp(dbManager);
@@ -84,8 +84,10 @@ describe('session backfill handler', () => {
       },
     });
 
-    assert.equal(scheduled, false);
-    assert.equal(callbacks.length, 0);
+    assert.equal(scheduled, true);
+    assert.equal(callbacks.length, 1);
+    callbacks[0]();
+    await state.promise;
     assert.equal(state.inProgress, false);
   });
 
@@ -162,6 +164,153 @@ describe('session backfill handler', () => {
     assert.equal(state.inProgress, false);
     assert.match(notifications[0].message, /Session backfill failed: boom/);
     assert.equal(notifications[0].level, 'warning');
+  });
+
+  it('coalesces repeated startup requests into one in-flight backfill', async () => {
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    const callbacks: (() => void)[] = [];
+    let runs = 0;
+    const options = {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: () => { runs++; return { sessionsProcessed: 0, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, errors: [] }; },
+      setTimeoutFn: (callback: () => void) => { callbacks.push(callback); return 0; },
+    };
+    assert.equal(scheduleSessionBackfill(dbManager, sessionsDir, options), true);
+    assert.equal(scheduleSessionBackfill(dbManager, sessionsDir, options), false);
+    callbacks[0]();
+    await state.promise;
+    assert.equal(runs, 1);
+  });
+
+  it('does not touch the completion watermark after an indexing error', async () => {
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    let touched = false;
+    const scheduled = scheduleSessionBackfill(dbManager, sessionsDir, {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: () => ({ sessionsProcessed: 1, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, errors: ['broken file'] }),
+      touchBackfillTimestampFn: () => { touched = true; },
+      setTimeoutFn: (callback) => { queueMicrotask(callback); return 0; },
+    });
+
+    assert.equal(scheduled, true);
+    await state.promise;
+    assert.equal(touched, false);
+  });
+
+  it('does not watermark deferred oversized files', async () => {
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    let touched = false;
+    const scheduled = scheduleSessionBackfill(dbManager, sessionsDir, {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: () => ({ sessionsProcessed: 0, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, errors: [], partial: true, deferredFiles: 1 }),
+      touchBackfillTimestampFn: () => { touched = true; },
+      setTimeoutFn: (callback) => { queueMicrotask(callback); return 0; },
+    });
+
+    assert.equal(scheduled, true);
+    await state.promise;
+    assert.equal(touched, false);
+  });
+
+  it('aborts bounded backfill on shutdown timeout before any late DB use', async () => {
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    let observedAbort = false;
+    const scheduled = scheduleSessionBackfill(dbManager, sessionsDir, {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: async (_db, _dir, { signal }) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        observedAbort = signal?.aborted ?? false;
+        return { sessionsProcessed: 0, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, errors: [], aborted: observedAbort, partial: observedAbort };
+      },
+      setTimeoutFn: (callback) => { queueMicrotask(callback); return 0; },
+    });
+
+    assert.equal(scheduled, true);
+    assert.equal(await waitForSessionBackfill(1, state), false);
+    await state.promise;
+    assert.equal(observedAbort, true);
+  });
+
+  it('does not perform final metadata writes after shutdown aborts the task', async () => {
+    const realDb = dbManager;
+    let postAbortDbUse = false;
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    const guarded = {
+      getDb: () => {
+        if (state.abortController?.signal.aborted) {
+          postAbortDbUse = true;
+          throw new Error('database use after abort');
+        }
+        return realDb.getDb();
+      },
+      withCorruptionRecovery: <T>(operation: () => T): T => operation(),
+    } as unknown as DatabaseManager;
+    let resolveIndex!: () => void;
+    const scheduled = scheduleSessionBackfill(guarded, sessionsDir, {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: async () => {
+        await new Promise<void>((resolve) => { resolveIndex = resolve; });
+        state.abortController?.abort();
+        return { sessionsProcessed: 0, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, errors: [] };
+      },
+      touchBackfillTimestampFn: () => { postAbortDbUse = true; },
+      setTimeoutFn: (callback) => { queueMicrotask(callback); return 0; },
+    });
+    assert.equal(scheduled, true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    resolveIndex();
+    await state.promise;
+    assert.equal(postAbortDbUse, false);
+  });
+
+  it('keeps session_start synchronous work bounded to DB eligibility and timer scheduling', () => {
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    let timerScheduled = false;
+    const scheduled = scheduleSessionBackfill(dbManager, sessionsDir, {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: () => ({ sessionsProcessed: 0, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, errors: [] }),
+      setTimeoutFn: (callback) => { timerScheduled = true; return callback as unknown as number; },
+    });
+
+    assert.equal(scheduled, true);
+    assert.equal(timerScheduled, true);
+    assert.equal(dbManager.getStats().sessions, 0);
+    state.abortController?.abort();
+  });
+
+  it('cancels a queued backfill before its timer can create late DB activity', async () => {
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+    let queued!: () => void;
+    let indexRuns = 0;
+    const scheduled = scheduleSessionBackfill(dbManager, sessionsDir, {
+      state,
+      needsBackfillQuickFn: () => true,
+      indexSessionsFn: () => {
+        indexRuns++;
+        throw new Error('late indexer invocation after teardown');
+      },
+      setTimeoutFn: (callback) => {
+        queued = callback;
+        return 0;
+      },
+    });
+
+    assert.equal(scheduled, true);
+    const task = state.promise;
+    assert.ok(task);
+    assert.equal(await waitForSessionBackfill(1, state), false);
+    // A faulty timer harness may still deliver the callback after cancellation;
+    // the handler must make that callback a no-op rather than reopen SQLite.
+    queued();
+    await task;
+    assert.equal(indexRuns, 0);
+    assert.equal(state.inProgress, false);
   });
 
   it('shutdown wait resolves true when an in-progress backfill completes before timeout', async () => {

@@ -1,7 +1,9 @@
 import type { DatabaseManager } from '../store/db.js';
 import {
   indexChangedSessions,
+  indexChangedSessionsBounded,
   needsBackfill,
+  needsBackfillQuick,
   touchBackfillTimestamp,
   type BulkIndexResult,
 } from '../store/session-indexer.js';
@@ -13,10 +15,13 @@ type NotifyLevel = 'info' | 'warning' | 'error';
 type NotifyFn = (message: string, level: NotifyLevel) => void;
 
 type SetTimeoutFn = (callback: () => void, ms: number) => unknown;
+type ClearTimeoutFn = (handle: unknown) => void;
 
 export interface SessionBackfillState {
   inProgress: boolean;
   promise: Promise<void> | null;
+  abortController?: AbortController;
+  cancel?: () => void;
 }
 
 export const sessionBackfillState: SessionBackfillState = {
@@ -29,7 +34,8 @@ export interface ScheduleSessionBackfillOptions {
   state?: SessionBackfillState;
   setTimeoutFn?: SetTimeoutFn;
   needsBackfillFn?: typeof needsBackfill;
-  indexSessionsFn?: typeof indexChangedSessions;
+  needsBackfillQuickFn?: typeof needsBackfillQuick;
+  indexSessionsFn?: typeof indexChangedSessions | typeof indexChangedSessionsBounded | ((dbManager: DatabaseManager, sessionsDir: string, options: { maxFilesToIndex: number; signal?: AbortSignal }) => BulkIndexResult | Promise<BulkIndexResult>);
   maxFilesToIndex?: number;
   touchBackfillTimestampFn?: typeof touchBackfillTimestamp;
 }
@@ -37,7 +43,9 @@ export interface ScheduleSessionBackfillOptions {
 function formatBackfillResult(result: BulkIndexResult): string {
   const errorSuffix = result.errors.length > 0 ? ` (${result.errors.length} file error${result.errors.length === 1 ? '' : 's'})` : '';
   const limitSuffix = result.reachedLimit ? ' (startup limit reached)' : '';
-  return `🧠 Session backfill complete: ${result.sessionsIndexed} indexed, ${result.sessionsSkipped} skipped, ${result.messagesIndexed} messages${errorSuffix}${limitSuffix}.`;
+  const deferredSuffix = result.deferredFiles ? ` (${result.deferredFiles} file${result.deferredFiles === 1 ? '' : 's'} deferred)` : '';
+  const partialSuffix = result.partial || result.aborted ? ' (incomplete)' : '';
+  return `🧠 Session backfill complete: ${result.sessionsIndexed} indexed, ${result.sessionsSkipped} skipped, ${result.messagesIndexed} messages${errorSuffix}${limitSuffix}${deferredSuffix}${partialSuffix}.`;
 }
 
 function notifyBestEffort(notify: NotifyFn | undefined, message: string, level: NotifyLevel): void {
@@ -64,8 +72,10 @@ export function scheduleSessionBackfill(
 ): boolean {
   const state = options.state ?? sessionBackfillState;
   const setTimeoutFn = options.setTimeoutFn ?? setTimeout;
+  const clearTimeoutFn: ClearTimeoutFn = (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>);
   const needsBackfillFn = options.needsBackfillFn ?? needsBackfill;
-  const indexSessionsFn = options.indexSessionsFn ?? indexChangedSessions;
+  const needsBackfillQuickFn = options.needsBackfillQuickFn ?? needsBackfillQuick;
+  const indexSessionsFn = options.indexSessionsFn ?? indexChangedSessionsBounded;
   const maxFilesToIndex = options.maxFilesToIndex ?? SESSION_BACKFILL_MAX_FILES;
   const touchBackfillTimestampFn = options.touchBackfillTimestampFn ?? touchBackfillTimestamp;
 
@@ -74,7 +84,7 @@ export function scheduleSessionBackfill(
   }
 
   try {
-    if (!needsBackfillFn(dbManager, sessionsDir)) {
+    if (options.needsBackfillFn ? !needsBackfillFn(dbManager, sessionsDir) : !needsBackfillQuickFn(dbManager)) {
       return false;
     }
   } catch (err) {
@@ -87,12 +97,32 @@ export function scheduleSessionBackfill(
   }
 
   state.inProgress = true;
+  const abortController = new AbortController();
+  state.abortController = abortController;
+  let timer: unknown;
+  let timerPending = true;
+  let resolveTask!: () => void;
+  let cancelled = false;
+  const finish = (): void => {
+    state.inProgress = false;
+    state.promise = null;
+    state.abortController = undefined;
+    state.cancel = undefined;
+    resolveTask();
+  };
   state.promise = new Promise<void>((resolve) => {
-    setTimeoutFn(() => {
+    resolveTask = resolve;
+    const run = async (): Promise<void> => {
+      timerPending = false;
+      if (cancelled) {
+        finish();
+        return;
+      }
       try {
-        const result = indexSessionsFn(dbManager, sessionsDir, { maxFilesToIndex });
-        if (!result.reachedLimit) touchBackfillTimestampFn(dbManager);
-        notifyBestEffort(options.notify, formatBackfillResult(result), result.errors.length > 0 || result.reachedLimit ? 'warning' : 'info');
+        const result = await indexSessionsFn(dbManager, sessionsDir, { maxFilesToIndex, signal: abortController.signal });
+        const complete = !result.partial && !result.aborted && !result.reachedLimit && !result.deferredFiles && result.errors.length === 0;
+        if (complete && !abortController.signal.aborted) touchBackfillTimestampFn(dbManager);
+        notifyBestEffort(options.notify, formatBackfillResult(result), complete ? 'info' : 'warning');
       } catch (err) {
         notifyBestEffort(
           options.notify,
@@ -100,12 +130,20 @@ export function scheduleSessionBackfill(
           'warning',
         );
       } finally {
-        state.inProgress = false;
-        state.promise = null;
-        resolve();
+        finish();
       }
-    }, 0);
+    };
+    timer = setTimeoutFn(() => { void run(); }, 0);
   });
+  state.cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    abortController.abort();
+    if (timerPending) {
+      clearTimeoutFn(timer);
+      finish();
+    }
+  };
 
   return true;
 }
@@ -130,7 +168,10 @@ export async function waitForSessionBackfill(
     return await Promise.race([
       promise.then(() => true),
       new Promise<boolean>((resolve) => {
-        timeout = setTimeout(() => resolve(false), timeoutMs);
+        timeout = setTimeout(() => {
+          state.cancel?.();
+          resolve(false);
+        }, timeoutMs);
       }),
     ]);
   } finally {

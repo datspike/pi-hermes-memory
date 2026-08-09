@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { DatabaseManager } from '../../src/store/db.js';
-import { indexSession } from '../../src/store/session-indexer.js';
-import { searchSessions, getIndexedMessageCount } from '../../src/store/session-search.js';
+import { indexLiveSession, indexSession } from '../../src/store/session-indexer.js';
+import { searchSessionEvidence, searchSessions, getIndexedMessageCount } from '../../src/store/session-search.js';
 import type { ParsedSession } from '../../src/store/session-parser.js';
 
 describe('session-search', () => {
@@ -249,6 +249,107 @@ describe('session-search', () => {
 
     it('should return empty for blank queries', () => {
       assert.deepStrictEqual(searchSessions(dbManager, '   '), []);
+    });
+  });
+
+  describe('searchSessionEvidence', () => {
+    function canonicalFile(id: string, content: string, cwd = '/canonical/project'): string {
+      const file = path.join(tmpDir, `${id}.jsonl`);
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'session', id, cwd, timestamp: '2026-05-03T00:00:00Z' }),
+        JSON.stringify({ type: 'message', id: `${id}-entry`, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content } }),
+      ].join('\n') + '\n');
+      return file;
+    }
+
+    it('returns full evidence identity, metadata, anchor and higher-is-better score', () => {
+      const file = canonicalFile('evidence-session', 'canonical needle 😀');
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'evidence-session', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      const result = searchSessionEvidence(dbManager, 'needle');
+      assert.strictEqual(result.results.length, 1);
+      const hit = result.results[0];
+      assert.strictEqual(hit.anchor, 'pi://session/evidence-session#entry=evidence-session-entry');
+      assert.strictEqual(hit.entryId, 'evidence-session-entry');
+      assert.strictEqual(hit.cwd, '/canonical/project');
+      assert.strictEqual(hit.kind, 'message');
+      assert.ok(Number.isFinite(hit.score));
+      assert.ok(hit.scoreMode === 'bm25' || hit.scoreMode === 'like');
+      assert.ok(hit.snippet.includes('needle'));
+    });
+
+    it('filters canonical eligibility before limit and only includes the exact current session by opt-in', () => {
+      const lowerFile = canonicalFile('canonical-lower', 'needle');
+      const currentFile = canonicalFile('current-session', 'needle needle');
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'canonical-lower', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => lowerFile });
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'current-session', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => currentFile });
+      indexSession(dbManager, { id: 'live-top', project: 'live', cwd: '/live', startedAt: '2026-05-03T00:00:00Z', endedAt: null, messages: [{ id: 'live-entry', role: 'user', content: 'needle needle needle needle', timestamp: '2026-05-03T00:02:00Z' }] });
+      const canonicalOnly = searchSessionEvidence(dbManager, 'needle', { limit: 1, currentSessionId: 'current-session' });
+      assert.deepStrictEqual(canonicalOnly.results.map((hit) => hit.sessionId), ['canonical-lower']);
+      const withCurrent = searchSessionEvidence(dbManager, 'needle', { sessionId: 'current-session', limit: 1, includeCurrentSession: true, currentSessionId: 'current-session' });
+      assert.strictEqual(withCurrent.results.some((hit) => hit.sessionId === 'current-session'), true);
+      const unrelated = searchSessionEvidence(dbManager, 'needle', { limit: 10, includeCurrentSession: true, currentSessionId: 'current-session' });
+      assert.strictEqual(unrelated.results.some((hit) => hit.sessionId === 'live-top'), false);
+    });
+
+    it('rejects ambiguous prefixes and supports exact IDs plus project/role/since parity', () => {
+      for (const id of ['prefix-one', 'prefix-two']) {
+        const file = canonicalFile(id, 'needle', `/work/${id}`);
+        indexLiveSession(dbManager, { getHeader: () => ({ id, cwd: `/work/${id}`, timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      }
+      const ambiguous = searchSessionEvidence(dbManager, 'needle', { sessionId: 'prefix-' });
+      assert.deepStrictEqual(ambiguous.results, []);
+      assert.deepStrictEqual(ambiguous.ambiguousSessionIds, ['prefix-one', 'prefix-two']);
+      const exact = searchSessionEvidence(dbManager, 'needle', { sessionId: 'prefix-one', project: 'prefix-one', role: 'user', since: '2026-05-03T00:00:00Z' });
+      assert.strictEqual(exact.results.length, 1);
+      assert.strictEqual(exact.results[0].sessionId, 'prefix-one');
+    });
+
+    it('keeps service metadata excluded, including consolidation names, while blank-cleared ordinary names remain searchable', () => {
+      const serviceFile = canonicalFile('service-session', 'needle service', '/service');
+      const ordinaryFile = canonicalFile('ordinary-session', 'needle ordinary', '/ordinary');
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'service-session', cwd: '/service', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => serviceFile });
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'ordinary-session', cwd: '/ordinary', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => ordinaryFile });
+      dbManager.getDb().prepare('UPDATE sessions SET name = ? WHERE id = ?').run('consolidation service', 'service-session');
+      dbManager.getDb().prepare('UPDATE sessions SET name = NULL WHERE id = ?').run('ordinary-session');
+      const defaultResults = searchSessionEvidence(dbManager, 'needle');
+      // Privacy classification is authoritative from the current JSONL; stale
+      // SQLite-only session names must not hide or expose evidence.
+      assert.strictEqual(defaultResults.results.some((hit) => hit.sessionId === 'service-session'), true);
+      assert.strictEqual(defaultResults.results.some((hit) => hit.sessionId === 'ordinary-session'), true);
+      assert.strictEqual(searchSessionEvidence(dbManager, 'needle', { includeService: true }).results.some((hit) => hit.sessionId === 'service-session'), true);
+    });
+
+    it('keeps tool output excluded by default and exposes it only with an explicit opt-in', () => {
+      const file = path.join(tmpDir, 'tool-session.jsonl');
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'session', id: 'tool-session', cwd: '/tool', timestamp: '2026-05-03T00:00:00Z' }),
+        JSON.stringify({ type: 'message', id: 'tool-entry', timestamp: '2026-05-03T00:01:00Z', message: { role: 'assistant', content: [{ type: 'toolCall', name: 'shell' }, { type: 'text', text: 'needle tool output' }] } }),
+      ].join('\n') + '\n');
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'tool-session', cwd: '/tool', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      assert.deepStrictEqual(searchSessionEvidence(dbManager, 'needle').results, []);
+      assert.strictEqual(searchSessionEvidence(dbManager, 'needle', { includeToolOutput: true }).results.length, 1);
+    });
+
+    it('centers a tail match and preserves Unicode boundaries', () => {
+      const file = canonicalFile('emoji-session', `${'😀'.repeat(60)} prefix ${'x'.repeat(60)} needle tail`);
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'emoji-session', cwd: '/emoji', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      const hit = searchSessionEvidence(dbManager, 'needle', { snippetChars: 80 }).results[0];
+      assert.ok(hit);
+      assert.strictEqual(hit.snippet, `…prefix ${'x'.repeat(60)} needle tail`);
+      assert.ok([...hit.snippet].length <= 80);
+      assert.match(hit.snippet, /needle/);
+      assert.doesNotMatch(hit.snippet, /\\uD800|\\uDC00/);
+    });
+
+    it('treats changed canonical JSONL content as authoritative over stale SQLite rows', () => {
+      const file = canonicalFile('stale-session', 'needle from the old index');
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'stale-session', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'session', id: 'stale-session', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }),
+        JSON.stringify({ type: 'message', id: 'stale-session-entry', timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: 'canonical replacement' } }),
+      ].join('\\n') + '\\n');
+      const result = searchSessionEvidence(dbManager, 'needle');
+      assert.deepStrictEqual(result.results, []);
     });
   });
 

@@ -71,6 +71,25 @@ describe('DatabaseManager', () => {
   }
 
   describe('initialization', () => {
+    it('supports valid multi-statement exec scripts without replaying them', () => {
+      const db = dbManager.getDb();
+      assert.doesNotThrow(() => db.exec('CREATE TABLE script_fixture (value TEXT); INSERT INTO script_fixture VALUES (\'ok\');'));
+      assert.deepStrictEqual(db.prepare('SELECT value FROM script_fixture').get(), { value: 'ok' });
+    });
+
+    it('fails closed when only WAL sidecars remain without the canonical database', () => {
+      const db = dbManager.getDb();
+      db.prepare('CREATE TABLE sidecar_state (value TEXT)').run();
+      db.prepare('INSERT INTO sidecar_state VALUES (?)').run('kept');
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      fs.writeFileSync(`${dbPath}-wal`, 'sidecar-only');
+      fs.writeFileSync(`${dbPath}-shm`, 'sidecar-only');
+      fs.rmSync(dbPath);
+      assert.throws(() => new DatabaseManager(tmpDir).getDb(), /sidecar|canonical|main file|temporarily absent/i);
+      assert.equal(fs.existsSync(dbPath), false);
+    });
+
     it('should create database file on first getDb() call', () => {
       assert.strictEqual(dbManager.exists(), false);
       const db = dbManager.getDb();
@@ -276,6 +295,13 @@ describe('DatabaseManager', () => {
       migratedManager.close();
     });
 
+    it('does not use an unbounded sessions count during schema initialization', () => {
+      const db = dbManager.getDb();
+      const plan = db.prepare('EXPLAIN QUERY PLAN SELECT 1 FROM sessions LIMIT 1').all() as Array<{ detail: string }>;
+      assert.ok(plan.every((row) => !/COUNT\s*\(/i.test(row.detail)));
+      assert.equal((db.prepare('SELECT 1 FROM sessions LIMIT 1').get() as { 1: number } | undefined), undefined);
+    });
+
     it('should migrate legacy memories table without project column', () => {
       const dbPath = path.join(tmpDir, 'sessions.db');
       const legacyDb = new Database(dbPath);
@@ -355,6 +381,197 @@ describe('DatabaseManager', () => {
     });
   });
 
+  describe('publication journal recovery', () => {
+    it('fails closed on a tampered journal path without moving artifacts', () => {
+      dbManager.getDb();
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const journalPath = `${dbPath}.publication-state.json`;
+      const backupBase = `${dbPath}.corrupt-test-${process.pid}`;
+      fs.writeFileSync(journalPath, JSON.stringify({
+        version: 1,
+        canonicalPath: dbPath,
+        recoveryToken: 'owner-token',
+        phase: 'temp-verified',
+        tempPath: path.join(tmpDir, '..', 'outside.tmp'),
+        backupBase,
+        plannedSuffixes: [''],
+        movedSuffixes: [],
+      }), { mode: 0o600 });
+      const before = fs.readFileSync(dbPath);
+      assert.throws(() => new DatabaseManager(tmpDir).getDb(), /publication journal.*invalid/i);
+      assert.deepEqual(fs.readFileSync(dbPath), before);
+      assert.equal(fs.existsSync(backupBase), false);
+      assert.equal(fs.existsSync(journalPath), true);
+    });
+
+    it('reconciles a dead publication journal and preserves each source row once', () => {
+      const db = dbManager.getDb();
+      db.prepare('INSERT INTO sessions (id, project, cwd, started_at) VALUES (?, ?, ?, ?)')
+        .run('journal-session', 'project', '/tmp/project', '2026-08-09T00:00:00Z');
+      db.prepare('INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)')
+        .run('journal-message', 'journal-session', 'user', 'journal row', '2026-08-09T00:01:00Z');
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const tempPath = `${dbPath}.rebuild-fixture-${process.pid}.tmp`;
+      const backupBase = `${dbPath}.corrupt-fixture-${process.pid}`;
+      fs.copyFileSync(dbPath, tempPath);
+      fs.writeFileSync(`${dbPath}.publication-state.json`, JSON.stringify({
+        version: 1,
+        canonicalPath: dbPath,
+        recoveryToken: 'old-recovery-token',
+        phase: 'temp-verified',
+        tempPath,
+        backupBase,
+        plannedSuffixes: [''],
+        movedSuffixes: [],
+      }), { mode: 0o600 });
+      const lockDb = new Database(path.join(tmpDir, '.pi-hermes-locks.sqlite'));
+      lockDb.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)')
+        .run(`publication:${dbPath}`, 'dead-publication', 999999, null, Date.now());
+      lockDb.close();
+
+      dbManager = new DatabaseManager(tmpDir);
+      const reopened = dbManager.getDb();
+      assert.equal(fs.existsSync(`${dbPath}.publication-state.json`), false);
+      assert.equal((reopened.prepare('SELECT COUNT(*) AS count FROM sessions WHERE id = ?').get('journal-session') as { count: number }).count, 1);
+      assert.equal((reopened.prepare('SELECT COUNT(*) AS count FROM messages WHERE entry_id = ?').get('journal-message') as { count: number }).count, 1);
+    });
+  });
+
+  describe('publication crash matrix', () => {
+    for (const stage of [
+      'after-source-rename',
+      'before-canonical-rename',
+      'after-published-phase',
+      'after-verified-before-release',
+      'after-publication-release-before-journal-delete',
+    ]) {
+      it(`reconciles a deterministic publication interruption at ${stage}`, () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-matrix-'));
+        let manager = new DatabaseManager(dir);
+        try {
+          const db = manager.getDb();
+          db.prepare('INSERT INTO sessions (id, project, cwd, started_at) VALUES (?, ?, ?, ?)').run('matrix-session', 'project', '/tmp/project', '2026-08-09T00:00:00Z');
+          db.prepare('INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)').run('matrix-message', 'matrix-session', 'user', 'matrix row', '2026-08-09T00:01:00Z');
+          manager.close();
+          corruptRecoverableIndexPage(path.join(dir, 'sessions.db'), 'idx_messages_timestamp');
+          manager = new DatabaseManager(dir);
+          let interrupted = false;
+          (manager as any).publicationFaultHook = (observed: string) => {
+            if (!interrupted && observed === stage) {
+              interrupted = true;
+              throw new Error(`fixture crash at ${stage}`);
+            }
+          };
+          assert.throws(() => manager.recoverFromCorruption(corruptSqliteError()), /fixture crash/);
+          assert.equal(fs.existsSync(path.join(dir, 'sessions.db.publication-state.json')), true);
+          (manager as any).publicationFaultHook = null;
+          manager.close();
+          manager = new DatabaseManager(dir);
+          const recovered = manager.getDb();
+          assert.equal(fs.existsSync(path.join(dir, 'sessions.db.publication-state.json')), false);
+          assert.equal((recovered.prepare('SELECT COUNT(*) AS count FROM sessions WHERE id = ?').get('matrix-session') as { count: number }).count, 1);
+          assert.equal((recovered.prepare('SELECT COUNT(*) AS count FROM messages WHERE entry_id = ?').get('matrix-message') as { count: number }).count, 1);
+        } finally {
+          manager.close();
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it('preserves an incomplete journal and never creates an empty canonical database', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-incomplete-'));
+      let manager = new DatabaseManager(dir);
+      try {
+        manager.getDb();
+        manager.close();
+        const dbPath = path.join(dir, 'sessions.db');
+        const journalPath = `${dbPath}.publication-state.json`;
+        fs.writeFileSync(journalPath, JSON.stringify({
+          version: 1, canonicalPath: dbPath, recoveryToken: 'old-token', phase: 'quarantine',
+          tempPath: `${dbPath}.rebuild-incomplete.tmp`, backupBase: `${dbPath}.corrupt-incomplete`,
+          plannedSuffixes: [''], movedSuffixes: [],
+        }), { mode: 0o600 });
+        const locks = new Database(path.join(dir, '.pi-hermes-locks.sqlite'));
+        locks.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)').run(`publication:${dbPath}`, 'dead-pub', 999999, null, Date.now());
+        locks.close();
+        manager = new DatabaseManager(dir, { recoveryLockWaitMs: 25, recoveryLockPollMs: 1 });
+        assert.throws(() => manager.getDb(), /suffix is missing|insufficient backups|publication/);
+        assert.equal(fs.existsSync(journalPath), true);
+        assert.equal(fs.statSync(dbPath).size > 0, true);
+      } finally {
+        manager.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed on a dead publication row when no journal exists', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-no-journal-'));
+      let manager = new DatabaseManager(dir);
+      try {
+        manager.getDb();
+        manager.close();
+        const dbPath = path.join(dir, 'sessions.db');
+        const locks = new Database(path.join(dir, '.pi-hermes-locks.sqlite'));
+        locks.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)').run(`publication:${dbPath}`, 'dead-pub', 999999, null, Date.now());
+        locks.close();
+        manager = new DatabaseManager(dir, { recoveryLockWaitMs: 10, recoveryLockPollMs: 1 });
+        assert.throws(() => manager.getDb(), /unverifiable publication|publication/);
+        assert.throws(() => manager.recoverFromCorruption(corruptSqliteError()), /timed out|publication/);
+        assert.equal(fs.existsSync(`${dbPath}.publication-state.json`), false);
+      } finally {
+        manager.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('restores a complete planned backup set when candidate and canonical are missing', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-restore-'));
+      let manager = new DatabaseManager(dir);
+      try {
+        const db = manager.getDb();
+        db.prepare('INSERT INTO sessions (id, project, cwd, started_at) VALUES (?, ?, ?, ?)').run('restore-session', 'project', '/tmp/project', '2026-08-09T00:00:00Z');
+        manager.close();
+        const dbPath = path.join(dir, 'sessions.db');
+        const tempPath = `${dbPath}.rebuild-restore.tmp`;
+        const backupBase = `${dbPath}.corrupt-restore`;
+        fs.renameSync(dbPath, backupBase);
+        fs.writeFileSync(`${dbPath}.publication-state.json`, JSON.stringify({
+          version: 1, canonicalPath: dbPath, recoveryToken: 'old-token', phase: 'quarantine',
+          tempPath, backupBase, plannedSuffixes: [''], movedSuffixes: [],
+        }), { mode: 0o600 });
+        const locks = new Database(path.join(dir, '.pi-hermes-locks.sqlite'));
+        locks.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, ?, ?)').run(`publication:${dbPath}`, 'dead-pub', 999999, null, Date.now());
+        locks.close();
+        manager = new DatabaseManager(dir);
+        const restored = manager.getDb();
+        assert.equal((restored.prepare('SELECT COUNT(*) AS count FROM sessions WHERE id=?').get('restore-session') as { count: number }).count, 1);
+        assert.equal(fs.existsSync(`${dbPath}.publication-state.json`), false);
+      } finally {
+        manager.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('returns deterministic moved backup paths after successful publication', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-backups-'));
+      try {
+        dbManager.getDb();
+        dbManager.close();
+        fs.writeFileSync(path.join(dir, 'sessions.db'), 'not a sqlite database');
+        const recoveryManager = new DatabaseManager(dir);
+        const result = recoveryManager.recoverFromCorruption(corruptSqliteError());
+        assert.ok(result.backupPaths.length >= 1);
+        assert.ok(result.backupPaths.every((backup) => fs.existsSync(backup)));
+        recoveryManager.close();
+      } finally {
+        dbManager.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('corruption recovery', () => {
     it('waits for a recovery owner and reuses the healthy database it leaves behind', () => {
       dbManager.getDb();
@@ -412,40 +629,25 @@ describe('DatabaseManager', () => {
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
       dbManager = new DatabaseManager(tmpDir, { recoveryLockStaleMs: 60_000 });
 
-      type MoveDatabaseFilesToBackup = (this: DatabaseManager, backupBase: string) => unknown;
-      const prototype = DatabaseManager.prototype as unknown as {
-        moveDatabaseFilesToBackup: MoveDatabaseFilesToBackup;
-      };
-      const originalMove = prototype.moveDatabaseFilesToBackup;
-      let moveCalls = 0;
-      prototype.moveDatabaseFilesToBackup = function (this: DatabaseManager, backupBase: string) {
-        moveCalls++;
-        if (moveCalls === 1) {
+      const originalHook = (dbManager as any).publicationFaultHook;
+      let hookCalls = 0;
+      (dbManager as any).publicationFaultHook = (stage: string) => {
+        if (stage === 'before-source-rename') {
+          hookCalls++;
           const canonicalDbPath = fs.realpathSync(path.join(tmpDir, 'sessions.db'));
           const lockDbPath = path.join(path.dirname(canonicalDbPath), '.pi-hermes-locks.sqlite');
           const lockKey = `recovery:${canonicalDbPath}`;
           const lockDb = new Database(lockDbPath);
-          try {
-            lockDb.prepare('UPDATE locks SET acquired_at = ? WHERE lock_key = ?').run(Date.now() - 100_000, lockKey);
-          } finally {
-            lockDb.close();
-          }
-          const thief = new AtomicLockCoordinator(lockDbPath);
-          const stolen = thief.tryAcquire(lockKey, { staleMs: 50 });
-          assert.ok(stolen);
-          stolen.release();
+          try { lockDb.prepare('UPDATE locks SET token = ? WHERE lock_key = ?').run('stolen-by-test', lockKey); }
+          finally { lockDb.close(); }
         }
-        return originalMove.call(this, backupBase);
       };
 
       try {
-        assert.throws(
-          () => dbManager.getDb(),
-          /SQLite recovery lease lost/,
-        );
-        assert.strictEqual(moveCalls, 1);
+        assert.throws(() => dbManager.getDb(), /SQLite recovery lease lost/);
+        assert.strictEqual(hookCalls, 1);
       } finally {
-        prototype.moveDatabaseFilesToBackup = originalMove;
+        (dbManager as any).publicationFaultHook = originalHook;
       }
     });
 
@@ -614,7 +816,7 @@ describe('DatabaseManager', () => {
       let deleteAttempts = 0;
       prototype.deleteOwnedLock = function (key: string, token: string): void {
         deleteAttempts++;
-        if (deleteAttempts <= 3) throw new Error('injected recovery release failure');
+        if (deleteAttempts <= 2) throw new Error('injected recovery release failure');
         return originalDeleteOwnedLock.call(this, key, token);
       };
 
@@ -631,7 +833,7 @@ describe('DatabaseManager', () => {
         dbManager = new DatabaseManager(tmpDir);
         assert.doesNotThrow(() => dbManager.getDb());
         assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'recreated-empty');
-        assert.ok(deleteAttempts >= 4);
+        assert.ok(deleteAttempts >= 3);
       } finally {
         prototype.deleteOwnedLock = originalDeleteOwnedLock;
       }
@@ -692,7 +894,7 @@ describe('DatabaseManager', () => {
       assert.doesNotThrow(() => dbManager.getDb());
     });
 
-    it('repairs recoverable corruption on open and preserves readable rows', () => {
+    it('repairs recoverable corruption on explicit recovery and preserves readable rows', () => {
       const db = dbManager.getDb();
       db.prepare(`
         INSERT INTO sessions (id, project, cwd, started_at)
@@ -716,11 +918,14 @@ describe('DatabaseManager', () => {
       corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
 
       dbManager = new DatabaseManager(tmpDir);
+      assert.doesNotThrow(() => dbManager.getDb());
+      assert.strictEqual(dbManager.getLastRecovery(), null);
+      dbManager.recoverFromCorruption(corruptSqliteError());
       const repairedDb = dbManager.getDb();
 
       assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
       assert.deepStrictEqual(dbManager.getLastRecovery()?.recoveredRows, {
-        extension_metadata: 0,
+        extension_metadata: 1,
         sessions: 1,
         messages: 50,
         session_files: 0,
@@ -760,6 +965,74 @@ describe('DatabaseManager', () => {
       assert.strictEqual(result, 'ok');
       assert.strictEqual(attempts, 2);
       assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'reused');
+    });
+  });
+
+  describe('explicit integrity checks', () => {
+    it('does not run quick_check or integrity_check during a normal open of an existing database', () => {
+      dbManager.getDb();
+      dbManager.close();
+
+      const prototype = DatabaseManager.prototype as unknown as {
+        assertIntegrityOk: (...args: unknown[]) => void;
+      };
+      const original = prototype.assertIntegrityOk;
+      let checks = 0;
+      prototype.assertIntegrityOk = function (...args: unknown[]) {
+        checks++;
+        return original.apply(this, args);
+      };
+      try {
+        const reopened = new DatabaseManager(tmpDir);
+        reopened.getDb();
+        reopened.close();
+        assert.strictEqual(checks, 0);
+      } finally {
+        prototype.assertIntegrityOk = original;
+      }
+    });
+
+    it('runs full integrity_check explicitly and keeps connection configuration', () => {
+      const db = dbManager.getDb();
+      assert.strictEqual(db.pragma?.('foreign_keys', { simple: true }), 1);
+      assert.strictEqual(db.pragma?.('journal_mode', { simple: true }), 'wal');
+      assert.doesNotThrow(() => dbManager.checkIntegrity());
+    });
+
+    it('recovers latent corruption only for an explicit integrity check and rechecks the final generation', () => {
+      const db = dbManager.getDb();
+      db.prepare('INSERT INTO sessions (id, project, cwd, started_at) VALUES (?, ?, ?, ?)')
+        .run('latent-session', 'project', '/tmp/project', '2026-08-09T00:00:00Z');
+      db.prepare('INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)')
+        .run('latent-message', 'latent-session', 'user', 'preserve me', '2026-08-09T00:01:00Z');
+      dbManager.close();
+      corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
+
+      dbManager = new DatabaseManager(tmpDir);
+      assert.doesNotThrow(() => dbManager.getDb());
+      assert.strictEqual(dbManager.getLastRecovery(), null);
+      assert.throws(() => dbManager.checkIntegrity(), /database disk image is malformed|SQLite integrity_check failed/);
+      const recovery = dbManager.recoverFromCorruption(new Error('SQLite integrity_check failed'));
+      assert.strictEqual(recovery.strategy, 'rebuilt');
+      assert.strictEqual(recovery.status, 'healthy');
+      assert.doesNotThrow(() => dbManager.checkIntegrity());
+      assert.strictEqual(
+        (dbManager.getDb().prepare('SELECT content FROM messages WHERE session_id = ? AND entry_id = ?').get('latent-session', 'latent-message') as { content: string }).content,
+        'preserve me',
+      );
+      assert.match(
+        (dbManager.getDb().prepare('SELECT id FROM messages WHERE session_id = ? AND entry_id = ?').get('latent-session', 'latent-message') as { id: string }).id,
+        /^idx:v1:/,
+      );
+    });
+
+    it('marks unrecoverable recreation as degraded', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
+      dbManager = new DatabaseManager(tmpDir);
+      const result = dbManager.recoverFromCorruption(new Error('SQLite integrity_check failed'));
+      assert.strictEqual(result.strategy, 'recreated-empty');
+      assert.strictEqual(result.status, 'degraded');
     });
   });
 

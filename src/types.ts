@@ -6,7 +6,26 @@ import type { TextContent } from "@earendil-works/pi-ai";
 
 export type MemoryOverflowStrategy = "auto-consolidate" | "reject" | "fifo-evict";
 
-export type SessionSearchVariant = "legacy" | "anchors";
+export type SessionSearchVariant = "legacy" | "structured" | "anchors";
+
+export type SessionEntryKind = "message" | "tool_call" | "tool_result" | "session_info" | "structural" | "unknown";
+export type SessionEntryIdentityStatus = "native" | "synthetic" | "ambiguous" | "unresolvable";
+
+/** Canonical identity and graph metadata shared by disk and live session parsing. */
+export interface LogicalSessionEntry {
+  entryId?: string | null;
+  storageId?: string | null;
+  identityStatus?: SessionEntryIdentityStatus;
+  kind?: SessionEntryKind;
+  parentEntryId?: string | null;
+  ordinal?: number;
+  timestamp?: string | null;
+  role?: "user" | "assistant" | "system" | null;
+  toolName?: string | null;
+  toolCallId?: string | null;
+  payload?: string | null;
+  diagnostics?: string[];
+}
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -50,7 +69,7 @@ export interface MemoryConfig {
   memoryDir?: string;
   /** Directory for project-scoped memory (relative to ~/.pi/agent). Default: "projects-memory" */
   projectsMemoryDir?: string;
-  /** Session search configuration. Default: { variant: "legacy" } */
+  /** Session search configuration. Default: { variant: "structured" } */
   sessionSearch?: SessionSearchConfig;
   /** Override model used for child pi -p subprocess LLM calls. Default: unset */
   llmModelOverride?: string;
@@ -121,6 +140,16 @@ export interface MemoryMutationOperation {
 export interface MemorySnapshot {
   memory: string;
   user: string;
+}
+
+export interface SessionGraphDiagnostics {
+  malformedLines?: number;
+  nulLines?: number;
+  duplicateStructuralIds?: string[];
+  cycles?: string[][];
+  orphanParents?: string[];
+  multipleDescendantLeaves?: string[];
+  messages?: string[];
 }
 
 export interface ConsolidationResult {

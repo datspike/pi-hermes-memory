@@ -205,6 +205,67 @@ describe('AtomicLockCoordinator', () => {
     }
   });
 
+  it('reconciles a stale publication row with unknown incarnation without weakening live mutation fencing', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    try {
+      const resource = path.join(tmpDir, 'sessions.db');
+      const lockPath = path.join(tmpDir, 'locks.sqlite');
+      const owner = new AtomicLockCoordinator(lockPath, { pid: process.pid, incarnation: undefined, probeIncarnation: () => null });
+      const publication = owner.tryAcquire(`publication:${resource}`, { staleMs: 0 });
+      assert.equal(publication, null, 'publication requires an explicit recovery lineage');
+
+      const raw = new Database(lockPath);
+      raw.exec(`CREATE TABLE IF NOT EXISTS locks (lock_key TEXT PRIMARY KEY, token TEXT NOT NULL, pid INTEGER NOT NULL, incarnation TEXT, acquired_at INTEGER NOT NULL)`);
+      raw.prepare('INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at) VALUES (?, ?, ?, NULL, ?)').run(`publication:${resource}`, 'unknown-publication', process.pid, Date.now() - 120_000);
+      raw.close();
+
+      const coordinator = new AtomicLockCoordinator(lockPath, { pid: process.pid, incarnation: 'successor', probeIncarnation: () => null });
+      assert.ok(coordinator.acquireRecoveryForReconciliation(resource, { staleMs: 60_000 }));
+      assert.equal(coordinator.acquireMutation(resource, { staleMs: 0 }), null);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not acquire a mutation while a publication journal is pending', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    try {
+      const resource = path.join(tmpDir, 'sessions.db');
+      fs.writeFileSync(`${resource}.publication-state.json`, '{}');
+      const coordinator = new AtomicLockCoordinator(path.join(tmpDir, 'locks.sqlite'));
+      assert.equal(coordinator.acquireMutation(resource, { staleMs: 0 }), null);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries a failed mutation release against the original ownership row', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalDeleteOwnedLock = prototype.deleteOwnedLock;
+    let deleteAttempts = 0;
+    prototype.deleteOwnedLock = function (key: string, token: string): void {
+      deleteAttempts++;
+      if (deleteAttempts <= 3) throw new Error('injected release failure');
+      return originalDeleteOwnedLock.call(this, key, token);
+    };
+    try {
+      const dbPath = path.join(tmpDir, 'locks.sqlite');
+      const coordinator = new AtomicLockCoordinator(dbPath);
+      const resource = path.join(tmpDir, 'sessions.db');
+      const first = coordinator.acquireMutation(resource, { staleMs: 60_000 });
+      assert.ok(first);
+      first.release();
+      const second = coordinator.acquireMutation(resource, { staleMs: 60_000 });
+      assert.ok(second, 'pending release must be retried before generating a new mutation key');
+      assert.equal(deleteAttempts, 4);
+      second.release();
+    } finally {
+      prototype.deleteOwnedLock = originalDeleteOwnedLock;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('retries a failed owner release before the next same-process acquisition', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
     const prototype = AtomicLockCoordinator.prototype as any;

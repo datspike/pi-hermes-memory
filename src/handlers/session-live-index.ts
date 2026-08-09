@@ -24,6 +24,7 @@ export interface ScheduleLiveSessionIndexOptions {
   indexLiveSessionFn?: typeof indexLiveSession;
   delayMs?: number;
   onError?: (error: unknown) => void;
+  sessionsDir?: string;
 }
 
 /**
@@ -53,7 +54,7 @@ export function scheduleLiveSessionIndex(
     setTimeoutFn(() => {
       try {
         dbManager.withCorruptionRecovery(() => {
-          indexLiveSessionFn(dbManager, sessionManager);
+          indexLiveSessionFn(dbManager, sessionManager, options.sessionsDir);
         });
       } catch (err) {
         try { options.onError?.(err); } catch { /* best effort */ }

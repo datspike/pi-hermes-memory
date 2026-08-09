@@ -338,7 +338,7 @@ export function parseMarkdownMemoryEntry(
  * Idempotently sync a Markdown-backed memory entry into SQLite.
  * Duplicate identity is exact: project + target + category + content.
  */
-export function syncMemoryEntry(
+function syncMemoryEntryOnce(
   dbManager: DatabaseManager,
   input: SqliteMemorySyncInput,
 ): SqliteMemorySyncResult {
@@ -419,6 +419,13 @@ export function syncMemoryEntry(
     action: 'existing',
     entry: getMemoryById(dbManager, existing.id)!,
   };
+}
+
+/** Keep lookup, insert/update, and returned-row read in one recovery-fenced mutation. */
+export function syncMemoryEntry(dbManager: DatabaseManager, input: SqliteMemorySyncInput): SqliteMemorySyncResult {
+  const db = dbManager.getDb();
+  const transaction = db.transaction?.(() => syncMemoryEntryOnce(dbManager, input));
+  return transaction ? transaction() : syncMemoryEntryOnce(dbManager, input);
 }
 
 /**
@@ -530,7 +537,7 @@ export function reconcileMarkdownFailureScopes(
  * Best-effort substring replacement for SQLite-backed memory sync.
  * Updates all matches in the scoped slice to recover from prior duplicate rows.
  */
-export function replaceSyncedMemories(
+function replaceSyncedMemoriesOnce(
   dbManager: DatabaseManager,
   oldText: string,
   updates: {
@@ -606,11 +613,18 @@ export function replaceSyncedMemories(
   };
 }
 
+/** Keep matching, all row updates, and result reads in one transaction. */
+export function replaceSyncedMemories(dbManager: DatabaseManager, oldText: string, updates: Parameters<typeof replaceSyncedMemoriesOnce>[2]): SqliteMemoryUpdateResult {
+  const db = dbManager.getDb();
+  const transaction = db.transaction?.(() => replaceSyncedMemoriesOnce(dbManager, oldText, updates));
+  return transaction ? transaction() : replaceSyncedMemoriesOnce(dbManager, oldText, updates);
+}
+
 /**
  * Best-effort substring removal for SQLite-backed memory sync.
  * Deletes all matches in the scoped slice to recover from prior duplicate rows.
  */
-export function removeSyncedMemories(
+function removeSyncedMemoriesOnce(
   dbManager: DatabaseManager,
   oldText: string,
   options: SqliteMemoryRemoveOptions,
@@ -643,12 +657,19 @@ export function removeSyncedMemories(
   };
 }
 
+/** Keep matching and deletion atomic across recovery generations. */
+export function removeSyncedMemories(dbManager: DatabaseManager, oldText: string, options: SqliteMemoryRemoveOptions): SqliteMemoryRemoveResult {
+  const db = dbManager.getDb();
+  const transaction = db.transaction?.(() => removeSyncedMemoriesOnce(dbManager, oldText, options));
+  return transaction ? transaction() : removeSyncedMemoriesOnce(dbManager, oldText, options);
+}
+
 /**
  * Exact removal for Markdown entries whose full content is known.
  * Used for FIFO eviction cleanup, where substring matching could remove
  * unrelated SQLite mirror rows that merely contain the evicted text.
  */
-export function removeExactSyncedMemories(
+function removeExactSyncedMemoriesOnce(
   dbManager: DatabaseManager,
   content: string,
   options: SqliteMemoryRemoveOptions,
@@ -677,6 +698,13 @@ export function removeExactSyncedMemories(
     matched: matchingIds.length,
     removed: result.changes,
   };
+}
+
+/** Keep exact matching and deletion atomic across recovery generations. */
+export function removeExactSyncedMemories(dbManager: DatabaseManager, content: string, options: SqliteMemoryRemoveOptions): SqliteMemoryRemoveResult {
+  const db = dbManager.getDb();
+  const transaction = db.transaction?.(() => removeExactSyncedMemoriesOnce(dbManager, content, options));
+  return transaction ? transaction() : removeExactSyncedMemoriesOnce(dbManager, content, options);
 }
 
 /**

@@ -24,7 +24,9 @@ export const SCHEMA_SQL = `
     cwd TEXT NOT NULL,
     started_at TEXT NOT NULL,
     ended_at TEXT,
-    message_count INTEGER DEFAULT 0
+    message_count INTEGER DEFAULT 0,
+    name TEXT,
+    title TEXT
   );
 
   -- Indexed session file metadata for cheap incremental backfill
@@ -38,12 +40,20 @@ export const SCHEMA_SQL = `
 
   -- All messages from all sessions
   CREATE TABLE IF NOT EXISTS messages (
+    -- Physical key; logical identity is entry_id and is scoped by session_id.
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id),
+    entry_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    kind TEXT NOT NULL DEFAULT 'message',
+    parent_entry_id TEXT,
+    ordinal INTEGER NOT NULL DEFAULT 0,
     content TEXT NOT NULL,
     timestamp TEXT NOT NULL,
-    tool_calls TEXT
+    tool_calls TEXT,
+    tool_name TEXT,
+    tool_call_id TEXT,
+    diagnostics TEXT
   );
 
   -- FTS5 index for full-text search across messages
@@ -54,16 +64,19 @@ export const SCHEMA_SQL = `
     content_rowid='rowid'
   );
 
-  -- Triggers to keep message_fts in sync with messages table
+  -- Triggers to keep message_fts in sync with messages table and provide the
+  -- stable identity defaults required by direct/native inserts.
   CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO message_fts(rowid, content) VALUES (new.rowid, new.content);
+    UPDATE messages SET entry_id = COALESCE(new.entry_id, new.id) WHERE rowid = new.rowid AND entry_id IS NULL;
+    INSERT INTO message_fts(rowid, content) SELECT rowid, content FROM messages WHERE rowid = new.rowid;
   END;
 
   CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO message_fts(message_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
   END;
 
-  CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+  CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+  WHEN old.content IS NOT new.content BEGIN
     INSERT INTO message_fts(message_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
     INSERT INTO message_fts(rowid, content) VALUES (new.rowid, new.content);
   END;

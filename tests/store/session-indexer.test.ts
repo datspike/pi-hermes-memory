@@ -8,6 +8,7 @@ import {
   indexSession,
   indexAllSessions,
   indexChangedSessions,
+  indexChangedSessionsBounded,
   getSessionStats,
   countSessionFiles,
   needsBackfill,
@@ -17,6 +18,10 @@ import {
   indexLiveSession,
   parseSessionManagerSnapshot,
   upsertSessionFileMetadata,
+  setSessionIndexerFaultInjector,
+  BACKFILL_MAX_FILE_BYTES,
+  SESSION_BACKFILL_SCAN_CURSOR_KEY,
+  SESSION_BACKFILL_DEFERRED_KEY,
 } from '../../src/store/session-indexer.js';
 import { parseSessionFile, type ParsedSession } from '../../src/store/session-parser.js';
 
@@ -30,6 +35,7 @@ describe('session-indexer', () => {
   });
 
   afterEach(() => {
+    setSessionIndexerFaultInjector();
     dbManager.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -76,7 +82,7 @@ describe('session-indexer', () => {
       indexSession(dbManager, session);
 
       const db = dbManager.getDb();
-      const msg = db.prepare('SELECT tool_calls FROM messages WHERE id = ?').get('session-1-msg-2') as { tool_calls: string | null };
+      const msg = db.prepare('SELECT tool_calls FROM messages WHERE session_id = ? AND entry_id = ?').get('session-1', 'session-1-msg-2') as { tool_calls: string | null };
       assert.ok(msg.tool_calls);
       assert.deepStrictEqual(JSON.parse(msg.tool_calls), ['read']);
     });
@@ -147,6 +153,108 @@ describe('session-indexer', () => {
       assert.strictEqual(result.sessionsIndexed, 1);
       assert.strictEqual(result.messagesIndexed, 1);
       assert.strictEqual(result.errors.length, 0);
+    });
+
+    it('removes stale entries on same-file canonical rewrite while preserving unchanged physical IDs', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project', 's1.jsonl');
+      const write = (ids: string[]) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, [
+          JSON.stringify({ type: 'session', id: 's1', timestamp: '2026-05-03T00:00:00Z', cwd: '/test/project' }),
+          ...ids.map((id, index) => JSON.stringify({ type: 'message', id, parentId: null, timestamp: `2026-05-03T00:0${index + 1}:00Z`, message: { role: 'user', content: [{ type: 'text', text: id }] } })),
+        ].join('\n'));
+      };
+      write(['keep', 'stale']);
+      indexAllSessions(dbManager, sessionsDir);
+      const before = dbManager.getDb().prepare('SELECT id FROM messages WHERE session_id = ? AND entry_id = ?').get('s1', 'keep') as { id: string };
+      write(['keep', 'fresh']);
+      indexAllSessions(dbManager, sessionsDir);
+      const rows = dbManager.getDb().prepare('SELECT entry_id, id FROM messages WHERE session_id = ? ORDER BY ordinal').all('s1') as Array<{ entry_id: string; id: string }>;
+      assert.deepStrictEqual(rows.map((row) => row.entry_id), ['keep', 'fresh']);
+      assert.equal(rows[0].id, before.id);
+    });
+
+    it('removes disappeared files but keeps a valid older owner for the same session', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const write = (filePath: string, id: string, messageId: string) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, [
+          JSON.stringify({ type: 'session', id, timestamp: '2026-05-03T00:00:00Z', cwd: '/test/project' }),
+          JSON.stringify({ type: 'message', id: messageId, parentId: null, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: [{ type: 'text', text: messageId }] } }),
+        ].join('\n'));
+      };
+      const older = path.join(sessionsDir, 'project', 'older.jsonl');
+      const newer = path.join(sessionsDir, 'project', 'newer.jsonl');
+      write(older, 'shared', 'older-entry');
+      write(newer, 'shared', 'newer-entry');
+      indexAllSessions(dbManager, sessionsDir);
+      fs.rmSync(newer);
+      indexAllSessions(dbManager, sessionsDir);
+      const rows = dbManager.getDb().prepare('SELECT entry_id FROM messages WHERE session_id = ?').all('shared') as Array<{ entry_id: string }>;
+      assert.deepStrictEqual(rows.map((row) => row.entry_id), ['older-entry']);
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM session_files WHERE session_id = ?').get('shared') as { count: number }).count, 1);
+    });
+
+    it('transfers a reused path and purges the former owner only when it has no paths', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project', 'reused.jsonl');
+      const write = (id: string, messageId: string) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, [
+          JSON.stringify({ type: 'session', id, timestamp: '2026-05-03T00:00:00Z', cwd: '/test/project' }),
+          JSON.stringify({ type: 'message', id: messageId, parentId: null, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: [{ type: 'text', text: messageId }] } }),
+        ].join('\n'));
+      };
+      write('old-owner', 'old-entry');
+      indexAllSessions(dbManager, sessionsDir);
+      write('new-owner', 'new-entry');
+      indexAllSessions(dbManager, sessionsDir);
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM sessions WHERE id = ?').get('old-owner') as { count: number }).count, 0);
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('new-owner') as { count: number }).count, 1);
+    });
+
+    it('rolls back canonical ownership, rows, and purge on injected statement failure', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project', 'atomic.jsonl');
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      const write = (id: string, messageId: string) => fs.writeFileSync(filePath, [
+        JSON.stringify({ type: 'session', id, timestamp: '2026-05-03T00:00:00Z', cwd: '/test/project' }),
+        JSON.stringify({ type: 'message', id: messageId, parentId: null, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: [{ type: 'text', text: messageId }] } }),
+      ].join('\n'));
+      write('atomic-old', 'old-entry');
+      indexAllSessions(dbManager, sessionsDir);
+      write('atomic-new', 'new-entry');
+      setSessionIndexerFaultInjector((statement) => { if (statement === 'upsert-session-file') throw new Error('injected'); });
+      const result = indexAllSessions(dbManager, sessionsDir);
+      assert.equal(result.errors.length, 1);
+      assert.equal((dbManager.getDb().prepare('SELECT session_id FROM session_files WHERE path = ?').get(filePath) as { session_id: string }).session_id, 'atomic-old');
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('atomic-old') as { count: number }).count, 1);
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('atomic-new') as { count: number }).count, 0);
+    });
+
+    it('excludes same-session ambiguous logical IDs instead of last-write-wins', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project', 'ambiguous.jsonl');
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, [
+        JSON.stringify({ type: 'session', id: 'ambiguous', timestamp: '2026-05-03T00:00:00Z', cwd: '/test/project' }),
+        JSON.stringify({ type: 'message', id: 'same', parentId: null, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: [{ type: 'text', text: 'first' }] } }),
+        JSON.stringify({ type: 'message', id: 'same', parentId: null, timestamp: '2026-05-03T00:02:00Z', message: { role: 'user', content: [{ type: 'text', text: 'second' }] } }),
+      ].join('\n'));
+      indexAllSessions(dbManager, sessionsDir);
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('ambiguous') as { count: number }).count, 0);
+    });
+
+    it('does not delete entries absent from a partial live snapshot', () => {
+      indexSession(dbManager, createTestSession({ id: 'partial', messages: [
+        { id: 'present', role: 'user', content: 'present', timestamp: '2026-05-03T00:01:00Z' },
+        { id: 'later', role: 'assistant', content: 'later', timestamp: '2026-05-03T00:02:00Z' },
+      ] }));
+      indexSession(dbManager, createTestSession({ id: 'partial', messages: [
+        { id: 'present', role: 'user', content: 'present', timestamp: '2026-05-03T00:01:00Z' },
+      ] }));
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('partial') as { count: number }).count, 2);
     });
 
     it('should skip already-indexed sessions on re-run', () => {
@@ -300,6 +408,170 @@ describe('session-indexer', () => {
       const indexed = dbManager.getDb().prepare('SELECT id FROM sessions').all() as { id: string }[];
       assert.deepStrictEqual(indexed.map((r) => r.id), ['newer']);
     });
+
+    it('uses one canonical file identity for lexical symlink and realpath aliases', () => {
+      const realRoot = path.join(tmpDir, 'real-sessions');
+      const aliasRoot = path.join(tmpDir, 'alias-sessions');
+      writeJsonlSession(path.join(realRoot, 'project-a', 'alias-session.jsonl'), 'alias-session');
+      fs.symlinkSync(realRoot, aliasRoot, 'dir');
+
+      const first = indexChangedSessions(dbManager, aliasRoot);
+      const second = indexChangedSessions(dbManager, realRoot);
+
+      assert.equal(first.sessionsIndexed, 1);
+      assert.equal(second.sessionsProcessed, 0);
+      assert.equal(second.sessionsSkipped, 1);
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM session_files').get() as { count: number }).count, 1);
+    });
+
+    it('defers an oversized JSONL file and does not write a completion watermark', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project-a', 'large.jsonl');
+      writeJsonlSession(filePath, 'large', ['x'.repeat(BACKFILL_MAX_FILE_BYTES)]);
+      const result = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 1000 });
+
+      assert.equal(result.deferredFiles, 1);
+      assert.equal(result.partial, true);
+      assert.equal(dbManager.getStats().sessions, 0);
+    });
+
+    it('enforces total-byte and wall-clock budgets while yielding between files', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      writeJsonlSession(path.join(sessionsDir, 'project-a', 'one.jsonl'), 'budget-one');
+      writeJsonlSession(path.join(sessionsDir, 'project-a', 'two.jsonl'), 'budget-two');
+      let yields = 0;
+      const totalLimited = await indexChangedSessionsBounded(dbManager, sessionsDir, {
+        maxTotalBytes: 1,
+        maxDurationMs: 1000,
+        yieldFn: async () => { yields++; },
+      });
+      assert.equal(totalLimited.partial, true);
+      assert.equal(totalLimited.deferredFiles, 2);
+      assert.equal(yields >= 2, true);
+
+      const deadlineLimited = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 0 });
+      assert.equal(deadlineLimited.partial, true);
+      assert.equal(deadlineLimited.sessionsProcessed, 0);
+    });
+
+    it('persists a canonical discovery cursor and reaches the tail across deadline-limited starts after reopen', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      for (const id of ['a', 'b', 'c']) writeJsonlSession(path.join(sessionsDir, 'project-a', `${id}.jsonl`), `cursor-${id}`);
+      let yields = 0;
+      const first = await indexChangedSessionsBounded(dbManager, sessionsDir, {
+        maxDurationMs: 50,
+        yieldFn: async () => { if (++yields === 1) await new Promise((resolve) => setTimeout(resolve, 100)); },
+      });
+      assert.equal(first.partial, true);
+      const cursor = dbManager.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(SESSION_BACKFILL_SCAN_CURSOR_KEY) as { value: string };
+      assert.ok(cursor.value);
+      dbManager.close();
+      dbManager = new DatabaseManager(path.join(tmpDir, 'memory'));
+      const second = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 1000 });
+      assert.equal(second.sessionsIndexed >= 2, true);
+      assert.equal(dbManager.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(SESSION_BACKFILL_SCAN_CURSOR_KEY), undefined);
+      assert.equal(dbManager.getStats().sessions, 3);
+    });
+
+    it('remembers stable oversized fingerprints, retries only after change, and leaves manual indexing unbounded', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const largePath = path.join(sessionsDir, 'project-a', 'large.jsonl');
+      writeJsonlSession(largePath, 'deferred-large', ['x'.repeat(BACKFILL_MAX_FILE_BYTES)]);
+      const first = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 1000 });
+      const second = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 1000 });
+      assert.equal(first.deferredFiles, 1);
+      assert.equal(second.deferredFiles, 1);
+      assert.equal(second.sessionsProcessed, 0);
+      assert.match((dbManager.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(SESSION_BACKFILL_DEFERRED_KEY) as { value: string }).value, /large\.jsonl/);
+
+      writeJsonlSession(largePath, 'deferred-large', ['changed-small']);
+      const changed = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 1000 });
+      assert.equal(changed.sessionsIndexed, 1);
+      assert.equal(dbManager.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(SESSION_BACKFILL_DEFERRED_KEY), undefined);
+
+      const manualPath = path.join(sessionsDir, 'project-a', 'manual-large.jsonl');
+      writeJsonlSession(manualPath, 'manual-large', ['y'.repeat(BACKFILL_MAX_FILE_BYTES)]);
+      await indexChangedSessionsBounded(dbManager, sessionsDir, { maxDurationMs: 1000 });
+      const manual = indexAllSessions(dbManager, sessionsDir);
+      assert.equal(manual.sessionsIndexed >= 1, true);
+    });
+
+    it('reports cancellation before parsing and leaves the DB untouched', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      writeJsonlSession(path.join(sessionsDir, 'project-a', 'cancelled.jsonl'), 'cancelled');
+      const controller = new AbortController();
+      controller.abort();
+      const result = await indexChangedSessionsBounded(dbManager, sessionsDir, { signal: controller.signal, maxDurationMs: 1000 });
+      assert.equal(result.aborted, true);
+      assert.equal(result.partial, true);
+      assert.equal(dbManager.getStats().sessions, 0);
+    });
+
+    it('does not open or touch the database when already aborted', async () => {
+      const controller = new AbortController();
+      controller.abort();
+      let opened = false;
+      const guarded = {
+        getDb: () => { opened = true; throw new Error('database opened after abort'); },
+      } as unknown as DatabaseManager;
+      const result = await indexChangedSessionsBounded(guarded, path.join(tmpDir, 'sessions'), { signal: controller.signal });
+      assert.equal(result.aborted, true);
+      assert.equal(result.partial, true);
+      assert.equal(opened, false);
+    });
+
+    it('enforces the file and total byte budgets when a file grows after stat', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project-a', 'growing.jsonl');
+      writeJsonlSession(filePath, 'growing', ['small']);
+      let yields = 0;
+      const result = await indexChangedSessionsBounded(dbManager, sessionsDir, {
+        maxFileBytes: 256,
+        maxTotalBytes: 256,
+        maxDurationMs: 1000,
+        yieldFn: async () => {
+          if (++yields === 3) fs.appendFileSync(filePath, 'x'.repeat(512));
+        },
+      });
+      assert.equal(result.deferredFiles, 1);
+      assert.equal(result.sessionsIndexed, 0);
+      assert.equal(dbManager.getStats().sessions, 0);
+    });
+
+    it('canonicalizes live session file ownership across lexical aliases', () => {
+      const realRoot = path.join(tmpDir, 'real-live');
+      const aliasRoot = path.join(tmpDir, 'alias-live');
+      const realFile = path.join(realRoot, 'project-a', 'live.jsonl');
+      writeJsonlSession(path.join(realRoot, 'project-a', 'live.jsonl'), 'live');
+      fs.symlinkSync(realRoot, aliasRoot, 'dir');
+      const snapshot = { getHeader: () => ({ id: 'live', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/project-a' }), getEntries: () => [], getSessionFile: () => path.join(aliasRoot, 'project-a', 'live.jsonl') };
+      indexLiveSession(dbManager, snapshot);
+      indexLiveSession(dbManager, { ...snapshot, getSessionFile: () => realFile });
+      assert.equal((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM session_files').get() as { count: number }).count, 1);
+    });
+
+    it('advances capped progress across repeated bounded starts and accepts the legacy string first-message format', async () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const older = path.join(sessionsDir, 'project-a', 'older.jsonl');
+      const newer = path.join(sessionsDir, 'project-a', 'newer.jsonl');
+      writeJsonlSession(older, 'legacy-older', ['legacy-older-m1']);
+      fs.writeFileSync(older, [
+        JSON.stringify({ type: 'session', id: 'legacy-older', timestamp: '2026-05-03T00:00:00Z', cwd: '/test/legacy' }),
+        JSON.stringify({ type: 'message', id: 'legacy-older-m1', parentId: null, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: 'legacy string content' } }),
+      ].join('\n'));
+      fs.utimesSync(older, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      writeJsonlSession(newer, 'legacy-newer', ['legacy-newer-m1']);
+
+      const first = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxFilesToIndex: 1, maxDurationMs: 1000 });
+      const second = await indexChangedSessionsBounded(dbManager, sessionsDir, { maxFilesToIndex: 1, maxDurationMs: 1000 });
+
+      assert.equal(first.sessionsIndexed, 1);
+      assert.equal(first.reachedLimit, true);
+      assert.equal(second.sessionsIndexed, 1);
+      assert.equal(second.reachedLimit, undefined);
+      assert.equal(dbManager.getStats().sessions, 2);
+      assert.equal(dbManager.getStats().messages, 2);
+    });
   });
 
   describe('current session indexing helpers', () => {
@@ -352,8 +624,9 @@ describe('session-indexer', () => {
       assert.ok(parsed);
       assert.strictEqual(parsed.id, 'live-session-1');
       assert.strictEqual(parsed.project, 'live-project');
-      assert.strictEqual(parsed.messages.length, 2);
+      assert.strictEqual(parsed.messages.length, 3);
       assert.deepStrictEqual(parsed.messages[1].toolCalls, ['read']);
+      assert.equal(parsed.messages[2].kind, 'tool_result');
     });
 
     it('indexLiveSession prefers the persisted JSONL file when available', () => {

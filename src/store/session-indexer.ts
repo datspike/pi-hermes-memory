@@ -1,9 +1,13 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { DatabaseManager } from './db.js';
-import { parseSessionFile, getSessionFiles, type ParsedSession } from './session-parser.js';
+import { parseSessionFile, parseSessionManagerSnapshot as parseCanonicalSnapshot, getSessionFiles, SessionFileTooLargeError, type ParsedSession } from './session-parser.js';
 
 export const LAST_SESSION_BACKFILL_KEY = 'last_session_backfill';
 export const SESSION_BACKFILL_INTERVAL_MS = 24 * 60 * 60 * 1000;
+export const SESSION_BACKFILL_SCAN_CURSOR_KEY = 'session_backfill_scan_cursor:v1';
+export const SESSION_BACKFILL_DEFERRED_KEY = 'session_backfill_deferred:v1';
 
 /**
  * Index result for a single session.
@@ -24,6 +28,10 @@ export interface BulkIndexResult {
   messagesIndexed: number;
   errors: string[];
   reachedLimit?: boolean;
+  partial?: boolean;
+  aborted?: boolean;
+  deferredFiles?: number;
+  bytesScanned?: number;
 }
 
 interface SessionFileMetadata {
@@ -32,15 +40,222 @@ interface SessionFileMetadata {
   mtimeMs: number;
 }
 
+/** Keep the derived index stable when the sessions root is addressed through a symlink. */
+export function canonicalPath(filePath: string): string {
+  try {
+    return fs.realpathSync.native(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+export function containedCanonicalPath(sessionsDir: string | undefined, candidate: string): string | null {
+  let root: string;
+  let real: string;
+  try {
+    root = fs.realpathSync.native(sessionsDir ?? path.dirname(candidate));
+    real = fs.realpathSync.native(candidate);
+  } catch {
+    return null;
+  }
+  const relative = path.relative(root, real);
+  if (relative !== '' && (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) return null;
+  return real;
+}
+
+export function canonicalSessionOwners(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, sessionsDir?: string): Array<{ path: string; session: ParsedSession }> {
+  const owners = db.prepare('SELECT path, indexed_at FROM session_files WHERE session_id = ? ORDER BY indexed_at DESC, path DESC').all(sessionId) as Array<{ path: string; indexed_at: string }>;
+  const valid: Array<{ path: string; session: ParsedSession; indexedAt: string }> = [];
+  for (const owner of owners) {
+    const contained = containedCanonicalPath(sessionsDir, owner.path);
+    if (!contained) continue;
+    try {
+      const session = parseSessionFile(contained);
+      if (session?.id === sessionId) valid.push({ path: contained, session, indexedAt: owner.indexed_at });
+    } catch { /* invalid JSONL is not canonical evidence */ }
+  }
+  return valid
+    .sort((a, b) => b.indexedAt.localeCompare(a.indexedAt) || b.path.localeCompare(a.path))
+    .map(({ path: ownerPath, session }) => ({ path: ownerPath, session }));
+}
+
+function getCanonicalSessionFiles(sessionsDir: string, projectDir?: string): string[] {
+  const root = canonicalPath(sessionsDir);
+  const requested = projectDir ? path.resolve(root, projectDir) : root;
+  const relative = path.relative(root, requested);
+  if (relative !== '' && (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) return [];
+  return getSessionFiles(root, projectDir).map(canonicalPath);
+}
+
 export interface IncrementalIndexOptions {
   projectDir?: string;
   maxFilesToIndex?: number;
 }
 
+export interface BoundedBackfillOptions extends IncrementalIndexOptions {
+  signal?: AbortSignal;
+  maxFileBytes?: number;
+  maxTotalBytes?: number;
+  maxDurationMs?: number;
+  yieldFn?: () => Promise<void>;
+}
+
+export const BACKFILL_MAX_FILE_BYTES = 4 * 1024 * 1024;
+export const BACKFILL_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+export const BACKFILL_MAX_DURATION_MS = 250;
+
+const macrotaskYield = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Test-only failure seam. The callback runs after each mutating statement. */
+export type IndexerFaultInjector = (statement: string) => void;
+let faultInjector: IndexerFaultInjector | undefined;
+
+export function setSessionIndexerFaultInjector(injector?: IndexerFaultInjector): void {
+  faultInjector = injector;
+}
+
+function runStatement<T>(statement: string, action: () => T): T {
+  const result = action();
+  faultInjector?.(statement);
+  return result;
+}
+
+function storageId(sessionId: string, entryId: string): string {
+  return `idx:v1:${createHash('sha256').update(JSON.stringify({ v: 1, sessionId, entryId })).digest('hex').slice(0, 32)}`;
+}
+
+function canonicalEntries(session: ParsedSession): ParsedSession['messages'] {
+  const counts = new Map<string, number>();
+  for (const message of session.messages) {
+    const logicalId = message.entryId ?? message.id;
+    if (logicalId) counts.set(logicalId, (counts.get(logicalId) ?? 0) + 1);
+  }
+  return session.messages.filter((message) => {
+    const logicalId = message.entryId ?? message.id;
+    return Boolean(logicalId)
+      && (counts.get(logicalId as string) ?? 0) === 1
+      && message.identityStatus !== 'ambiguous'
+      && message.identityStatus !== 'unresolvable';
+  });
+}
+
+function entryId(message: ParsedSession['messages'][number]): string {
+  return message.entryId ?? message.id;
+}
+
+function writeSessionMetadata(db: ReturnType<DatabaseManager['getDb']>, session: ParsedSession): void {
+  runStatement('insert-session', () => db.prepare(`
+    INSERT INTO sessions (id, project, cwd, started_at, ended_at, message_count, name, title)
+    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      project = excluded.project,
+      cwd = excluded.cwd,
+      started_at = excluded.started_at,
+      ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
+      name = excluded.name,
+      title = excluded.title
+  `).run(session.id, session.project, session.cwd, session.startedAt, session.endedAt, session.name ?? null, session.title ?? null));
+}
+
+function writeMessages(db: ReturnType<DatabaseManager['getDb']>, session: ParsedSession, messages: ParsedSession['messages']): void {
+  const insert = db.prepare(`
+    INSERT INTO messages (id, session_id, entry_id, role, kind, parent_entry_id, ordinal, content, timestamp, tool_calls, tool_name, tool_call_id, diagnostics)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT DO UPDATE SET
+      id = excluded.id,
+      role = excluded.role,
+      kind = excluded.kind,
+      parent_entry_id = excluded.parent_entry_id,
+      ordinal = excluded.ordinal,
+      content = excluded.content,
+      timestamp = excluded.timestamp,
+      tool_calls = excluded.tool_calls,
+      tool_name = excluded.tool_name,
+      tool_call_id = excluded.tool_call_id,
+      diagnostics = excluded.diagnostics
+  `);
+  for (const message of messages) {
+    const logicalId = entryId(message);
+    runStatement('upsert-message', () => insert.run(
+      storageId(session.id, logicalId),
+      session.id,
+      logicalId,
+      message.role,
+      message.kind ?? 'message',
+      message.parentEntryId ?? null,
+      message.ordinal ?? 0,
+      message.content,
+      message.timestamp,
+      message.toolCalls ? JSON.stringify(message.toolCalls) : null,
+      message.toolName ?? null,
+      message.toolCallId ?? null,
+      message.diagnostics?.length ? JSON.stringify(message.diagnostics) : null,
+    ));
+  }
+}
+
+function reconcileSession(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, authoritativeIds: Set<string>): void {
+  const ambiguous = db.prepare("DELETE FROM messages WHERE session_id = ? AND (entry_id IS NULL OR diagnostics LIKE '%ambiguous-entry-id%')");
+  runStatement('delete-unresolvable-message', () => ambiguous.run(sessionId));
+  const rows = db.prepare('SELECT entry_id FROM messages WHERE session_id = ? AND entry_id IS NOT NULL').all(sessionId) as Array<{ entry_id: string }>;
+  const remove = db.prepare('DELETE FROM messages WHERE session_id = ? AND entry_id = ?');
+  for (const row of rows) {
+    if (!authoritativeIds.has(row.entry_id)) runStatement('delete-stale-message', () => remove.run(sessionId, row.entry_id));
+  }
+  runStatement('update-session-count', () => db.prepare('UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?) WHERE id = ?').run(sessionId, sessionId));
+}
+
+function linkedCanonicalIds(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, currentPath: string, currentSession: ParsedSession): Set<string> {
+  const ids = new Set(canonicalEntries(currentSession).map(entryId));
+  const paths = db.prepare('SELECT path FROM session_files WHERE session_id = ? AND path <> ?').all(sessionId, currentPath) as Array<{ path: string }>;
+  for (const { path } of paths) {
+    if (!fs.existsSync(path)) continue;
+    const linked = parseSessionFile(path);
+    if (linked?.id !== sessionId) continue;
+    for (const message of canonicalEntries(linked)) ids.add(entryId(message));
+  }
+  return ids;
+}
+
+function remainingCanonicalIds(db: ReturnType<DatabaseManager['getDb']>, sessionId: string): Set<string> {
+  const ids = new Set<string>();
+  const paths = db.prepare('SELECT path FROM session_files WHERE session_id = ?').all(sessionId) as Array<{ path: string }>;
+  for (const { path } of paths) {
+    if (!fs.existsSync(path)) continue;
+    const linked = parseSessionFile(path);
+    if (linked?.id !== sessionId) continue;
+    for (const message of canonicalEntries(linked)) ids.add(entryId(message));
+  }
+  return ids;
+}
+
+function purgeSessionIfUnowned(db: ReturnType<DatabaseManager['getDb']>, sessionId: string): void {
+  if (db.prepare('SELECT 1 FROM session_files WHERE session_id = ? LIMIT 1').get(sessionId)) {
+    reconcileSession(db, sessionId, remainingCanonicalIds(db, sessionId));
+    return;
+  }
+  runStatement('delete-session-messages', () => db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId));
+  runStatement('delete-session', () => db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId));
+}
+
+/** Remove one missing canonical owner without purging a session that still has linked paths. */
+export function removeMissingCanonicalFile(dbManager: DatabaseManager, filePath: string): void {
+  dbManager.withCorruptionRecovery(() => {
+    const db = dbManager.getDb();
+    const owner = db.prepare('SELECT session_id FROM session_files WHERE path = ?').get(filePath) as { session_id: string } | undefined;
+    if (!owner) return;
+    const work = () => {
+      runStatement('delete-missing-session-file', () => db.prepare('DELETE FROM session_files WHERE path = ?').run(filePath));
+      purgeSessionIfUnowned(db, owner.session_id);
+    };
+    if (db.transaction) db.transaction(work)();
+    else { db.exec('BEGIN IMMEDIATE'); try { work(); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
+  });
+}
+
 /**
- * Index a single session into the database.
- *
- * @returns IndexResult with count of messages indexed
+ * Index a parsed snapshot. Snapshots are additive and non-authoritative: an
+ * absent entry is never deleted because the live SessionManager is partial.
  */
 export function indexSession(dbManager: DatabaseManager, session: ParsedSession): IndexResult {
   return dbManager.withCorruptionRecovery(() => indexSessionOnce(dbManager, session));
@@ -48,64 +263,44 @@ export function indexSession(dbManager: DatabaseManager, session: ParsedSession)
 
 function indexSessionOnce(dbManager: DatabaseManager, session: ParsedSession): IndexResult {
   const db = dbManager.getDb();
-
-  const existingSession = db.prepare('SELECT id FROM sessions WHERE id = ?').get(session.id) as { id: string } | undefined;
   const before = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
-
-  const insertSession = db.prepare(`
-    INSERT OR IGNORE INTO sessions (id, project, cwd, started_at, ended_at, message_count)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
-
-  const insertMsg = db.prepare(`
-    INSERT OR IGNORE INTO messages (id, session_id, role, content, timestamp, tool_calls)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
-
-  const updateSession = db.prepare(`
-    UPDATE sessions
-    SET project = ?,
-        cwd = ?,
-        ended_at = COALESCE(?, ended_at),
-        message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?)
-    WHERE id = ?
-  `);
-
-  const writeSession = () => {
-    insertSession.run(
-      session.id,
-      session.project,
-      session.cwd,
-      session.startedAt,
-      session.endedAt,
-      session.messages.length
-    );
-
-    for (const msg of session.messages) {
-      insertMsg.run(
-        msg.id,
-        session.id,
-        msg.role,
-        msg.content,
-        msg.timestamp,
-        msg.toolCalls ? JSON.stringify(msg.toolCalls) : null
-      );
-    }
-
-    updateSession.run(session.project, session.cwd, session.endedAt, session.id, session.id);
+  const existing = db.prepare('SELECT id FROM sessions WHERE id = ?').get(session.id);
+  const messages = canonicalEntries(session);
+  const work = () => {
+    writeSessionMetadata(db, session);
+    writeMessages(db, session, messages);
+    runStatement('update-session-count', () => db.prepare('UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?) WHERE id = ?').run(session.id, session.id));
   };
-
-  if (db.transaction) {
-    const tx = db.transaction(writeSession);
-    tx();
-  } else {
-    writeSession();
-  }
-
+  if (db.transaction) db.transaction(work)();
+  else { db.exec('BEGIN IMMEDIATE'); try { work(); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
   const after = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
-  const messagesIndexed = after.count - before.count;
+  return { sessionId: session.id, messagesIndexed: after.count - before.count, skipped: Boolean(existing) && after.count === before.count };
+}
 
-  return { sessionId: session.id, messagesIndexed, skipped: Boolean(existingSession) && messagesIndexed === 0 };
+function indexCanonicalSessionFileOnce(dbManager: DatabaseManager, file: string, session: ParsedSession): IndexResult {
+  file = canonicalPath(file);
+  const db = dbManager.getDb();
+  const metadata = getSessionFileMetadata(file);
+  const oldOwner = db.prepare('SELECT session_id FROM session_files WHERE path = ?').get(file) as { session_id: string } | undefined;
+  const before = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
+  const work = () => {
+    writeSessionMetadata(db, session);
+    writeMessages(db, session, canonicalEntries(session));
+    runStatement('upsert-session-file', () => db.prepare(`
+      INSERT INTO session_files (path, session_id, size, mtime_ms, indexed_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(path) DO UPDATE SET session_id = excluded.session_id, size = excluded.size, mtime_ms = excluded.mtime_ms, indexed_at = excluded.indexed_at
+    `).run(file, session.id, metadata.size, metadata.mtimeMs, new Date().toISOString()));
+    reconcileSession(db, session.id, linkedCanonicalIds(db, session.id, file, session));
+    if (oldOwner && oldOwner.session_id !== session.id) purgeSessionIfUnowned(db, oldOwner.session_id);
+  };
+  if (db.transaction) db.transaction(work)();
+  else { db.exec('BEGIN IMMEDIATE'); try { work(); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
+  const after = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
+  return { sessionId: session.id, messagesIndexed: after.count - before.count, skipped: Boolean(oldOwner?.session_id === session.id) && after.count === before.count };
+}
+
+function indexCanonicalSessionFile(dbManager: DatabaseManager, file: string, session: ParsedSession): IndexResult {
+  return dbManager.withCorruptionRecovery(() => indexCanonicalSessionFileOnce(dbManager, file, session));
 }
 
 type SessionManagerSnapshot = {
@@ -190,21 +385,7 @@ function parseMessageEntry(entry: unknown): ParsedSession['messages'][number] | 
 }
 
 export function parseSessionManagerSnapshot(sessionManager: SessionManagerSnapshot): ParsedSession | null {
-  const header = sessionManager.getHeader();
-  if (!header?.id || !header.cwd || !header.timestamp) return null;
-
-  const messages = sessionManager.getEntries()
-    .map(parseMessageEntry)
-    .filter((msg): msg is ParsedSession['messages'][number] => msg !== null);
-
-  return {
-    id: header.id,
-    project: header.cwd.split('/').pop() ?? header.cwd,
-    cwd: header.cwd,
-    startedAt: header.timestamp,
-    endedAt: null,
-    messages,
-  };
+  return parseCanonicalSnapshot(sessionManager);
 }
 
 export function indexCurrentSession(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot): IndexResult | null {
@@ -213,18 +394,18 @@ export function indexCurrentSession(dbManager: DatabaseManager, sessionManager: 
   return indexSession(dbManager, session);
 }
 
-export function indexLiveSession(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot): IndexResult | null {
-  return dbManager.withCorruptionRecovery(() => indexLiveSessionOnce(dbManager, sessionManager));
+export function indexLiveSession(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot, sessionsDir?: string): IndexResult | null {
+  return dbManager.withCorruptionRecovery(() => indexLiveSessionOnce(dbManager, sessionManager, sessionsDir));
 }
 
-function indexLiveSessionOnce(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot): IndexResult | null {
+function indexLiveSessionOnce(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot, sessionsDir?: string): IndexResult | null {
   const sessionFile = sessionManager.getSessionFile?.();
-  if (sessionFile && fs.existsSync(sessionFile)) {
-    const session = parseSessionFile(sessionFile);
-    if (session) {
-      const result = indexSession(dbManager, session);
-      upsertSessionFileMetadata(dbManager, sessionFile, session.id);
-      return result;
+  if (sessionFile) {
+    const contained = sessionsDir ? containedCanonicalPath(sessionsDir, sessionFile) : canonicalPath(sessionFile);
+    const canonicalFile = contained ?? '';
+    if (canonicalFile && fs.existsSync(canonicalFile)) {
+      const session = parseSessionFile(canonicalFile);
+      if (session) return indexCanonicalSessionFile(dbManager, canonicalFile, session);
     }
   }
 
@@ -253,6 +434,7 @@ export function upsertSessionFileMetadata(
   indexedAt = new Date(),
 ): void {
   const db = dbManager.getDb();
+  filePath = canonicalPath(filePath);
   db.prepare(`
     INSERT INTO session_files (path, session_id, size, mtime_ms, indexed_at)
     VALUES (?, ?, ?, ?, ?)
@@ -274,22 +456,37 @@ function emptyBulkIndexResult(): BulkIndexResult {
   };
 }
 
-function indexSessionFile(dbManager: DatabaseManager, file: string, result: BulkIndexResult): void {
+function indexSessionFile(dbManager: DatabaseManager, file: string, result: BulkIndexResult, maxFileBytes?: number): void {
   result.sessionsProcessed++;
 
-  const session = parseSessionFile(file);
+  const session = parseSessionFile(file, maxFileBytes);
   if (!session) {
     result.errors.push(`Failed to parse: ${file}`);
     return;
   }
 
-  const indexResult = indexSession(dbManager, session);
-  upsertSessionFileMetadata(dbManager, file, session.id);
+  const indexResult = indexCanonicalSessionFile(dbManager, file, session);
   if (indexResult.skipped) {
     result.sessionsSkipped++;
   } else {
     result.sessionsIndexed++;
     result.messagesIndexed += indexResult.messagesIndexed;
+  }
+}
+
+function removeMissingCanonicalFiles(dbManager: DatabaseManager, knownFiles: readonly string[], scopeRoot: string): void {
+  const db = dbManager.getDb();
+  const known = new Set(knownFiles);
+  const rows = db.prepare('SELECT path, session_id FROM session_files').all() as Array<{ path: string; session_id: string }>;
+  const prefix = scopeRoot.endsWith(path.sep) ? scopeRoot : `${scopeRoot}${path.sep}`;
+  for (const row of rows) {
+    if (!row.path.startsWith(prefix) || known.has(row.path)) continue;
+    const work = () => {
+      runStatement('delete-missing-session-file', () => db.prepare('DELETE FROM session_files WHERE path = ?').run(row.path));
+      purgeSessionIfUnowned(db, row.session_id);
+    };
+    if (db.transaction) db.transaction(work)();
+    else { db.exec('BEGIN IMMEDIATE'); try { work(); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
   }
 }
 
@@ -306,7 +503,7 @@ export function indexAllSessions(
   sessionsDir: string,
   projectDir?: string
 ): BulkIndexResult {
-  const files = getSessionFiles(sessionsDir, projectDir);
+  const files = getCanonicalSessionFiles(sessionsDir, projectDir);
   const result = emptyBulkIndexResult();
 
   for (const file of files) {
@@ -315,6 +512,16 @@ export function indexAllSessions(
     } catch (err) {
       result.errors.push(`Error indexing ${file}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  try {
+    const scopeRoot = canonicalPath(sessionsDir);
+    const requestedRoot = projectDir ? path.resolve(scopeRoot, projectDir) : scopeRoot;
+    const relative = path.relative(scopeRoot, requestedRoot);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('session project path escapes sessions directory');
+    removeMissingCanonicalFiles(dbManager, files, requestedRoot);
+  } catch (err) {
+    result.errors.push(`Error cleaning missing session files: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   return result;
@@ -332,7 +539,7 @@ export function indexChangedSessions(
   sessionsDir: string,
   options: IncrementalIndexOptions = {},
 ): BulkIndexResult {
-  const files = getSessionFiles(sessionsDir, options.projectDir);
+  const files = getCanonicalSessionFiles(sessionsDir, options.projectDir);
   const maxFilesToIndex = options.maxFilesToIndex ?? 50;
   const result = emptyBulkIndexResult();
 
@@ -373,11 +580,277 @@ export function indexChangedSessions(
   return result;
 }
 
+interface DeferredFingerprint {
+  size: number;
+  mtimeMs: number;
+}
+
+type DeferredFingerprints = Record<string, DeferredFingerprint>;
+
+function readMetadataValue(dbManager: DatabaseManager, key: string): string | null {
+  const row = dbManager.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+function writeMetadataValue(dbManager: DatabaseManager, key: string, value: string | null): void {
+  const db = dbManager.getDb();
+  const work = () => {
+    if (value === null) db.prepare('DELETE FROM extension_metadata WHERE key = ?').run(key);
+    else db.prepare(`
+      INSERT INTO extension_metadata (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value);
+  };
+  if (db.transaction) db.transaction(work)();
+  else { db.exec('BEGIN IMMEDIATE'); try { work(); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
+}
+
+function getScanCursor(dbManager: DatabaseManager): string | null {
+  return readMetadataValue(dbManager, SESSION_BACKFILL_SCAN_CURSOR_KEY);
+}
+
+function setScanCursor(dbManager: DatabaseManager, filePath: string): void {
+  writeMetadataValue(dbManager, SESSION_BACKFILL_SCAN_CURSOR_KEY, filePath);
+}
+
+function getDeferredFingerprints(dbManager: DatabaseManager): DeferredFingerprints {
+  const value = readMetadataValue(dbManager, SESSION_BACKFILL_DEFERRED_KEY);
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as Record<string, DeferredFingerprint>;
+    return Object.fromEntries(Object.entries(parsed).filter(([, fingerprint]) => (
+      fingerprint && Number.isFinite(fingerprint.size) && Number.isFinite(fingerprint.mtimeMs)
+    )));
+  } catch {
+    return {};
+  }
+}
+
+function setDeferredFingerprints(dbManager: DatabaseManager, fingerprints: DeferredFingerprints): void {
+  writeMetadataValue(dbManager, SESSION_BACKFILL_DEFERRED_KEY, Object.keys(fingerprints).length ? JSON.stringify(fingerprints) : null);
+}
+
+async function discoverCanonicalSessionFiles(
+  sessionsDir: string,
+  projectDir: string | undefined,
+  signal: AbortSignal | undefined,
+  deadline: number,
+  yieldFn: () => Promise<void>,
+  onFileDiscovered: (filePath: string) => void,
+  cursor: string | null,
+): Promise<{ files: string[]; complete: boolean }> {
+  const sessionsRoot = canonicalPath(sessionsDir);
+  const root = projectDir ? path.resolve(sessionsRoot, projectDir) : sessionsRoot;
+  const relative = path.relative(sessionsRoot, root);
+  if (relative !== '' && (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) return { files: [], complete: true };
+  const files: string[] = [];
+  let complete = true;
+  let passedCursor = cursor === null;
+  let cursorSeen = cursor === null;
+  const emit = (filePath: string): void => {
+    if (!passedCursor) {
+      if (filePath <= (cursor as string)) return;
+      passedCursor = true;
+    }
+    cursorSeen = cursorSeen || filePath === cursor;
+    files.push(filePath);
+    onFileDiscovered(filePath);
+  };
+  const checkBudget = (): boolean => {
+    if (signal?.aborted || Date.now() >= deadline) {
+      complete = false;
+      return false;
+    }
+    return true;
+  };
+  try {
+    const entries = (await fs.promises.readdir(root, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (!checkBudget()) break;
+      const candidate = path.join(root, entry.name);
+      if (!projectDir && !passedCursor && cursor && entry.isDirectory() && candidate < path.dirname(cursor)) {
+        await yieldFn();
+        continue;
+      }
+      const stat = await fs.promises.stat(candidate);
+      if (stat.isDirectory() && !projectDir) {
+        const children = (await fs.promises.readdir(candidate, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+        for (const child of children) {
+          if (!checkBudget()) break;
+          const childPath = path.join(candidate, child.name);
+          if (!passedCursor && cursor && childPath <= cursor) {
+            await yieldFn();
+            continue;
+          }
+          if (child.name.endsWith('.jsonl')) {
+            if ((await fs.promises.stat(childPath)).isFile()) {
+              const canonical = canonicalPath(childPath);
+              const childRelative = path.relative(sessionsRoot, canonical);
+              if (childRelative === '..' || childRelative.startsWith(`..${path.sep}`) || path.isAbsolute(childRelative)) continue;
+              emit(canonical);
+            }
+          }
+          await yieldFn();
+        }
+      } else if (stat.isFile() && entry.name.endsWith('.jsonl')) {
+        const canonical = canonicalPath(candidate);
+        const fileRelative = path.relative(sessionsRoot, canonical);
+        if (fileRelative === '..' || fileRelative.startsWith(`..${path.sep}`) || path.isAbsolute(fileRelative)) continue;
+        emit(canonical);
+      }
+      await yieldFn();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (complete && cursor !== null && !passedCursor && !cursorSeen) {
+    // The persisted owner disappeared or the tree was replaced. Start a new
+    // cycle rather than permanently skipping every path lexically before it.
+    return discoverCanonicalSessionFiles(sessionsDir, projectDir, signal, deadline, yieldFn, onFileDiscovered, null);
+  }
+  return { files: [...new Set(files)].sort(), complete };
+}
+
+/**
+ * Async startup backfill with explicit file, byte, wall-clock and cursor budgets.
+ * Manual indexAllSessions remains the unbounded operator path.
+ */
+export async function indexChangedSessionsBounded(
+  dbManager: DatabaseManager,
+  sessionsDir: string,
+  options: BoundedBackfillOptions = {},
+): Promise<BulkIndexResult> {
+  const maxFilesToIndex = options.maxFilesToIndex ?? 50;
+  const maxFileBytes = options.maxFileBytes ?? BACKFILL_MAX_FILE_BYTES;
+  const maxTotalBytes = options.maxTotalBytes ?? BACKFILL_MAX_TOTAL_BYTES;
+  const maxDurationMs = options.maxDurationMs ?? BACKFILL_MAX_DURATION_MS;
+  const yieldFn = options.yieldFn ?? macrotaskYield;
+  const deadline = Date.now() + maxDurationMs;
+  const result = emptyBulkIndexResult();
+  if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
+  const cursor = getScanCursor(dbManager);
+  const discovery = await discoverCanonicalSessionFiles(sessionsDir, options.projectDir, options.signal, deadline, yieldFn, (file) => {
+    if (!options.signal?.aborted) setScanCursor(dbManager, file);
+  }, null);
+  if (!discovery.complete) {
+    result.partial = true;
+    result.aborted = options.signal?.aborted;
+  }
+  if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
+  const files = discovery.files;
+  const cursorIndex = cursor ? files.findIndex((file) => file > cursor) : 0;
+  const orderedFiles = cursorIndex > 0 ? [...files.slice(cursorIndex), ...files.slice(0, cursorIndex)] : files;
+  const deferred = getDeferredFingerprints(dbManager);
+  const changed: SessionFileMetadata[] = [];
+
+  for (const file of orderedFiles) {
+    if (options.signal?.aborted || Date.now() >= deadline) {
+      result.partial = true;
+      result.aborted = options.signal?.aborted;
+      break;
+    }
+    try {
+      const stat = await fs.promises.stat(file);
+      const metadata = { path: file, size: stat.size, mtimeMs: Math.trunc(stat.mtimeMs) };
+      const previous = deferred[file];
+      if (previous && previous.size === metadata.size && previous.mtimeMs === metadata.mtimeMs) {
+        result.deferredFiles = (result.deferredFiles ?? 0) + 1;
+      } else if (storedSessionFileMatches(dbManager, metadata)) {
+        result.sessionsSkipped++;
+        if (previous) delete deferred[file];
+      } else {
+        changed.push(metadata);
+      }
+    } catch (error) {
+      result.errors.push(`Error indexing ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      result.partial = true;
+    } finally {
+      if (!options.signal?.aborted) setScanCursor(dbManager, file);
+    }
+    await yieldFn();
+    if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
+  }
+
+  const discoveryComplete = discovery.complete;
+  if (discoveryComplete && !options.signal?.aborted) {
+    for (const file of Object.keys(deferred)) if (!files.includes(file)) delete deferred[file];
+  }
+
+  // Newest files get priority for crash recovery. Malformed candidates do not
+  // consume the successful-file cap, so one bad file cannot starve the tail.
+  changed.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const metadata of changed) {
+    if (options.signal?.aborted || Date.now() >= deadline || result.sessionsProcessed >= maxFilesToIndex) {
+      result.partial = true;
+      result.aborted = options.signal?.aborted;
+      result.reachedLimit = result.sessionsProcessed >= maxFilesToIndex;
+      break;
+    }
+    if (metadata.size > maxFileBytes || (result.bytesScanned ?? 0) + metadata.size > maxTotalBytes) {
+      result.deferredFiles = (result.deferredFiles ?? 0) + 1;
+      deferred[metadata.path] = { size: metadata.size, mtimeMs: metadata.mtimeMs };
+      result.partial = true;
+      await yieldFn();
+      continue;
+    }
+    try {
+      const session = parseSessionFile(metadata.path, maxFileBytes);
+      const finalMetadata = getSessionFileMetadata(metadata.path);
+      if (finalMetadata.size > maxFileBytes || (result.bytesScanned ?? 0) + finalMetadata.size > maxTotalBytes) {
+        result.deferredFiles = (result.deferredFiles ?? 0) + 1;
+        deferred[metadata.path] = { size: finalMetadata.size, mtimeMs: finalMetadata.mtimeMs };
+        result.partial = true;
+      } else if (session) {
+        result.sessionsProcessed++;
+        const indexResult = indexCanonicalSessionFile(dbManager, metadata.path, session);
+        if (indexResult.skipped) result.sessionsSkipped++;
+        else {
+          result.sessionsIndexed++;
+          result.messagesIndexed += indexResult.messagesIndexed;
+        }
+        result.bytesScanned = (result.bytesScanned ?? 0) + finalMetadata.size;
+        delete deferred[metadata.path];
+      } else {
+        result.errors.push(`Failed to parse: ${metadata.path}`);
+      }
+    } catch (error) {
+      if (error instanceof SessionFileTooLargeError) {
+        result.deferredFiles = (result.deferredFiles ?? 0) + 1;
+        const current = getSessionFileMetadata(metadata.path);
+        deferred[metadata.path] = { size: current.size, mtimeMs: current.mtimeMs };
+      } else {
+        result.errors.push(`Error indexing ${metadata.path}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      result.partial = true;
+    }
+    if (!options.signal?.aborted) setScanCursor(dbManager, metadata.path);
+    await yieldFn();
+    if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
+  }
+
+  const attemptedAll = changed.length <= result.sessionsProcessed + (result.deferredFiles ?? 0) && !result.reachedLimit && !result.aborted && Date.now() < deadline;
+  if (discoveryComplete && attemptedAll && !options.signal?.aborted) writeMetadataValue(dbManager, SESSION_BACKFILL_SCAN_CURSOR_KEY, null);
+  if (discoveryComplete && !options.signal?.aborted) {
+    try { removeMissingCanonicalFiles(dbManager, files, canonicalPath(sessionsDir)); }
+    catch (error) { result.errors.push(`Error cleaning missing session files: ${error instanceof Error ? error.message : String(error)}`); result.partial = true; }
+  }
+  if (changed.length > result.sessionsProcessed + (result.deferredFiles ?? 0) && !result.reachedLimit && !result.aborted) result.partial = true;
+  if (Object.keys(deferred).length > 0) result.partial = true;
+  if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
+  setDeferredFingerprints(dbManager, deferred);
+  return result;
+}
+
+/** Startup always schedules a deferred metadata discovery; the watermark is not an eligibility gate. */
+export function needsBackfillQuick(_dbManager: DatabaseManager, _now = new Date()): boolean {
+  return true;
+}
+
 /**
  * Cheaply count session JSONL files in the same scope indexAllSessions scans.
  */
 export function countSessionFiles(sessionsDir: string): number {
-  return getSessionFiles(sessionsDir).length;
+  return getCanonicalSessionFiles(sessionsDir).length;
 }
 
 function getLastBackfillTimestamp(dbManager: DatabaseManager): string | null {
