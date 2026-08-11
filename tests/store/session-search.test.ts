@@ -250,6 +250,34 @@ describe('session-search', () => {
     it('should return empty for blank queries', () => {
       assert.deepStrictEqual(searchSessions(dbManager, '   '), []);
     });
+
+    it('validates one canonical JSONL once per session across legacy and structured candidates', () => {
+      const id = 'dedupe-session';
+      const file = path.join(tmpDir, `${id}.jsonl`);
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'session', id, cwd: '/dedupe', timestamp: '2026-05-03T00:00:00Z' }),
+        ...Array.from({ length: 40 }, (_, index) => JSON.stringify({ type: 'message', id: `${id}-entry-${index}`, timestamp: `2026-05-03T00:01:${String(index).padStart(2, '0')}Z`, message: { role: 'user', content: 'dedupe needle' } })),
+      ].join('\n') + '\n');
+      indexLiveSession(dbManager, { getHeader: () => ({ id, cwd: '/dedupe', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      const originalReadFileSync = fs.readFileSync;
+      let reads = 0;
+      (fs as any).readFileSync = (...args: any[]) => {
+        if (typeof args[0] === 'string' && path.resolve(args[0]) === path.resolve(file)) reads++;
+        return (originalReadFileSync as any)(...args);
+      };
+      try {
+        const legacy = searchSessions(dbManager, 'needle', { limit: 10, sessionsDir: tmpDir });
+        assert.strictEqual(legacy.length, 10);
+        assert.strictEqual(reads, 1);
+
+        reads = 0;
+        const structured = searchSessionEvidence(dbManager, 'needle', { limit: 10, sessionsDir: tmpDir });
+        assert.strictEqual(structured.results.length, 3);
+        assert.strictEqual(reads, 1);
+      } finally {
+        (fs as any).readFileSync = originalReadFileSync;
+      }
+    });
   });
 
   describe('searchSessionEvidence', () => {
@@ -350,6 +378,16 @@ describe('session-search', () => {
       ].join('\\n') + '\\n');
       const result = searchSessionEvidence(dbManager, 'needle');
       assert.deepStrictEqual(result.results, []);
+    });
+    it('revalidates canonical JSONL on the next search call', () => {
+      const file = canonicalFile('request-boundary-session', 'needle from the old snapshot');
+      indexLiveSession(dbManager, { getHeader: () => ({ id: 'request-boundary-session', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
+      assert.strictEqual(searchSessionEvidence(dbManager, 'needle', { sessionsDir: tmpDir }).results.length, 1);
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'session', id: 'request-boundary-session', cwd: '/canonical/project', timestamp: '2026-05-03T00:00:00Z' }),
+        JSON.stringify({ type: 'message', id: 'request-boundary-session-entry', timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: 'canonical replacement' } }),
+      ].join('\n') + '\n');
+      assert.deepStrictEqual(searchSessionEvidence(dbManager, 'needle', { sessionsDir: tmpDir }).results, []);
     });
   });
 

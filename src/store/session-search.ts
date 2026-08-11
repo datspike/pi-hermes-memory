@@ -96,12 +96,39 @@ function mapRows(rows: Array<{ session_id: string; project: string; role: string
   return rows.map(row => ({ sessionId: row.session_id, project: row.project, role: row.role, content: row.content, timestamp: row.timestamp, snippet: row.snippet }));
 }
 
+type CanonicalOwner = ReturnType<typeof canonicalSessionOwners>[number];
+type CanonicalSnapshot = { owners: CanonicalOwner[]; entries: Map<string, ParsedEntry> };
+type CanonicalSessionResolver = (sessionId: string) => CanonicalSnapshot;
+
+/** Cache canonical JSONL validation for the duration of one search operation. */
+function createCanonicalSessionResolver(
+  db: ReturnType<DatabaseManager['getDb']>,
+  sessionsDir?: string,
+): CanonicalSessionResolver {
+  const cache = new Map<string, CanonicalSnapshot>();
+  return (sessionId: string): CanonicalSnapshot => {
+    const cached = cache.get(sessionId);
+    if (cached) return cached;
+    const owners = canonicalSessionOwners(db, sessionId, sessionsDir);
+    const entries = new Map<string, ParsedEntry>();
+    const owner = owners[0];
+    for (const entry of owner?.session.entries ?? []) {
+      if (!entry.entryId || entry.identityStatus === 'ambiguous' || entry.identityStatus === 'unresolvable' || entries.has(entry.entryId)) continue;
+      entries.set(entry.entryId, entry);
+    }
+    const snapshot = { owners, entries };
+    cache.set(sessionId, snapshot);
+    return snapshot;
+  };
+}
+
 /** Original FTS/LIKE search. Its ordering and result shape are intentionally unchanged. */
 export function searchSessions(dbManager: DatabaseManager, query: string, options: SessionSearchOptions = {}): SessionSearchResult[] {
   dbManager.assertSessionEvidenceAvailable();
   if (query.trim().length === 0) return [];
   const db = dbManager.getDb();
   const { limit = 10, project, role, since } = options;
+  const resolveCanonical = options.sessionsDir ? createCanonicalSessionResolver(db, options.sessionsDir) : null;
   let ftsParseError = false;
   const executeSearch = (match: SearchMatch): SessionSearchResult[] => {
     const conditions: string[] = [];
@@ -119,9 +146,13 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     if (since) { conditions.push('m.timestamp >= ?'); params.push(since); }
     try {
       const rows = db.prepare(`SELECT m.session_id, s.project, m.role, m.content, m.timestamp, m.content as snippet FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?`).all(...params, Math.max(limit * 20, limit)) as Array<{ session_id: string; project: string; role: string; content: string; timestamp: string; snippet: string }>;
-      const visible = options.sessionsDir
-        ? rows.filter((row) => canonicalSessionOwners(db, row.session_id, options.sessionsDir!).length > 0).slice(0, limit)
-        : rows.slice(0, limit);
+      if (!resolveCanonical) return mapRows(rows.slice(0, limit));
+      const visible: typeof rows = [];
+      for (const row of rows) {
+        if (resolveCanonical(row.session_id).owners.length === 0) continue;
+        visible.push(row);
+        if (visible.length >= limit) break;
+      }
       return mapRows(visible);
     } catch (err) {
       if (match.type === 'fts' && isFts5QueryError(err)) { ftsParseError = true; return []; }
@@ -177,11 +208,17 @@ function safeSnippet(text: string, query: string, maxChars: number): string {
   return `${leadingMarker}${chars.slice(start, start + contentBudget).join('')}${trailingMarker}`;
 }
 
-function canonicalEvidence(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, entryId: string, sessionsDir?: string): { session: ParsedSession; entry: ParsedEntry } | null {
-  const owner = canonicalSessionOwners(db, sessionId, sessionsDir)[0];
-  if (!owner) return null;
-  const entry = owner.session.entries?.find(candidate => candidate.entryId === entryId && candidate.identityStatus !== 'ambiguous' && candidate.identityStatus !== 'unresolvable');
-  return entry ? { session: owner.session, entry } : null;
+function canonicalEvidence(
+  db: ReturnType<DatabaseManager['getDb']>,
+  sessionId: string,
+  entryId: string,
+  sessionsDir: string | undefined,
+  resolveCanonical: CanonicalSessionResolver = createCanonicalSessionResolver(db, sessionsDir),
+ ): { session: ParsedSession; entry: ParsedEntry } | null {
+  const snapshot = resolveCanonical(sessionId);
+  const owner = snapshot.owners[0];
+  const entry = snapshot.entries.get(entryId);
+  return owner && entry ? { session: owner.session, entry } : null;
 }
 
 function resolveSessionFilter(db: ReturnType<DatabaseManager['getDb']>, value: string | undefined): { ids?: string[]; ambiguous: string[] } {
@@ -230,6 +267,7 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
   const filterSql = `${resolved.ids?.length ? `AND m.session_id IN (${resolved.ids.map(() => '?').join(',')})` : ''} ${options.project ? 'AND s.project = ?' : ''} ${options.role ? 'AND m.role = ?' : ''} ${options.since ? 'AND m.timestamp >= ?' : ''}`;
   const filterParams = [...(resolved.ids ?? []), ...(options.project ? [options.project] : []), ...(options.role ? [options.role] : []), ...(options.since ? [options.since] : [])];
   let candidateRows: CandidateRow[];
+  const resolveCanonical = createCanonicalSessionResolver(db, options.sessionsDir);
   try {
     candidateRows = db.prepare(`
       SELECT m.session_id, m.entry_id, m.role, m.kind, m.tool_name, m.tool_call_id, m.content, m.timestamp,
@@ -252,7 +290,7 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
   const results: SessionSearchEvidence[] = [];
   const hitsBySession = new Map<string, number>();
   for (const row of candidateRows) {
-    const evidence = canonicalEvidence(db, row.session_id, row.entry_id, options.sessionsDir);
+    const evidence = canonicalEvidence(db, row.session_id, row.entry_id, options.sessionsDir, resolveCanonical);
     if (!evidence || !canonicalEligibleForRow(row, options)) continue;
     const canonical = evidence.entry;
     const canonicalSession = evidence.session;
