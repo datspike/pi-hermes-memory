@@ -57,6 +57,11 @@ The implementation is ported from the Hermes agent harness. See `PLAN.md` → "H
 
 **Before starting any work, read `docs/0.2/TASKS.md` to see what's next.**
 
+## Git Workflow
+
+- After successful verification, automatically create the relevant commit or commits unless the user explicitly asks to leave changes uncommitted.
+- Before finishing, inspect remaining tracked and untracked changes and commit completed work in separate coherent commits; never commit secrets, disposable artifacts, or generated noise.
+
 ## Development
 
 ```bash
