@@ -167,19 +167,23 @@ function graphDiagnostics(entries: ParsedEntry[], malformedLines: number, nulLin
   }
   const orphanParents = entries.filter((entry) => entry.parentEntryId && !byId.has(entry.parentEntryId)).map((entry) => entry.entryId ?? `ordinal:${entry.ordinal}`);
   const cycles: string[][] = [];
+  const resolved = new Set<string>();
   for (const entry of entries) {
-    const seen = new Set<string>();
-    const chain: string[] = [];
+    if (!entry.entryId || resolved.has(entry.entryId)) continue;
+    const path: string[] = [];
+    const pathIndexes = new Map<string, number>();
     let current: ParsedEntry | undefined = entry;
-    while (current?.parentEntryId) {
-      if (seen.has(current.parentEntryId)) {
-        cycles.push([...chain, current.parentEntryId]);
+    while (current?.entryId && !resolved.has(current.entryId)) {
+      const cycleStart = pathIndexes.get(current.entryId);
+      if (cycleStart !== undefined) {
+        cycles.push(path.slice(cycleStart));
         break;
       }
-      seen.add(current.parentEntryId);
-      chain.push(current.parentEntryId);
-      current = byId.get(current.parentEntryId);
+      pathIndexes.set(current.entryId, path.length);
+      path.push(current.entryId);
+      current = current.parentEntryId ? byId.get(current.parentEntryId) : undefined;
     }
+    for (const id of path) resolved.add(id);
   }
   const children = new Map<string, number>();
   for (const entry of entries) if (entry.parentEntryId) children.set(entry.parentEntryId, (children.get(entry.parentEntryId) ?? 0) + 1);
@@ -212,10 +216,11 @@ export function resolveActiveLineage(entries: readonly ParsedEntry[]): string[] 
   return lineage;
 }
 
-function parseEntries(rawEntries: JsonlEntry[], sessionId: string, malformedLines: number, nulLines: number): { entries: ParsedEntry[]; diagnostics: SessionGraphDiagnostics } {
+function parseEntries(rawEntries: JsonlEntry[], sessionId: string, malformedLines: number, nulLines: number, ordinalOffset = 0): { entries: ParsedEntry[]; diagnostics: SessionGraphDiagnostics } {
   const entries: ParsedEntry[] = [];
   const identityByRawId = new Map<string, string | null>();
-  for (const [ordinal, raw] of rawEntries.entries()) {
+  for (const [localOrdinal, raw] of rawEntries.entries()) {
+    const ordinal = ordinalOffset + localOrdinal;
     const kind = entryKind(raw);
     const rawRole = raw.message?.role;
     const role = rawRole === 'toolResult' ? 'system' : rawRole === 'user' || rawRole === 'assistant' || rawRole === 'system' ? rawRole : null;
@@ -350,11 +355,11 @@ export function parseSessionEntries(content: string, sessionId: string): ParsedE
 export function parseSessionManagerSnapshot(sessionManager: {
   getHeader: () => { id: string; timestamp: string; cwd: string } | null;
   getEntries: () => unknown[];
-}): ParsedSession | null {
+}, ordinalOffset = 0): ParsedSession | null {
   const header = sessionManager.getHeader();
   if (!header?.id || !header.cwd || !header.timestamp) return null;
   const rawEntries = sessionManager.getEntries().filter((entry): entry is JsonlEntry => !!entry && typeof entry === 'object').map((entry) => entry as JsonlEntry);
-  const parsed = parseEntries(rawEntries, header.id, 0, 0);
+  const parsed = parseEntries(rawEntries, header.id, 0, 0, ordinalOffset);
   const messages = parsed.entries.filter((entry): entry is ParsedMessage => (entry.kind === 'message' || entry.kind === 'tool_call' || entry.kind === 'tool_result') && !!entry.content && !!entry.entryId && entry.identityStatus !== 'ambiguous' && entry.identityStatus !== 'unresolvable' && !!entry.role && !!entry.timestamp).map((entry) => ({ ...entry, id: entry.entryId as string, entryId: entry.entryId as string, role: entry.role as ParsedMessage['role'], timestamp: entry.timestamp as string, kind: entry.kind as ParsedMessage['kind'] }));
   return { id: header.id, project: path.basename(header.cwd) || header.cwd, cwd: header.cwd, startedAt: header.timestamp, endedAt: null, name: null, title: null, metadata: null, messages, entries: parsed.entries, diagnostics: parsed.diagnostics };
 }

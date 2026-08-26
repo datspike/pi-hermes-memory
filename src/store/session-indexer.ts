@@ -194,6 +194,27 @@ function writeMessages(db: ReturnType<DatabaseManager['getDb']>, session: Parsed
   }
 }
 
+/** Add only entries that are absent from an already indexed live session. */
+function indexAdditiveSessionOnce(dbManager: DatabaseManager, session: ParsedSession): IndexResult {
+  const db = dbManager.getDb();
+  const before = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
+  const existing = db.prepare('SELECT id FROM sessions WHERE id = ?').get(session.id);
+  const indexedIds = new Set((db.prepare('SELECT entry_id FROM messages WHERE session_id = ? AND entry_id IS NOT NULL').all(session.id) as Array<{ entry_id: string }>).map((row) => row.entry_id));
+  const messages = canonicalEntries(session).filter((message) => !indexedIds.has(entryId(message)));
+  if (existing && messages.length === 0) {
+    return { sessionId: session.id, messagesIndexed: 0, skipped: true };
+  }
+  const work = () => {
+    writeSessionMetadata(db, session);
+    writeMessages(db, session, messages);
+    runStatement('update-session-count', () => db.prepare('UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?) WHERE id = ?').run(session.id, session.id));
+  };
+  if (db.transaction) db.transaction(work)();
+  else { db.exec('BEGIN IMMEDIATE'); try { work(); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
+  const after = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
+  return { sessionId: session.id, messagesIndexed: after.count - before.count, skipped: Boolean(existing) && after.count === before.count };
+}
+
 function reconcileSession(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, authoritativeIds: Set<string>): void {
   const ambiguous = db.prepare("DELETE FROM messages WHERE session_id = ? AND (entry_id IS NULL OR diagnostics LIKE '%ambiguous-entry-id%')");
   runStatement('delete-unresolvable-message', () => ambiguous.run(sessionId));
@@ -384,14 +405,95 @@ function parseMessageEntry(entry: unknown): ParsedSession['messages'][number] | 
   };
 }
 
-export function parseSessionManagerSnapshot(sessionManager: SessionManagerSnapshot): ParsedSession | null {
-  return parseCanonicalSnapshot(sessionManager);
+export function parseSessionManagerSnapshot(sessionManager: SessionManagerSnapshot, ordinalOffset = 0): ParsedSession | null {
+  return parseCanonicalSnapshot(sessionManager, ordinalOffset);
+}
+
+type IndexedLiveCursor = {
+  entry_id: string;
+  ordinal: number;
+  role: string;
+  kind: string;
+  content: string;
+  timestamp: string;
+  tool_calls: string | null;
+  tool_name: string | null;
+  tool_call_id: string | null;
+};
+
+function getIndexedLiveCursor(dbManager: DatabaseManager, sessionId: string): IndexedLiveCursor | undefined {
+  return dbManager.getDb().prepare(`
+    SELECT entry_id, ordinal, role, kind, content, timestamp, tool_calls, tool_name, tool_call_id
+    FROM messages
+    WHERE session_id = ? AND entry_id IS NOT NULL
+    ORDER BY ordinal DESC
+    LIMIT 1
+  `).get(sessionId) as IndexedLiveCursor | undefined;
+}
+
+function liveEntryId(entry: unknown): string | undefined {
+  if (!entry || typeof entry !== 'object') return undefined;
+  const id = (entry as { id?: unknown }).id;
+  return typeof id === 'string' ? id : undefined;
+}
+
+function indexedCursorMatchesLiveEntry(header: NonNullable<ReturnType<SessionManagerSnapshot['getHeader']>>, entry: unknown, cursor: IndexedLiveCursor): boolean {
+  const session = parseSessionManagerSnapshot({
+    getHeader: () => header,
+    getEntries: () => [entry],
+  }, cursor.ordinal);
+  const message = session?.messages.find((candidate) => entryId(candidate) === cursor.entry_id);
+  if (!message) return false;
+  return message.role === cursor.role
+    && (message.kind ?? 'message') === cursor.kind
+    && message.content === cursor.content
+    && message.timestamp === cursor.timestamp
+    && (message.toolCalls ? JSON.stringify(message.toolCalls) : null) === cursor.tool_calls
+    && (message.toolName ?? null) === cursor.tool_name
+    && (message.toolCallId ?? null) === cursor.tool_call_id;
+}
+
+function indexCurrentSessionOnce(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot): IndexResult | null {
+  const header = sessionManager.getHeader();
+  if (!header?.id) return null;
+  const db = dbManager.getDb();
+  const cursor = getIndexedLiveCursor(dbManager, header.id);
+  const entries = sessionManager.getEntries();
+  let entryOffset = 0;
+  let ordinalOffset = cursor ? cursor.ordinal + 1 : 0;
+  if (cursor) {
+    const cursorIndex = entries.findIndex((entry) => liveEntryId(entry) === cursor.entry_id);
+    if (cursorIndex >= 0) entryOffset = cursorIndex + 1;
+  }
+  if (entryOffset >= entries.length && db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(header.id)) {
+    return { sessionId: header.id, messagesIndexed: 0, skipped: true };
+  }
+  const session = parseSessionManagerSnapshot({
+    getHeader: () => header,
+    getEntries: () => entries.slice(entryOffset),
+  }, ordinalOffset);
+  if (!session) return null;
+  return indexAdditiveSessionOnce(dbManager, session);
 }
 
 export function indexCurrentSession(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot): IndexResult | null {
-  const session = parseSessionManagerSnapshot(sessionManager);
-  if (!session) return null;
-  return indexSession(dbManager, session);
+  return dbManager.withCorruptionRecovery(() => indexCurrentSessionOnce(dbManager, sessionManager));
+}
+
+function indexPersistedLiveSessionOnce(
+  dbManager: DatabaseManager,
+  sessionManager: SessionManagerSnapshot,
+  sessionsDir?: string,
+  expectedSessionId?: string,
+): IndexResult | null {
+  const sessionFile = sessionManager.getSessionFile?.();
+  if (!sessionFile) return null;
+  const contained = sessionsDir ? containedCanonicalPath(sessionsDir, sessionFile) : canonicalPath(sessionFile);
+  const canonicalFile = contained ?? '';
+  if (!canonicalFile || !fs.existsSync(canonicalFile)) return null;
+  const session = parseSessionFile(canonicalFile);
+  if (!session || (expectedSessionId && session.id !== expectedSessionId)) return null;
+  return indexCanonicalSessionFileOnce(dbManager, canonicalFile, session);
 }
 
 export function indexLiveSession(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot, sessionsDir?: string): IndexResult | null {
@@ -399,17 +501,30 @@ export function indexLiveSession(dbManager: DatabaseManager, sessionManager: Ses
 }
 
 function indexLiveSessionOnce(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot, sessionsDir?: string): IndexResult | null {
-  const sessionFile = sessionManager.getSessionFile?.();
-  if (sessionFile) {
-    const contained = sessionsDir ? containedCanonicalPath(sessionsDir, sessionFile) : canonicalPath(sessionFile);
-    const canonicalFile = contained ?? '';
-    if (canonicalFile && fs.existsSync(canonicalFile)) {
-      const session = parseSessionFile(canonicalFile);
-      if (session) return indexCanonicalSessionFile(dbManager, canonicalFile, session);
+  const liveEntries = sessionManager.getEntries();
+  if (liveEntries.length > 0) {
+    const header = sessionManager.getHeader();
+    if (header?.id) {
+      const cursor = getIndexedLiveCursor(dbManager, header.id);
+      if (cursor) {
+        const cursorIndex = liveEntries.findIndex((entry) => liveEntryId(entry) === cursor.entry_id);
+        const cursorEntry = cursorIndex >= 0 ? liveEntries[cursorIndex] : undefined;
+        if (!cursorEntry || !indexedCursorMatchesLiveEntry(header, cursorEntry, cursor)) {
+          return indexPersistedLiveSessionOnce(dbManager, sessionManager, sessionsDir, header.id);
+        }
+        if (cursorIndex + 1 < liveEntries.length && canonicalLiveFileIsFullyIndexed(dbManager, sessionManager, header.id, sessionsDir)) {
+          return { sessionId: header.id, messagesIndexed: 0, skipped: true };
+        }
+      }
     }
+    return indexCurrentSessionOnce(dbManager, {
+      getHeader: () => header,
+      getEntries: () => liveEntries,
+    });
   }
 
-  return indexCurrentSession(dbManager, sessionManager);
+  return indexPersistedLiveSessionOnce(dbManager, sessionManager, sessionsDir)
+    ?? indexCurrentSessionOnce(dbManager, sessionManager);
 }
 
 function getSessionFileMetadata(filePath: string): SessionFileMetadata {
@@ -424,6 +539,25 @@ function getStoredSessionFileMetadata(dbManager: DatabaseManager, filePath: stri
 function storedSessionFileMatches(dbManager: DatabaseManager, metadata: SessionFileMetadata): boolean {
   const row = getStoredSessionFileMetadata(dbManager, metadata.path);
   return Boolean(row && row.size === metadata.size && row.mtime_ms === metadata.mtimeMs);
+}
+
+function canonicalLiveFileIsFullyIndexed(
+  dbManager: DatabaseManager,
+  sessionManager: SessionManagerSnapshot,
+  sessionId: string,
+  sessionsDir?: string,
+): boolean {
+  const sessionFile = sessionManager.getSessionFile?.();
+  if (!sessionFile) return false;
+  const contained = sessionsDir ? containedCanonicalPath(sessionsDir, sessionFile) : canonicalPath(sessionFile);
+  const canonicalFile = contained ?? '';
+  if (!canonicalFile || !fs.existsSync(canonicalFile)) return false;
+  try {
+    const owner = dbManager.getDb().prepare('SELECT session_id FROM session_files WHERE path = ?').get(canonicalFile) as { session_id: string } | undefined;
+    return owner?.session_id === sessionId && storedSessionFileMatches(dbManager, getSessionFileMetadata(canonicalFile));
+  } catch {
+    return false;
+  }
 }
 
 export function upsertSessionFileMetadata(

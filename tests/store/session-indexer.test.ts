@@ -647,6 +647,219 @@ describe('session-indexer', () => {
       assert.strictEqual(indexed.cwd, '/work/file-project');
     });
 
+    it('uses the live snapshot instead of reparsing a persisted file when entries are available', () => {
+      const filePath = path.join(tmpDir, 'sessions', 'project', 'stale-session.jsonl');
+      writeSessionFile(filePath);
+      const snapshot = {
+        getHeader: () => ({ id: 'live-session-1', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/live-project' }),
+        getEntries: () => [{
+          type: 'message',
+          id: 'live-entry-1',
+          parentId: null,
+          timestamp: '2026-05-03T00:02:00Z',
+          message: { role: 'user', content: 'from live snapshot' },
+        }],
+        getSessionFile: () => filePath,
+      };
+
+      const result = indexLiveSession(dbManager, snapshot);
+
+      assert.ok(result);
+      assert.strictEqual(result.sessionId, 'live-session-1');
+      assert.strictEqual(result.messagesIndexed, 1);
+      assert.equal(dbManager.getDb().prepare('SELECT 1 FROM sessions WHERE id = ?').get('file-session-1'), undefined);
+    });
+
+    it('appends live entries after a canonical disk index without mixing ordinal coordinates', () => {
+      const filePath = path.join(tmpDir, 'sessions', 'project', 'file-session.jsonl');
+      writeSessionFile(filePath);
+      const entries = [
+        {
+          type: 'message',
+          id: 'file-entry-1',
+          parentId: null,
+          timestamp: '2026-05-03T00:01:00Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'from persisted file' }] },
+        },
+        {
+          type: 'message',
+          id: 'file-entry-2',
+          parentId: 'file-entry-1',
+          timestamp: '2026-05-03T00:02:00Z',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'new live message' }] },
+        },
+      ];
+      const snapshot = {
+        getHeader: () => ({ id: 'file-session-1', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/file-project' }),
+        getEntries: () => entries,
+        getSessionFile: () => filePath,
+      };
+
+      indexLiveSession(dbManager, { ...snapshot, getEntries: () => [] });
+      fs.appendFileSync(filePath, `\n${JSON.stringify(entries[1])}`);
+      const result = indexLiveSession(dbManager, snapshot);
+
+      assert.ok(result);
+      assert.strictEqual(result.messagesIndexed, 1);
+      const rows = dbManager.getDb().prepare('SELECT entry_id, ordinal FROM messages WHERE session_id = ? ORDER BY ordinal').all('file-session-1') as Array<{ entry_id: string; ordinal: number }>;
+      assert.deepStrictEqual(rows, [
+        { entry_id: 'file-entry-1', ordinal: 1 },
+        { entry_id: 'file-entry-2', ordinal: 2 },
+      ]);
+    });
+
+    it('falls back to the canonical file when the indexed live cursor content is stale', () => {
+      const filePath = path.join(tmpDir, 'sessions', 'project', 'file-session.jsonl');
+      writeSessionFile(filePath);
+      const header = { id: 'file-session-1', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/file-project' };
+      indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [], getSessionFile: () => filePath });
+      const updatedEntry = {
+        type: 'message',
+        id: 'file-entry-1',
+        parentId: null,
+        timestamp: '2026-05-03T00:01:00Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'updated canonical content' }] },
+      };
+      fs.writeFileSync(filePath, [
+        JSON.stringify({ type: 'session', ...header }),
+        JSON.stringify(updatedEntry),
+      ].join('\n'));
+
+      const result = indexLiveSession(dbManager, {
+        getHeader: () => header,
+        getEntries: () => [updatedEntry],
+        getSessionFile: () => filePath,
+      });
+
+      assert.ok(result);
+      const row = dbManager.getDb().prepare('SELECT content FROM messages WHERE session_id = ? AND entry_id = ?').get('file-session-1', 'file-entry-1') as { content: string };
+      assert.strictEqual(row.content, 'updated canonical content');
+    });
+
+    it('does not republish a live cursor removed by canonical reconciliation', () => {
+      const filePath = path.join(tmpDir, 'sessions', 'project', 'file-session.jsonl');
+      writeSessionFile(filePath);
+      const header = { id: 'file-session-1', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/file-project' };
+      const staleEntry = {
+        type: 'message',
+        id: 'file-entry-1',
+        parentId: null,
+        timestamp: '2026-05-03T00:01:00Z',
+        message: { role: 'user', content: 'stale live payload' },
+      };
+      indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [], getSessionFile: () => filePath });
+      fs.writeFileSync(filePath, JSON.stringify({ type: 'session', ...header }));
+
+      const result = indexLiveSession(dbManager, {
+        getHeader: () => header,
+        getEntries: () => [staleEntry],
+        getSessionFile: () => filePath,
+      });
+
+      assert.ok(result);
+      assert.strictEqual((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get(header.id) as { count: number }).count, 0);
+    });
+
+    it('does not restore a canonical tail removed before a stale live snapshot arrives', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project', 'tail-session.jsonl');
+      const header = { id: 'tail-session', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/tail-project' };
+      const entry1 = { type: 'message', id: 'tail-entry-1', parentId: null, timestamp: '2026-05-03T00:01:00Z', message: { role: 'user', content: 'kept' } };
+      const entry2 = { type: 'message', id: 'tail-entry-2', parentId: 'tail-entry-1', timestamp: '2026-05-03T00:02:00Z', message: { role: 'assistant', content: 'removed tail' } };
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, [JSON.stringify({ type: 'session', ...header }), JSON.stringify(entry1), JSON.stringify(entry2)].join('\n'));
+      indexAllSessions(dbManager, sessionsDir);
+      fs.writeFileSync(filePath, [JSON.stringify({ type: 'session', ...header }), JSON.stringify(entry1)].join('\n'));
+      indexAllSessions(dbManager, sessionsDir);
+
+      const result = indexLiveSession(dbManager, {
+        getHeader: () => header,
+        getEntries: () => [entry1, entry2],
+        getSessionFile: () => filePath,
+      }, sessionsDir);
+
+      assert.ok(result);
+      assert.strictEqual(result.messagesIndexed, 0);
+      assert.strictEqual((dbManager.getDb().prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ? AND entry_id = ?').get(header.id, entry2.id) as { count: number }).count, 0);
+    });
+
+    it('fails closed for malformed, non-contained, or foreign canonical sources during stale reconciliation', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project', 'file-session.jsonl');
+      writeSessionFile(filePath);
+      const header = { id: 'file-session-1', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/file-project' };
+      const changedEntry = {
+        type: 'message',
+        id: 'file-entry-1',
+        parentId: null,
+        timestamp: '2026-05-03T00:01:00Z',
+        message: { role: 'user', content: 'untrusted changed payload' },
+      };
+      indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [], getSessionFile: () => filePath }, sessionsDir);
+
+      const malformedPath = path.join(sessionsDir, 'project', 'malformed.jsonl');
+      fs.writeFileSync(malformedPath, '{not-json');
+      assert.strictEqual(indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [changedEntry], getSessionFile: () => malformedPath }, sessionsDir), null);
+
+      const outsidePath = path.join(tmpDir, 'outside.jsonl');
+      fs.writeFileSync(outsidePath, fs.readFileSync(filePath));
+      assert.strictEqual(indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [changedEntry], getSessionFile: () => outsidePath }, sessionsDir), null);
+
+      const foreignPath = path.join(sessionsDir, 'project', 'foreign.jsonl');
+      fs.writeFileSync(foreignPath, [
+        JSON.stringify({ type: 'session', id: 'foreign-session', timestamp: header.timestamp, cwd: header.cwd }),
+        JSON.stringify({ ...changedEntry, id: 'foreign-entry' }),
+      ].join('\n'));
+      assert.strictEqual(indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [changedEntry], getSessionFile: () => foreignPath }, sessionsDir), null);
+      assert.equal(dbManager.getDb().prepare('SELECT 1 FROM sessions WHERE id = ?').get('foreign-session'), undefined);
+      const row = dbManager.getDb().prepare('SELECT content FROM messages WHERE session_id = ? AND entry_id = ?').get(header.id, 'file-entry-1') as { content: string };
+      assert.strictEqual(row.content, 'from persisted file');
+    });
+
+    it('reconciles a changed tool call identity even when text and timestamp are unchanged', () => {
+      const filePath = path.join(tmpDir, 'sessions', 'project', 'tool-session.jsonl');
+      const header = { id: 'tool-session', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/tool-project' };
+      const makeEntry = (toolCallId: string) => ({
+        type: 'message',
+        id: 'tool-entry',
+        parentId: null,
+        timestamp: '2026-05-03T00:01:00Z',
+        message: { role: 'toolResult', toolName: 'read', toolCallId, content: [{ type: 'text', text: 'same result' }] },
+      });
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, [JSON.stringify({ type: 'session', ...header }), JSON.stringify(makeEntry('call-old'))].join('\n'));
+      indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [], getSessionFile: () => filePath });
+      const updatedEntry = makeEntry('call-new');
+      fs.writeFileSync(filePath, [JSON.stringify({ type: 'session', ...header }), JSON.stringify(updatedEntry)].join('\n'));
+
+      const result = indexLiveSession(dbManager, { getHeader: () => header, getEntries: () => [updatedEntry], getSessionFile: () => filePath });
+
+      assert.ok(result);
+      const row = dbManager.getDb().prepare('SELECT tool_name, tool_call_id FROM messages WHERE session_id = ? AND entry_id = ?').get(header.id, 'tool-entry') as { tool_name: string; tool_call_id: string };
+      assert.deepStrictEqual(row, { tool_name: 'read', tool_call_id: 'call-new' });
+    });
+
+    it('preserves SessionManager method receivers on the live snapshot path', () => {
+      const snapshot = {
+        header: { id: 'bound-live-session', timestamp: '2026-05-03T00:00:00Z', cwd: '/work/live-project' },
+        entries: [{
+          type: 'message',
+          id: 'bound-live-entry',
+          parentId: null,
+          timestamp: '2026-05-03T00:02:00Z',
+          message: { role: 'user', content: 'bound receiver' },
+        }],
+        getHeader() { return this.header; },
+        getEntries() { return this.entries; },
+      };
+
+      const result = indexLiveSession(dbManager, snapshot);
+
+      assert.ok(result);
+      assert.strictEqual(result.sessionId, 'bound-live-session');
+      assert.strictEqual(result.messagesIndexed, 1);
+    });
+
     it('indexCurrentSession indexes missing live messages idempotently', () => {
       const entries = [
         {
@@ -680,6 +893,119 @@ describe('session-indexer', () => {
       assert.ok(result3);
       assert.strictEqual(result3.skipped, true);
       assert.strictEqual(result3.messagesIndexed, 0);
+    });
+
+    it('uses the indexed cursor ordinal when a partial snapshot contains only new entries', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'live-session-1',
+        messages: [{
+          id: 'entry-1',
+          entryId: 'entry-1',
+          ordinal: 1,
+          role: 'user',
+          content: 'persisted cursor',
+          timestamp: '2026-05-03T00:01:00Z',
+        }],
+      }));
+      const snapshot = createSessionManagerSnapshot([{
+        type: 'message',
+        id: 'entry-2',
+        parentId: 'entry-1',
+        timestamp: '2026-05-03T00:02:00Z',
+        message: { role: 'assistant', content: 'partial append' },
+      }]);
+
+      const result = indexCurrentSession(dbManager, snapshot);
+
+      assert.ok(result);
+      assert.strictEqual(result.messagesIndexed, 1);
+      const row = dbManager.getDb().prepare('SELECT ordinal FROM messages WHERE session_id = ? AND entry_id = ?').get('live-session-1', 'entry-2') as { ordinal: number };
+      assert.strictEqual(row.ordinal, 2);
+    });
+
+    it('indexes a physically appended branch message after the existing live cursor', () => {
+      const entries = [
+        {
+          type: 'message',
+          id: 'branch-root',
+          parentId: null,
+          timestamp: '2026-05-03T00:01:00Z',
+          message: { role: 'user', content: 'root' },
+        },
+        {
+          type: 'message',
+          id: 'old-leaf',
+          parentId: 'branch-root',
+          timestamp: '2026-05-03T00:02:00Z',
+          message: { role: 'assistant', content: 'old leaf' },
+        },
+      ];
+      const snapshot = createSessionManagerSnapshot(entries);
+      indexCurrentSession(dbManager, snapshot);
+      entries.push({
+        type: 'message',
+        id: 'new-branch-leaf',
+        parentId: 'branch-root',
+        timestamp: '2026-05-03T00:03:00Z',
+        message: { role: 'user', content: 'new branch' },
+      });
+
+      const result = indexCurrentSession(dbManager, snapshot);
+
+      assert.ok(result);
+      assert.strictEqual(result.messagesIndexed, 1);
+      const row = dbManager.getDb().prepare('SELECT parent_entry_id, ordinal FROM messages WHERE session_id = ? AND entry_id = ?').get('live-session-1', 'new-branch-leaf') as { parent_entry_id: string; ordinal: number };
+      assert.deepStrictEqual(row, { parent_entry_id: 'branch-root', ordinal: 2 });
+    });
+
+    it('recovers corruption when indexCurrentSession is called directly', () => {
+      const snapshot = createSessionManagerSnapshot([{
+        type: 'message',
+        id: 'entry-after-recovery',
+        timestamp: '2026-05-03T00:01:00Z',
+        message: { role: 'user', content: 'recover me' },
+      }]);
+      let injected = false;
+      setSessionIndexerFaultInjector((statement) => {
+        if (!injected && statement === 'insert-session') {
+          injected = true;
+          const error = new Error('database disk image is malformed') as Error & { code: string };
+          error.code = 'SQLITE_CORRUPT';
+          throw error;
+        }
+      });
+
+      assert.throws(
+        () => indexCurrentSession(dbManager, snapshot),
+        (error: Error & { code?: string }) => error.code === 'SQLITE_CORRUPT',
+      );
+      assert.ok(dbManager.getLastRecovery());
+    });
+
+    it('does not upsert the full live history again when there are no new entries', () => {
+      const entries = Array.from({ length: 1_000 }, (_, index) => ({
+        type: 'message',
+        id: `entry-${index}`,
+        parentId: index === 0 ? null : `entry-${index - 1}`,
+        timestamp: '2026-05-03T00:01:00Z',
+        message: { role: index % 2 === 0 ? 'user' : 'assistant', content: `message ${index}` },
+      }));
+      const snapshot = createSessionManagerSnapshot(entries);
+
+      const first = indexCurrentSession(dbManager, snapshot);
+      assert.ok(first);
+      assert.strictEqual(first.messagesIndexed, entries.length);
+
+      let upserts = 0;
+      setSessionIndexerFaultInjector((statement) => {
+        if (statement === 'upsert-message') upserts++;
+      });
+      const repeated = indexCurrentSession(dbManager, snapshot);
+
+      assert.ok(repeated);
+      assert.strictEqual(repeated.messagesIndexed, 0);
+      assert.strictEqual(repeated.skipped, true);
+      assert.strictEqual(upserts, 0);
     });
   });
 

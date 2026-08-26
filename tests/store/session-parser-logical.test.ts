@@ -55,4 +55,29 @@ describe('logical session parser', () => {
     assert.equal(result.diagnostics?.nulLines, 1);
     assert.deepEqual(resolveActiveLineage(result.entries ?? []), null);
   });
+
+  it('checks a long linear graph without quadratic slowdown', () => {
+    const entries: string[] = [];
+    let parentId: string | null = null;
+    for (let index = 0; index < 15_000; index++) {
+      const id = `entry-${index}`;
+      entries.push(JSON.stringify({
+        type: 'custom',
+        id,
+        parentId,
+        timestamp: '2026-08-26T00:01:00.000Z',
+        customType: 'benchmark',
+        data: {},
+      }));
+      parentId = id;
+    }
+
+    const started = performance.now();
+    const result = parseText(session(entries));
+    const elapsedMs = performance.now() - started;
+
+    assert.equal(result.entries?.length, 15_001);
+    assert.deepEqual(result.diagnostics?.cycles, []);
+    assert.ok(elapsedMs < 1_500, `linear graph diagnostics took ${Math.round(elapsedMs)} ms`);
+  });
 });
