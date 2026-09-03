@@ -26,6 +26,10 @@ describe("buildPromptContext", () => {
     assert.match(result, /category filters categorized failure\/lesson memories only/);
     assert.match(result, /Use category only for categorized failure\/lesson searches/);
     assert.match(result, /session_search: search indexed past conversation messages/);
+    assert.match(result, /Context recovery:/);
+    assert.match(result, /evicted part of the current session or another past session/);
+    assert.match(result, /Do not guess, silently choose a new interpretation, repeat completed work/);
+    assert.match(result, /Use session_get when exact canonical source context is needed/);
     assert.match(result, /skill_manage: list, view, create, patch, update, and delete procedural skills/);
     assert.match(result, /Always pass scope explicitly on create/);
     assert.match(result, /Do not create skills for one-off task state/);
@@ -60,6 +64,9 @@ describe("buildPromptContext", () => {
     assert.match(result, /category filters categorized failure\/lesson memories only/);
     assert.match(result, /scope is required: global for transferable workflows, project for repo-specific ones/);
     assert.match(result, /Do not use memory_search for generic questions/);
+    assert.match(result, /retrieve missing prior context instead of guessing/);
+    assert.match(result, /evicted part of the current session or another past session/);
+    assert.match(result, /session_get for exact canonical source context/);
     assert.doesNotMatch(result, /MEMORY<\/memory-context>/);
     assert.doesNotMatch(result, /PROJECT demo/);
     assert.doesNotMatch(result, /SKILLS/);

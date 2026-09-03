@@ -34,6 +34,11 @@ describe("registerSessionSearchTool", () => {
     assert.doesNotMatch(schema, /markdown/);
     assert.match(schema, /"minimum":1/);
     assert.match(schema, /"maximum":20/);
+    const guidelines = captured.promptGuidelines.join("\n");
+    assert.match(guidelines, /specific fact required for the next step/);
+    assert.match(guidelines, /evicted part of the current session or another past session/);
+    assert.match(guidelines, /Do not guess, repeat completed work/);
+    assert.match(guidelines, /Use session_get when exact canonical source context/);
   });
 
   it("enforces the configured sessions root for legacy and structured runtime searches", async () => {
@@ -328,6 +333,11 @@ describe("registerSessionSearchTool", () => {
       registerSessionSearchTool(mockPi, dbManager, { variant: "structured" }, { currentSessionId: "structured-session" });
       assert.match(JSON.stringify(captured.parameters), /include_current_session/);
       assert.match(JSON.stringify(captured.parameters), /session_id/);
+      const guidelines = captured.promptGuidelines.join("\n");
+      assert.match(guidelines, /specific fact required for the next step/);
+      assert.match(guidelines, /evicted part of the current session or another past session/);
+      assert.match(guidelines, /Do not guess, repeat completed work/);
+      assert.match(guidelines, /Use session_get when exact canonical source context/);
       const result = await captured.execute("structured", { query: "needle", limit: 1 });
       const output = result.content[0].text as string;
       const rows = output === "No results found." ? [] : output.split("\n").map((line: string) => JSON.parse(line));
@@ -404,6 +414,9 @@ describe("registerSessionSearchTool", () => {
     assert.match(captured.description, /path:startLine-endLine with a short reason/);
     assert.match(captured.description, /Example:\nfrom: 2026-05-14/);
     assert.match(captured.promptGuidelines.join("\n"), /Use all for required terms/);
+    assert.match(captured.promptGuidelines.join("\n"), /specific fact required for the next step/);
+    assert.match(captured.promptGuidelines.join("\n"), /evicted part of the current session or another past session/);
+    assert.match(captured.promptGuidelines.join("\n"), /Do not guess, repeat completed work/);
 
     const empty = await captured.execute("tc-1", { markdown: "" });
     assert.strictEqual(empty.details.success, false);

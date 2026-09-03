@@ -94,6 +94,8 @@ exclude:
     promptSnippet: 'Search past session JSONL files for compact source anchors',
     promptGuidelines: [
       'Use session_search with markdown only when the session search anchor mode is configured.',
+      'Before acting, search when a specific fact required for the next step is absent from current context but likely exists in the evicted part of the current session or another past session.',
+      'Do not guess, repeat completed work, or ask the user to restate prior context before attempting a narrow search.',
       'Request source anchors, not summaries or previews.',
       'Use all for required terms, any for alternatives, and exclude for terms that must not appear in a returned range.',
     ],
@@ -156,7 +158,10 @@ function registerStructuredSessionSearchTool(pi: ExtensionAPI, dbManager: Databa
     promptSnippet: 'Search past sessions for canonical structured evidence',
     promptGuidelines: [
       'Use this mode when exact session evidence and an entry anchor are needed.',
+      'Before acting, search when a specific fact required for the next step is absent from current context but likely exists in the evicted part of the current session or another past session.',
+      'Do not guess, repeat completed work, or ask the user to restate prior context before attempting a narrow search.',
       'Pass includeCurrentSession, includeService, or includeToolOutput explicitly when those rows are required.',
+      'Use session_get when exact canonical source context around a result is needed.',
       'Use session_id for an exact ID or a bounded, unambiguous prefix; do not guess among ambiguous prefixes.',
     ],
     renderResult: createSharedToolResultRenderer(searchResultView),
@@ -243,7 +248,9 @@ Returns bounded conversation snippets with session dates and project context. La
     promptSnippet: 'Search past conversations for relevant context',
     promptGuidelines: [
       'Use session_search when the user asks about previous discussions or past work.',
-      'Use session_search when you need context from earlier sessions.',
+      'Before acting, search when a specific fact required for the next step is absent from current context but likely exists in the evicted part of the current session or another past session.',
+      'Do not guess, repeat completed work, or ask the user to restate prior context before attempting a narrow search.',
+      'Use session_get when exact canonical source context around a result is needed.',
     ],
     renderResult: createSharedToolResultRenderer(searchResultView),
     parameters: Type.Object({
