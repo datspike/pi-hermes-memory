@@ -2,12 +2,9 @@
 /**
  * Type-check the extension against the OLDEST Pi SDK we claim to support.
  *
- * Why this exists: `peerDependencies` is the only thing telling a user whether
- * this extension works on their Pi, and nothing verified it. The declared floor
- * had drifted to `>=0.74.0` while `src/handlers/review-memory-ops.ts` imports
- * `@earendil-works/pi-ai/compat`, a subpath that does not exist before 0.80.1 —
- * so anyone on 0.74-0.79.x got ERR_PACKAGE_PATH_NOT_EXPORTED and no extension
- * at all, with nothing in CI to catch it.
+ * Pi requires wildcard peers for host-provided packages, so the supported SDK
+ * floor is tracked by this probe independently of package installation.
+ * Version 0.80.1 introduced the pi-ai/compat subpath used by the extension.
  *
  * The regular `check` job structurally cannot catch this: it installs whatever
  * the devDependency range resolves to, which is always new enough.
@@ -23,10 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCOPE = "@earendil-works";
-// pi-tui is a direct dependency rather than a peer, but its types cross the
-// boundary (ExtensionCommandContext.ui.custom takes a pi-tui TUI). Leaving it
-// at a different version yields a duplicate-private-property error instead of
-// a real finding, so it moves with the floor.
+// All SDK packages move together because their types cross module boundaries.
 const FLOOR_PACKAGES = [`${SCOPE}/pi-coding-agent`, `${SCOPE}/pi-ai`, `${SCOPE}/pi-tui`];
 
 const scopeDir = path.join(repoRoot, "node_modules", SCOPE);
@@ -51,13 +45,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => { restore(); process.exit(130); });
 }
 
-const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf-8"));
-const range = pkg.peerDependencies?.[`${SCOPE}/pi-coding-agent`];
-const floor = /(\d+\.\d+\.\d+)/.exec(range ?? "")?.[1];
-if (!floor) {
-  console.error(`peerDependencies range "${range}" has no explicit floor — pin one like ">=0.80.1"`);
-  process.exit(1);
-}
+const floor = "0.80.1";
 
 console.log(`Minimum supported ${SCOPE}/pi-coding-agent: ${floor}`);
 
@@ -88,7 +76,7 @@ try {
   if (!/Command failed/.test(String(error?.message))) console.error(error);
   console.error(
     `\nsrc does NOT type-check against the declared minimum (${floor}).\n`
-    + "Either raise the peerDependencies floor in package.json to a version that works,\n"
+    + "Either raise the tested SDK floor in this script to a version that works,\n"
     + "or stop using the SDK API that is missing at that version.\n",
   );
 } finally {
