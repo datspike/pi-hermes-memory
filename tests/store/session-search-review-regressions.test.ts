@@ -76,4 +76,33 @@ describe('canonical search review regressions', () => {
     manager.getDb().prepare('UPDATE messages SET entry_id = ?').run('e'.repeat(70_000));
     assert.throws(() => search(), SessionSearchReadLimitError);
   });
+  it('fetches candidate payloads without acquiring a mutation lease', () => {
+    const acquire = manager.acquireMutation;
+    manager.acquireMutation = () => { throw new Error('Search must use read-only SQL'); };
+    try { assert.equal(search()[0].entryId, record.id); }
+    finally { manager.acquireMutation = acquire; }
+  });
+  it('does not let keys grown after compact selection bypass the allocation budget', () => {
+    const db = manager.getDb();
+    const getDb = manager.getDb;
+    manager.getDb = () => ({ prepare(sql: string) {
+      const statement = db.prepare(sql);
+      if (!sql.includes('length(m.session_id) AS session_chars')) return statement;
+      return { ...statement, all(...args: unknown[]) {
+        const rows = statement.all(...args);
+        db.prepare('UPDATE messages SET entry_id = ?').run('e'.repeat(60_000));
+        return rows;
+      }};
+    }} as ReturnType<DatabaseManager['getDb']>);
+    try { assert.throws(() => search(), SessionSearchReadLimitError); }
+    finally { manager.getDb = getDb; }
+  });
+  it('keeps an individually valid historical long key and anchor exact', () => {
+    const id = 'я'.repeat(30_000);
+    manager.getDb().prepare('UPDATE messages SET entry_id = ?').run(id);
+    write(header, { ...record, id });
+    const [result] = search();
+    assert.equal(result.entryId, id);
+    assert.equal(result.anchor, `pi://session/${header.id}#entry=${id}`);
+  });
 });

@@ -154,4 +154,68 @@ describe('session search memory bounds', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('fails explicitly before aggregating many individually valid long Unicode keys', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-key-memory-'));
+    const manager = new DatabaseManager(dir);
+    try {
+      const prefix = 'я'.repeat(59_993);
+      const timestamp = '2026-05-03T00:01:00Z';
+      indexSession(manager, { id: 'unowned-long-keys', project: 'memory-test', cwd: '/memory-test', startedAt: timestamp, endedAt: null,
+        messages: Array.from({ length: 1000 }, (_, index) => ({ id: `${prefix}${String(index).padStart(7, '0')}`, role: 'user' as const, content: 'needle', timestamp })) });
+      manager.close();
+      for (const mode of ['fts', 'like', 'legacy']) {
+        const result = searchInSmallHeap(dir, `
+          if (${JSON.stringify(mode)} === 'like') manager.getDb = () => ({ prepare(sql) {
+            if (sql.includes('bm25(message_fts)')) throw new Error('fts5: synthetic unavailable index');
+            return db.prepare(sql);
+          }});
+          const options = { limit: 50, sessionsDir: ${JSON.stringify(dir)} };
+          try {
+            if (${JSON.stringify(mode)} === 'legacy') searchSessions(manager, 'needle', options);
+            else searchSessionEvidence(manager, 'needle', options);
+            console.log(JSON.stringify({ error: null }));
+          } catch (error) {
+            if (error.name !== 'SessionSearchReadLimitError') throw error;
+            console.log(JSON.stringify({ error: error.name }));
+          }
+        `);
+        // Legacy does not materialize entry IDs, so this candidate set remains cheap.
+        assert.deepEqual(result, { error: mode === 'legacy' ? null : 'SessionSearchReadLimitError' });
+      }
+    } finally {
+      manager.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('bounds aggregate session keys in legacy and structured candidate passes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-session-key-memory-'));
+    const manager = new DatabaseManager(dir);
+    try {
+      const prefix = 'я'.repeat(59_993);
+      const timestamp = '2026-05-03T00:01:00Z';
+      for (let index = 0; index < 72; index++) indexSession(manager, {
+        id: `${prefix}${String(index).padStart(7, '0')}`, project: 'memory-test', cwd: '/memory-test', startedAt: timestamp, endedAt: null,
+        messages: [{ id: 'wanted', role: 'user', content: 'needle', timestamp }],
+      });
+      manager.close();
+      for (const mode of ['legacy', 'structured']) {
+        const result = searchInSmallHeap(dir, `
+          try {
+            const options = { limit: 50, sessionsDir: ${JSON.stringify(dir)} };
+            if (${JSON.stringify(mode)} === 'legacy') searchSessions(manager, 'needle', options);
+            else searchSessionEvidence(manager, 'needle', options);
+            console.log(JSON.stringify({ error: null }));
+          } catch (error) {
+            if (error.name !== 'SessionSearchReadLimitError') throw error;
+            console.log(JSON.stringify({ error: error.name }));
+          }
+        `);
+        assert.deepEqual(result, { error: 'SessionSearchReadLimitError' });
+      }
+    } finally {
+      manager.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

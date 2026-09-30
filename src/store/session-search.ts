@@ -82,10 +82,9 @@ const MAX_EVIDENCE_BYTES = 50 * 1024;
 const MAX_HITS_PER_SESSION = 3;
 // Native/synthetic keys stay exact; oversized identities fail rather than become broken anchors.
 const MAX_SEARCH_ID_CHARS = 65_536;
-const CANDIDATE_FIELDS = `substr(m.session_id, 1, ${MAX_SEARCH_ID_CHARS}) AS session_id,
-  substr(m.entry_id, 1, ${MAX_SEARCH_ID_CHARS}) AS entry_id,
-  (length(m.session_id) > ${MAX_SEARCH_ID_CHARS} OR length(m.entry_id) > ${MAX_SEARCH_ID_CHARS}) AS oversized_identity,
-  substr(m.role, 1, 200) AS role, substr(m.kind, 1, 200) AS kind, substr(m.timestamp, 1, 200) AS timestamp`;
+const MAX_CANDIDATE_KEY_BYTES = 8 * 1024 * 1024;
+const COMPACT_CANDIDATE_FIELDS = `m.rowid AS candidate_rowid, length(m.session_id) AS session_chars,
+  coalesce(length(m.entry_id), 0) AS entry_chars`;
 
 function escapeLikePattern(text: string): string { return text.replace(/[\\%_]/g, '\\$&'); }
 function collectLikeTerms(query: string): string[] {
@@ -102,6 +101,41 @@ function collectLikeTerms(query: string): string[] {
 
 function mapRows(rows: Array<{ session_id: string; project: string; role: string; content: string; timestamp: string; content_chars: number }>): SessionSearchResult[] {
   return rows.map(row => ({ sessionId: row.session_id, project: row.project, role: row.role, content: row.content, timestamp: row.timestamp, snippet: row.content, contentChars: row.content_chars }));
+}
+
+/** Budget compact key sizes before materializing exact keys through any SQLite adapter. */
+function readSearchCandidates<T extends { session_id: string; entry_id?: string; oversized_identity: number }>(
+  db: ReturnType<DatabaseManager['getDb']>, query: string, params: unknown[], legacy = false,
+): T[] {
+  type CompactRow = { candidate_rowid: number; session_chars: number; entry_chars: number };
+  const candidates = db.prepare(query).all(...params) as CompactRow[];
+  let remaining = MAX_CANDIDATE_KEY_BYTES;
+  for (const row of candidates) {
+    if (row.session_chars > MAX_SEARCH_ID_CHARS || (!legacy && row.entry_chars > MAX_SEARCH_ID_CHARS)) throw new SessionSearchReadLimitError();
+    // SQLite counts code points; four bytes cover the largest UTF-16 representation.
+    remaining -= 4 * (row.session_chars + (legacy ? 0 : row.entry_chars));
+    if (remaining < 0) throw new SessionSearchReadLimitError();
+  }
+  const byRow = new Map<number, T>();
+  for (let offset = 0; offset < candidates.length; offset += 64) {
+    const batch = candidates.slice(offset, offset + 64);
+    const sameSizes = `length(m.session_id) <= wanted.session_chars${legacy ? '' : ' AND m.entry_id IS NOT NULL AND length(m.entry_id) <= wanted.entry_chars'}`;
+    const fields = legacy
+      ? `substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, substr(m.content, 1, ${MAX_SNIPPET_CHARS}) AS content, length(m.content) AS content_chars, substr(m.timestamp, 1, 200) AS timestamp`
+      : `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, substr(m.role, 1, 200) AS role, substr(m.kind, 1, 200) AS kind, substr(m.timestamp, 1, 200) AS timestamp`;
+    // Recheck sizes in SQL: a concurrent index change must not bypass the first budget.
+    const rows = db.prepare(`SELECT m.rowid AS candidate_rowid, CASE WHEN ${sameSizes} THEN m.session_id ELSE '' END AS session_id,
+        CASE WHEN ${sameSizes} THEN 0 ELSE 1 END AS oversized_identity, ${fields}
+      FROM (${batch.map((_, index) => index === 0 ? 'SELECT ? AS candidate_rowid, ? AS session_chars, ? AS entry_chars' : 'SELECT ?, ?, ?').join(' UNION ALL ')}) AS wanted
+      JOIN messages m ON m.rowid = wanted.candidate_rowid JOIN sessions s ON s.id = m.session_id`)
+      .all(...batch.flatMap(row => [row.candidate_rowid, row.session_chars, row.entry_chars])) as Array<T & { candidate_rowid: number }>;
+    for (const row of rows) {
+      if (row.oversized_identity) throw new SessionSearchReadLimitError();
+      byRow.set(row.candidate_rowid, row);
+    }
+  }
+  // Payload fetch order is irrelevant; preserve the original ranked candidate order.
+  return candidates.flatMap(row => { const value = byRow.get(row.candidate_rowid); return value ? [value] : []; });
 }
 
 /** Original FTS/LIKE search. Its ordering and result shape are intentionally unchanged. */
@@ -140,8 +174,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     try {
       // Bound payloads inside SQLite: a row limit does not bound large messages,
       // and selecting content twice creates two independent V8 strings.
-      const rows = db.prepare(`SELECT substr(m.session_id, 1, ${MAX_SEARCH_ID_CHARS}) AS session_id, length(m.session_id) > ${MAX_SEARCH_ID_CHARS} AS oversized_identity, substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, substr(m.content, 1, ?) AS content, length(m.content) AS content_chars, substr(m.timestamp, 1, 200) AS timestamp FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?`).all(MAX_SNIPPET_CHARS, ...params, Math.max(limit * 20, limit)) as Array<{ session_id: string; oversized_identity: number; project: string; role: string; content: string; timestamp: string; content_chars: number }>;
-      if (rows.some(row => row.oversized_identity)) throw new SessionSearchReadLimitError();
+      const rows = readSearchCandidates(db, `SELECT ${COMPACT_CANDIDATE_FIELDS} FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?`, [...params, Math.max(limit * 20, limit)], true) as Array<{ session_id: string; oversized_identity: number; project: string; role: string; content: string; timestamp: string; content_chars: number }>;
       const visible: typeof rows = [];
       for (const row of rows) {
         if (options.sessionsDir && !hasCanonical(row.session_id)) continue;
@@ -295,28 +328,28 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
   if (options.sessionId && !resolved.ids?.length) return { results: [], ambiguousSessionIds: resolved.ambiguous };
   const terms = collectLikeTerms(query);
   const normalized = normalizeFts5Query(query);
-  type CandidateRow = { session_id: string; entry_id: string; oversized_identity: number; role: string; kind: string; timestamp: string; bm25_score: number | null };
+  type CandidateRow = { session_id: string; entry_id: string; oversized_identity: number; role: string; kind: string; timestamp: string };
   const filterSql = `${resolved.ids?.length ? `AND m.session_id IN (${resolved.ids.map(() => '?').join(',')})` : ''} ${options.project ? 'AND s.project = ?' : ''} ${options.role ? 'AND m.role = ?' : ''} ${options.since ? 'AND m.timestamp >= ?' : ''}`;
   const filterParams = [...(resolved.ids ?? []), ...(options.project ? [options.project] : []), ...(options.role ? [options.role] : []), ...(options.since ? [options.since] : [])];
   let candidateRows: CandidateRow[];
   try {
-    candidateRows = db.prepare(`
-      SELECT ${CANDIDATE_FIELDS}, bm25(message_fts) AS bm25_score
+    candidateRows = readSearchCandidates(db, `
+      SELECT ${COMPACT_CANDIDATE_FIELDS}, bm25(message_fts) AS bm25_score
       FROM messages m JOIN sessions s ON s.id = m.session_id
       LEFT JOIN message_fts ON message_fts.rowid = m.rowid
       WHERE m.entry_id IS NOT NULL AND (m.rowid IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?) OR ${terms.length ? terms.map(() => 'm.content LIKE ? ESCAPE \'\\\'').join(' OR ') : '0'}) ${filterSql}
       ORDER BY CASE WHEN bm25(message_fts) IS NULL THEN 1 ELSE 0 END, bm25_score ASC, m.timestamp DESC, m.session_id ASC, m.entry_id ASC
-      LIMIT ?`).all(normalized || '""', ...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20) as CandidateRow[];
-  } catch {
+      LIMIT ?`, [normalized || '""', ...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20]) as CandidateRow[];
+  } catch (error) {
+    if (error instanceof SessionSearchReadLimitError) throw error;
     // Malformed MATCH expressions are untrusted input; use a bounded LIKE candidate scan.
     if (!terms.length) return { results: [], ambiguousSessionIds: [] };
-    candidateRows = db.prepare(`
-      SELECT ${CANDIDATE_FIELDS}, NULL AS bm25_score
+    candidateRows = readSearchCandidates(db, `
+      SELECT ${COMPACT_CANDIDATE_FIELDS}, NULL AS bm25_score
       FROM messages m JOIN sessions s ON s.id = m.session_id
       WHERE m.entry_id IS NOT NULL AND (${terms.map(() => 'm.content LIKE ? ESCAPE \'\\\'').join(' OR ')}) ${filterSql}
-      ORDER BY m.timestamp DESC, m.session_id ASC, m.entry_id ASC LIMIT ?`).all(...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20) as CandidateRow[];
+      ORDER BY m.timestamp DESC, m.session_id ASC, m.entry_id ASC LIMIT ?`, [...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20]) as CandidateRow[];
   }
-  if (candidateRows.some(row => row.oversized_identity)) throw new SessionSearchReadLimitError();
   const requestedEntries = new Map<string, Set<string>>();
   for (const row of candidateRows) {
     if (!requestedEntries.has(row.session_id)) requestedEntries.set(row.session_id, new Set());
