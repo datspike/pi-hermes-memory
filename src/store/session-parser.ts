@@ -212,44 +212,35 @@ export function resolveActiveLineage(entries: readonly ParsedEntry[]): string[] 
   return lineage;
 }
 
+function parseEntry(raw: JsonlEntry, sessionId: string, ordinal: number, identityByRawId: Map<string, string | null>): ParsedEntry {
+  const kind = entryKind(raw);
+  const rawRole = raw.message?.role;
+  const role = rawRole === 'toolResult' ? 'system' : rawRole === 'user' || rawRole === 'assistant' || rawRole === 'system' ? rawRole : null;
+  const blocks = toolBlocks(raw.message?.content);
+  const content = extractTextContent(raw.message?.content) || (blocks.length ? `Tool call: ${blocks.map((call) => call.name).join(', ')}` : '');
+  const timestamp = typeof raw.timestamp === 'string' ? raw.timestamp : typeof raw.message?.timestamp === 'number' ? new Date(raw.message.timestamp).toISOString() : null;
+  const rawParentId = typeof raw.parentId === 'string' ? raw.parentId : null;
+  const parentEntryId = rawParentId ? identityByRawId.get(rawParentId) ?? rawParentId : 'root';
+  const nativeId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : null;
+  const toolName = typeof raw.message?.toolName === 'string' ? raw.message.toolName : blocks[0]?.name ?? null;
+  const payload = { type: raw.type, message: raw.message, name: raw.name, title: raw.title };
+  const synthetic = nativeId ? null : deriveSyntheticEntryId({ sessionId, kind, parentIdentity: parentEntryId, timestamp, role, toolIdentity: toolName, payload });
+  const entryId = nativeId ?? synthetic;
+  if (nativeId) identityByRawId.set(nativeId, nativeId);
+  else if (synthetic) identityByRawId.set(`ordinal:${ordinal}`, synthetic);
+  return {
+    id: nativeId, entryId, identityStatus: nativeId ? 'native' : synthetic ? 'synthetic' : 'unresolvable',
+    kind: rawRole === 'toolResult' ? 'tool_result' : blocks.length ? 'tool_call' : kind,
+    parentId: rawParentId, parentEntryId, ordinal, role, content, timestamp, toolName,
+    toolCallId: extractToolCallId(raw.message, raw.message?.content),
+    toolCalls: blocks.length ? extractToolCalls(raw.message?.content) : undefined,
+    diagnostics: entryId ? [] : ['missing-or-non-reproducible-identity'],
+  };
+}
+
 function parseEntries(rawEntries: JsonlEntry[], sessionId: string, malformedLines: number, nulLines: number): { entries: ParsedEntry[]; diagnostics: SessionGraphDiagnostics } {
-  const entries: ParsedEntry[] = [];
   const identityByRawId = new Map<string, string | null>();
-  for (const [ordinal, raw] of rawEntries.entries()) {
-    const kind = entryKind(raw);
-    const rawRole = raw.message?.role;
-    const role = rawRole === 'toolResult' ? 'system' : rawRole === 'user' || rawRole === 'assistant' || rawRole === 'system' ? rawRole : null;
-    const blocks = toolBlocks(raw.message?.content);
-    const content = extractTextContent(raw.message?.content) || (blocks.length ? `Tool call: ${blocks.map((call) => call.name).join(', ')}` : '');
-    const timestamp = typeof raw.timestamp === 'string' ? raw.timestamp : typeof raw.message?.timestamp === 'number' ? new Date(raw.message.timestamp).toISOString() : null;
-    const rawParentId = typeof raw.parentId === 'string' ? raw.parentId : null;
-    const parentEntryId = rawParentId ? identityByRawId.get(rawParentId) ?? rawParentId : 'root';
-    const nativeId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : null;
-    const toolName = typeof raw.message?.toolName === 'string' ? raw.message.toolName : blocks[0]?.name ?? null;
-    const payload = { type: raw.type, message: raw.message, name: raw.name, title: raw.title };
-    const synthetic = nativeId ? null : deriveSyntheticEntryId({ sessionId, kind, parentIdentity: parentEntryId, timestamp, role, toolIdentity: toolName, payload });
-    const entryId = nativeId ?? synthetic;
-    const identityStatus: SessionEntryIdentityStatus = nativeId ? 'native' : synthetic ? 'synthetic' : 'unresolvable';
-    const entry: ParsedEntry = {
-      id: nativeId,
-      entryId,
-      identityStatus,
-      kind: rawRole === 'toolResult' ? 'tool_result' : blocks.length ? 'tool_call' : kind,
-      parentId: rawParentId,
-      parentEntryId,
-      ordinal,
-      role,
-      content,
-      timestamp,
-      toolName: typeof raw.message?.toolName === 'string' ? raw.message.toolName : blocks[0]?.name ?? null,
-      toolCallId: extractToolCallId(raw.message, raw.message?.content),
-      toolCalls: blocks.length ? extractToolCalls(raw.message?.content) : undefined,
-      diagnostics: entryId ? [] : ['missing-or-non-reproducible-identity'],
-    };
-    entries.push(entry);
-    if (nativeId) identityByRawId.set(nativeId, nativeId);
-    else if (synthetic) identityByRawId.set(`ordinal:${ordinal}`, synthetic);
-  }
+  const entries = rawEntries.map((raw, ordinal) => parseEntry(raw, sessionId, ordinal, identityByRawId));
   const counts = new Map<string, number>();
   for (const entry of entries) if (entry.entryId) counts.set(entry.entryId, (counts.get(entry.entryId) ?? 0) + 1);
   for (const entry of entries) {
@@ -336,6 +327,112 @@ export function parseSessionFile(filePath: string, maxBytes?: number): ParsedSes
   } finally {
     fs.closeSync(fd);
   }
+}
+
+export const SESSION_SEARCH_MAX_SCAN_BYTES = 512 * 1024 * 1024;
+export const SESSION_SEARCH_MAX_LINE_BYTES = 8 * 1024 * 1024;
+const SESSION_SEARCH_MAX_ENTRIES = 100_000;
+
+export class SessionSearchReadLimitError extends Error {
+  constructor() {
+    super('Session search read limit reached; narrow the project, session, or date filters.');
+    this.name = 'SessionSearchReadLimitError';
+  }
+}
+
+export interface SessionSearchReadOptions {
+  sessionId: string;
+  entryIds?: ReadonlySet<string>;
+  /** Shared by all canonical reads in one search, including fallback queries. */
+  budget: { remainingBytes: number };
+  /** Reduce a matched entry before retaining it; classification uses its full payload. */
+  transformEntry?: (entry: ParsedEntry) => ParsedEntry;
+}
+
+/** Read canonical metadata and requested entries without retaining the whole transcript. */
+export function parseSessionFileForSearch(filePath: string, options: SessionSearchReadOptions): ParsedSession | null {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const initial = fs.fstatSync(fd);
+    if (initial.size > options.budget.remainingBytes) throw new SessionSearchReadLimitError();
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let fragments: Buffer[] = [];
+    let lineBytes = 0;
+    let ordinal = 0;
+    let malformedLines = 0;
+    let nulLines = 0;
+    let id: string | null = null;
+    let cwd: string | null = null;
+    let startedAt: string | null = null;
+    let name: string | null = null;
+    let title: string | null = null;
+    const identityByRawId = new Map<string, string | null>();
+    const entries = new Map<string, ParsedEntry>();
+    const wantsSynthetic = [...(options.entryIds ?? [])].some(value => value.startsWith('syn:v1:'));
+    const consume = (line: string): void => {
+      if (!line.trim()) return;
+      if (line.includes('\0')) { nulLines++; return; }
+      let raw: JsonlEntry;
+      try { raw = JSON.parse(line) as JsonlEntry; } catch { malformedLines++; return; }
+      if (!raw || typeof raw !== 'object') { malformedLines++; return; }
+      if (++ordinal > SESSION_SEARCH_MAX_ENTRIES) throw new SessionSearchReadLimitError();
+      if (raw.type === 'session' && typeof raw.id === 'string') {
+        id = raw.id;
+        cwd = typeof raw.cwd === 'string' ? raw.cwd : cwd;
+        startedAt = typeof raw.timestamp === 'string' ? raw.timestamp : startedAt;
+      }
+      if (raw.type === 'session_info' || raw.type === 'session') {
+        if (typeof raw.name === 'string' && raw.name.trim()) name = raw.name;
+        else if (raw.name === '') name = null;
+        if (typeof raw.title === 'string' && raw.title.trim()) title = raw.title;
+        else if (raw.title === '') title = null;
+      }
+      const nativeId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : null;
+      // Native parent identities are unchanged. Only synthetic identities need
+      // the ordinal map when the requested evidence contains a synthetic ID.
+      if (!options.entryIds?.has(nativeId ?? '') && !(wantsSynthetic && !nativeId)) return;
+      const entry = parseEntry(raw, options.sessionId, ordinal - 1, identityByRawId);
+      if (!entry.entryId || !options.entryIds?.has(entry.entryId)) return;
+      if (entries.has(entry.entryId)) {
+        entries.get(entry.entryId)!.identityStatus = 'ambiguous';
+        return;
+      }
+      const retained = options.transformEntry?.(entry) ?? { ...entry, content: entry.content.slice(0, 4_000) };
+      // A sliced string may retain the full parsed body; copy only the bounded UTF-16 units.
+      const content = Buffer.from(retained.content.slice(0, 8_000), 'utf16le').toString('utf16le');
+      entries.set(entry.entryId, { ...retained, content });
+    };
+    const addFragment = (part: Buffer): void => {
+      lineBytes += part.length;
+      if (lineBytes > SESSION_SEARCH_MAX_LINE_BYTES) throw new SessionSearchReadLimitError();
+      if (part.length) fragments.push(Buffer.from(part));
+    };
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (!read) break;
+      options.budget.remainingBytes -= read;
+      if (options.budget.remainingBytes < 0) throw new SessionSearchReadLimitError();
+      let start = 0;
+      for (let end = 0; end < read; end++) {
+        if (chunk[end] !== 10) continue;
+        addFragment(chunk.subarray(start, end));
+        consume(Buffer.concat(fragments, lineBytes).toString('utf8'));
+        fragments = [];
+        lineBytes = 0;
+        start = end + 1;
+      }
+      addFragment(chunk.subarray(start, read));
+    }
+    if (lineBytes) consume(Buffer.concat(fragments, lineBytes).toString('utf8'));
+    const final = fs.fstatSync(fd);
+    if (final.size !== initial.size || final.mtimeMs !== initial.mtimeMs) return null;
+    if (id !== options.sessionId || !cwd || !startedAt) return null;
+    return {
+      id, project: path.basename(cwd) || cwd, cwd, startedAt, endedAt: null, name, title, metadata: null,
+      entries: [...entries.values()], messages: [],
+      diagnostics: { malformedLines, nulLines, duplicateStructuralIds: [], cycles: [], orphanParents: [], multipleDescendantLeaves: [], messages: [] },
+    };
+  } finally { fs.closeSync(fd); }
 }
 
 export function parseSessionEntries(content: string, sessionId: string): ParsedEntry[] {
