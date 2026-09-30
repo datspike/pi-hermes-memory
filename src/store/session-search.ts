@@ -152,7 +152,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
       canonicalCache.set(sessionId, canonicalSessionOwners(db, sessionId, options.sessionsDir, file => {
         const session = parseSessionFileForSearch(file, { sessionId, budget });
         return session ? boundSessionForSearch(session, options.project) : null;
-      }).length > 0);
+      }, true).length > 0);
     }
     return canonicalCache.get(sessionId)!;
   };
@@ -374,7 +374,7 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
           }),
         });
         return session ? boundSessionForSearch(session, options.project) : null;
-      })[0];
+      }, true)[0];
       canonicalCache.set(sessionId, (owner?.session as CanonicalSearchSession | undefined) ?? null);
     }
     return canonicalCache.get(sessionId)!;

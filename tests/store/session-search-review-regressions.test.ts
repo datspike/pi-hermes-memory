@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseManager } from '../../src/store/db.js';
-import { indexSession, upsertSessionFileMetadata } from '../../src/store/session-indexer.js';
+import { canonicalSessionOwners, indexSession, upsertSessionFileMetadata } from '../../src/store/session-indexer.js';
 import { searchSessions, searchSessionEvidence, type SessionSearchEvidenceOptions } from '../../src/store/session-search.js';
-import { SessionSearchReadLimitError } from '../../src/store/session-parser.js';
+import { parseSessionFileForSearch, SESSION_SEARCH_MAX_SCAN_BYTES, SessionSearchReadLimitError } from '../../src/store/session-parser.js';
 
 /** Keep the indexed candidate fixed while independently changing its canonical facts. */
 describe('canonical search review regressions', () => {
@@ -104,5 +104,56 @@ describe('canonical search review regressions', () => {
     const [result] = search();
     assert.equal(result.entryId, id);
     assert.equal(result.anchor, `pi://session/${header.id}#entry=${id}`);
+  });
+  it('returns the valid priority owner without reading an over-budget lower owner in either mode', () => {
+    const lower = path.join(dir, 'lower.jsonl');
+    fs.writeFileSync(lower, `${JSON.stringify(header)}\n${JSON.stringify(record)}\n`);
+    // A sparse file exercises the real size guard without allocating a large corpus.
+    fs.truncateSync(lower, SESSION_SEARCH_MAX_SCAN_BYTES + 1);
+    upsertSessionFileMetadata(manager, lower, header.id);
+    manager.getDb().prepare('UPDATE session_files SET indexed_at = ? WHERE path = ?').run('2020-01-01T00:00:00Z', lower);
+    assert.equal(searchSessions(manager, 'needle', { sessionsDir: dir })[0].sessionId, header.id);
+    assert.equal(search()[0].entryId, record.id);
+  });
+  it('stops after one valid owner within a shared budget but preserves default full validation', () => {
+    const lower = path.join(dir, 'lower.jsonl');
+    fs.copyFileSync(file, lower);
+    upsertSessionFileMetadata(manager, lower, header.id);
+    const db = manager.getDb();
+    db.prepare('UPDATE session_files SET indexed_at = ? WHERE path = ?').run('2020-01-01T00:00:00Z', lower);
+    const budget = { remainingBytes: fs.statSync(file).size + 1 };
+    let attempted: string[] = [];
+    const read = (owner: string) => {
+      attempted.push(owner);
+      return parseSessionFileForSearch(owner, { sessionId: header.id, budget });
+    };
+    assert.equal(canonicalSessionOwners(db, header.id, dir, read, true)[0].path, file);
+    assert.deepEqual(attempted, [file]);
+    budget.remainingBytes = fs.statSync(file).size + 1;
+    attempted = [];
+    assert.throws(() => canonicalSessionOwners(db, header.id, dir, read), SessionSearchReadLimitError);
+    assert.deepEqual(attempted, [file, lower]);
+  });
+  it('continues to a valid lower owner when the priority owner has a different header', () => {
+    write({ ...header, id: 'wrong-session' });
+    const lower = path.join(dir, 'lower.jsonl');
+    fs.writeFileSync(lower, `${JSON.stringify(header)}\n${JSON.stringify({ ...record, message: { role: 'user', content: 'needle backup' } })}\n`);
+    upsertSessionFileMetadata(manager, lower, header.id);
+    manager.getDb().prepare('UPDATE session_files SET indexed_at = ? WHERE path = ?').run('2020-01-01T00:00:00Z', lower);
+    assert.equal(searchSessions(manager, 'needle', { sessionsDir: dir })[0].sessionId, header.id);
+    assert.equal(search()[0].snippet, 'needle backup');
+  });
+  it('preserves canonical locale priority for equal indexing timestamps', () => {
+    const db = manager.getDb();
+    db.prepare('DELETE FROM session_files WHERE path = ?').run(file);
+    const paths = ['Z.jsonl', 'a.jsonl'].map(name => path.join(dir, name));
+    for (const owner of paths) {
+      fs.writeFileSync(owner, `${JSON.stringify(header)}\n${JSON.stringify({ ...record, message: { role: 'user', content: `needle ${path.basename(owner)}` } })}\n`);
+      upsertSessionFileMetadata(manager, owner, header.id);
+      db.prepare('UPDATE session_files SET indexed_at = ? WHERE path = ?').run('2020-01-01T00:00:00Z', owner);
+    }
+    const [expected] = paths.sort((a, b) => b.localeCompare(a));
+    assert.equal(canonicalSessionOwners(db, header.id, dir)[0].path, expected);
+    assert.equal(search()[0].snippet, `needle ${path.basename(expected)}`);
   });
 });
