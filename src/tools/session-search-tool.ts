@@ -33,10 +33,10 @@ const DEFAULT_LEGACY_SNIPPET_CHARS = 1_200;
 const MAX_LEGACY_SNIPPET_CHARS = 4_000;
 const MAX_LEGACY_OUTPUT_CHARS = 50 * 1024;
 
-function truncateLegacySnippet(text: string, maxChars: number): { text: string; truncated: boolean } {
-  if (text.length <= maxChars) return { text, truncated: false };
+function truncateLegacySnippet(text: string, maxChars: number, originalChars = text.length): { text: string; truncated: boolean } {
+  if (text.length <= maxChars && originalChars <= maxChars) return { text, truncated: false };
   return {
-    text: `${text.slice(0, maxChars)}\n... (truncated, ${text.length} chars total — refine the query or increase snippetChars)`,
+    text: `${text.slice(0, maxChars)}\n... (truncated, ${originalChars} chars total — refine the query or increase snippetChars)`,
     truncated: true,
   };
 }
@@ -324,7 +324,7 @@ Returns bounded conversation snippets with session dates and project context. La
           day: 'numeric',
         });
 
-        const snippet = truncateLegacySnippet(r.snippet, snippetChars);
+        const snippet = truncateLegacySnippet(r.snippet, snippetChars, r.contentChars);
         if (snippet.truncated) truncatedCount += 1;
         blocks.push([
           '---',

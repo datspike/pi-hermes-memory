@@ -339,6 +339,11 @@ Search behavior notes:
 - Multi-word natural-language queries are supported for both `memory_search` and `session_search`.
 - Exact phrases can be requested with quotes, for example `"memory search"`.
 - Advanced FTS queries with operators like `OR` still work when you need them.
+- Legacy session search loads at most 4,000 content characters per candidate inside SQLite, then applies the requested snippet limit. Truncated results retain the original SQLite character count; other candidate fields are bounded too.
+- Session search first selects compact rowids and key sizes. Each SQL candidate pass has an 8 MiB key-allocation estimate, charged conservatively at four bytes per Unicode code point before loading exact keys into JavaScript. Payloads are fetched in batches of 64, with key sizes rechecked inside SQL to prevent a concurrent index update from bypassing the budget.
+- Structured session search loads bounded keys and scalar metadata, not repeated session names, working directories or tool payloads. Canonical validation streams JSONL and retains only requested entries and detached, bounded display fields; small excerpts cannot keep their large source strings alive. Search stops after the first valid contained owner in canonical priority order, so lower-priority aliases cannot consume its scan budget; the full owner-validation policy for `session_get` is unchanged. Role, project and date filters are rechecked against full canonical facts before truncation.
+- Canonical search reads share a 512 MiB budget per request, with an 8 MiB limit per JSONL line and 100,000 valid records per file. Search rejects session or entry identities longer than 65,536 characters instead of truncating anchors. Exceeding a limit raises an explicit search error asking for narrower filters, rather than returning a misleading partial result. A transcript changed during a read is not published as canonical evidence.
+- These bounds apply to legacy and structured `session_search`; indexing, anchor mode, and `session_get` keep their existing behavior.
 
 Session history is indexed automatically during the active session and on session shutdown. Startup also runs a bounded incremental backfill for missed sessions: it compares stored file metadata and only parses files without matching metadata, capped per startup. To bulk-import existing sessions manually:
 

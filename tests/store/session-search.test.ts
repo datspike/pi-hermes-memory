@@ -259,11 +259,11 @@ describe('session-search', () => {
         ...Array.from({ length: 40 }, (_, index) => JSON.stringify({ type: 'message', id: `${id}-entry-${index}`, timestamp: `2026-05-03T00:01:${String(index).padStart(2, '0')}Z`, message: { role: 'user', content: 'dedupe needle' } })),
       ].join('\n') + '\n');
       indexLiveSession(dbManager, { getHeader: () => ({ id, cwd: '/dedupe', timestamp: '2026-05-03T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file });
-      const originalReadFileSync = fs.readFileSync;
+      const originalOpenSync = fs.openSync;
       let reads = 0;
-      (fs as any).readFileSync = (...args: any[]) => {
+      (fs as any).openSync = (...args: any[]) => {
         if (typeof args[0] === 'string' && path.resolve(args[0]) === path.resolve(file)) reads++;
-        return (originalReadFileSync as any)(...args);
+        return (originalOpenSync as any)(...args);
       };
       try {
         const legacy = searchSessions(dbManager, 'needle', { limit: 10, sessionsDir: tmpDir });
@@ -275,7 +275,7 @@ describe('session-search', () => {
         assert.strictEqual(structured.results.length, 3);
         assert.strictEqual(reads, 1);
       } finally {
-        (fs as any).readFileSync = originalReadFileSync;
+        (fs as any).openSync = originalOpenSync;
       }
     });
   });
