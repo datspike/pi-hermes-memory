@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseManager } from './db.js';
-import { parseSessionFile, parseSessionManagerSnapshot as parseCanonicalSnapshot, getSessionFiles, SessionFileTooLargeError, type ParsedSession } from './session-parser.js';
+import { parseSessionFile, parseSessionManagerSnapshot as parseCanonicalSnapshot, getSessionFiles, SessionFileTooLargeError, SessionSearchReadLimitError, type ParsedSession } from './session-parser.js';
 
 export const LAST_SESSION_BACKFILL_KEY = 'last_session_backfill';
 export const SESSION_BACKFILL_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -63,16 +63,21 @@ export function containedCanonicalPath(sessionsDir: string | undefined, candidat
   return real;
 }
 
-export function canonicalSessionOwners(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, sessionsDir?: string): Array<{ path: string; session: ParsedSession }> {
+/** Resolve contained owners in canonical priority order using the caller's read policy. */
+export function canonicalSessionOwners(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, sessionsDir?: string, readSession: (filePath: string) => ParsedSession | null = parseSessionFile): Array<{ path: string; session: ParsedSession }> {
   const owners = db.prepare('SELECT path, indexed_at FROM session_files WHERE session_id = ? ORDER BY indexed_at DESC, path DESC').all(sessionId) as Array<{ path: string; indexed_at: string }>;
   const valid: Array<{ path: string; session: ParsedSession; indexedAt: string }> = [];
   for (const owner of owners) {
     const contained = containedCanonicalPath(sessionsDir, owner.path);
     if (!contained) continue;
     try {
-      const session = parseSessionFile(contained);
+      const session = readSession(contained);
       if (session?.id === sessionId) valid.push({ path: contained, session, indexedAt: owner.indexed_at });
-    } catch { /* invalid JSONL is not canonical evidence */ }
+    } catch (error) {
+      // A budget failure is not evidence that the transcript is invalid.
+      // Surface it instead of silently turning a partial search into no hits.
+      if (error instanceof SessionSearchReadLimitError) throw error;
+    }
   }
   return valid
     .sort((a, b) => b.indexedAt.localeCompare(a.indexedAt) || b.path.localeCompare(a.path))
