@@ -95,4 +95,63 @@ describe('session search memory bounds', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('bounds repeated SQL metadata in legacy, structured FTS and structured LIKE candidates', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-metadata-memory-'));
+    const manager = new DatabaseManager(dir);
+    try {
+      const wide = 'я'.repeat(512 * 1024);
+      const file = path.join(dir, 'metadata.jsonl');
+      const timestamp = '2026-05-03T00:01:00Z';
+      const messages = Array.from({ length: 120 }, (_, index) => ({ id: `entry-${index}`, role: 'user' as const, content: 'needle', timestamp }));
+      indexSession(manager, { id: 'metadata', project: wide, cwd: `/${wide}`, name: wide, startedAt: timestamp, endedAt: null, messages });
+      manager.getDb().prepare('UPDATE messages SET tool_name = ?, tool_call_id = ?, timestamp = ?').run(wide, wide, 'x'.repeat(8_000));
+      fs.writeFileSync(file, JSON.stringify({ type: 'session', id: 'metadata', cwd: `/${wide}`, name: wide, title: wide, timestamp }) + '\n');
+      for (const entry of messages) fs.appendFileSync(file, JSON.stringify({ type: 'message', id: entry.id, timestamp, message: { role: entry.role, content: entry.content, toolName: wide, toolCallId: wide } }) + '\n');
+      upsertSessionFileMetadata(manager, file, 'metadata');
+      manager.close();
+      for (const mode of ['legacy', 'fts', 'like']) {
+        const result = searchInSmallHeap(dir, `
+          if (${JSON.stringify(mode)} === 'like') manager.getDb = () => ({ prepare(sql) {
+            if (sql.includes('bm25(message_fts)')) throw new Error('fts5: synthetic unavailable index');
+            return db.prepare(sql);
+          }});
+          const options = { limit: 50, sessionsDir: ${JSON.stringify(dir)}, includeToolOutput: true };
+          const results = ${JSON.stringify(mode)} === 'legacy' ? searchSessions(manager, 'needle', options) : searchSessionEvidence(manager, 'needle', options).results;
+          console.log(JSON.stringify({ count: results.length, bounded: results.every(row => row.project.length <= 1000 && (!row.name || row.name.length <= 1000) && (!row.cwd || row.cwd.length <= 2000) && (!row.tool || row.tool.length <= 500) && (!row.tool_call_id || row.tool_call_id.length <= 500)) }));
+        `);
+        assert.deepEqual(result, { count: mode === 'legacy' ? 20 : 3, bounded: true });
+      }
+    } finally {
+      manager.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('detaches bounded canonical metadata before caching many distinct sessions', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-cache-memory-'));
+    const manager = new DatabaseManager(dir);
+    try {
+      const name = 'я'.repeat(512 * 1024);
+      const timestamp = '2026-05-03T00:01:00Z';
+      for (let index = 0; index < 120; index++) {
+        const id = `cached-${index}`;
+        const file = path.join(dir, `${id}.jsonl`);
+        indexSession(manager, { id, project: 'memory-test', cwd: '/memory-test', name, startedAt: timestamp, endedAt: null,
+          messages: [{ id: 'wanted', role: 'user', content: 'needle', timestamp }] });
+        fs.writeFileSync(file, JSON.stringify({ type: 'session', id, cwd: '/memory-test', name, timestamp }) + '\n' +
+          JSON.stringify({ type: 'message', id: 'wanted', timestamp, message: { role: 'user', content: 'needle' } }) + '\n');
+        upsertSessionFileMetadata(manager, file, id);
+      }
+      manager.close();
+      const result = searchInSmallHeap(dir, `
+        const results = searchSessionEvidence(manager, 'needle', { limit: 50, sessionsDir: ${JSON.stringify(dir)} }).results;
+        console.log(JSON.stringify({ count: results.length, bounded: results.every(row => row.name.length === 1000) }));
+      `);
+      assert.deepEqual(result, { count: 50, bounded: true });
+    } finally {
+      manager.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

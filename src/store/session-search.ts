@@ -1,5 +1,5 @@
 import { DatabaseManager } from './db.js';
-import { parseSessionFileForSearch, SESSION_SEARCH_MAX_SCAN_BYTES, type ParsedEntry, type ParsedSession } from './session-parser.js';
+import { parseSessionFileForSearch, SessionSearchReadLimitError, SESSION_SEARCH_MAX_SCAN_BYTES, type ParsedEntry, type ParsedSession } from './session-parser.js';
 import { canonicalSessionOwners } from './session-indexer.js';
 import {
   buildFallbackFts5Query,
@@ -80,6 +80,12 @@ const DEFAULT_SNIPPET_CHARS = 1_200;
 const MAX_SNIPPET_CHARS = 4_000;
 const MAX_EVIDENCE_BYTES = 50 * 1024;
 const MAX_HITS_PER_SESSION = 3;
+// Native/synthetic keys stay exact; oversized identities fail rather than become broken anchors.
+const MAX_SEARCH_ID_CHARS = 65_536;
+const CANDIDATE_FIELDS = `substr(m.session_id, 1, ${MAX_SEARCH_ID_CHARS}) AS session_id,
+  substr(m.entry_id, 1, ${MAX_SEARCH_ID_CHARS}) AS entry_id,
+  (length(m.session_id) > ${MAX_SEARCH_ID_CHARS} OR length(m.entry_id) > ${MAX_SEARCH_ID_CHARS}) AS oversized_identity,
+  substr(m.role, 1, 200) AS role, substr(m.kind, 1, 200) AS kind, substr(m.timestamp, 1, 200) AS timestamp`;
 
 function escapeLikePattern(text: string): string { return text.replace(/[\\%_]/g, '\\$&'); }
 function collectLikeTerms(query: string): string[] {
@@ -109,8 +115,10 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
   const canonicalCache = new Map<string, boolean>();
   const hasCanonical = (sessionId: string): boolean => {
     if (!canonicalCache.has(sessionId)) {
-      canonicalCache.set(sessionId, canonicalSessionOwners(db, sessionId, options.sessionsDir,
-        file => parseSessionFileForSearch(file, { sessionId, budget })).length > 0);
+      canonicalCache.set(sessionId, canonicalSessionOwners(db, sessionId, options.sessionsDir, file => {
+        const session = parseSessionFileForSearch(file, { sessionId, budget });
+        return session ? boundSessionForSearch(session, options.project) : null;
+      }).length > 0);
     }
     return canonicalCache.get(sessionId)!;
   };
@@ -132,7 +140,8 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     try {
       // Bound payloads inside SQLite: a row limit does not bound large messages,
       // and selecting content twice creates two independent V8 strings.
-      const rows = db.prepare(`SELECT m.session_id, s.project, m.role, substr(m.content, 1, ?) AS content, length(m.content) AS content_chars, m.timestamp FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?`).all(MAX_SNIPPET_CHARS, ...params, Math.max(limit * 20, limit)) as Array<{ session_id: string; project: string; role: string; content: string; timestamp: string; content_chars: number }>;
+      const rows = db.prepare(`SELECT substr(m.session_id, 1, ${MAX_SEARCH_ID_CHARS}) AS session_id, length(m.session_id) > ${MAX_SEARCH_ID_CHARS} AS oversized_identity, substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, substr(m.content, 1, ?) AS content, length(m.content) AS content_chars, substr(m.timestamp, 1, 200) AS timestamp FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?`).all(MAX_SNIPPET_CHARS, ...params, Math.max(limit * 20, limit)) as Array<{ session_id: string; oversized_identity: number; project: string; role: string; content: string; timestamp: string; content_chars: number }>;
+      if (rows.some(row => row.oversized_identity)) throw new SessionSearchReadLimitError();
       const visible: typeof rows = [];
       for (const row of rows) {
         if (options.sessionsDir && !hasCanonical(row.session_id)) continue;
@@ -185,34 +194,55 @@ function codePointCount(text: string): number {
   return count;
 }
 
+/** Detach small excerpts so a V8 sliced string cannot keep its large source alive. */
+function copyText(text: string): string {
+  return Buffer.from(text, 'utf16le').toString('utf16le');
+}
+
 function truncateCodePoints(text: string, maxChars: number): string {
-  return text.slice(0, codePointOffset(text, maxChars));
+  return copyText(text.slice(0, codePointOffset(text, maxChars)));
+}
+
+/** Map a folded UTF-16 offset back to its original prefix without a per-character map. */
+function originalHitOffset(text: string, foldedOffset: number): number {
+  const guess = Math.min(foldedOffset, text.length);
+  if (text.slice(0, guess).toLocaleLowerCase().length === foldedOffset) return guess;
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (text.slice(0, middle).toLocaleLowerCase().length <= foldedOffset) low = middle;
+    else high = middle - 1;
+  }
+  return low;
 }
 
 /** Center a Unicode-safe excerpt without materializing an array of the entire message. */
 function safeSnippet(text: string, query: string, maxChars: number): string {
   const length = codePointCount(text);
-  if (length <= maxChars) return text;
+  if (length <= maxChars) return copyText(text);
   const lowerText = text.toLocaleLowerCase();
   const hitOffsets = collectLikeTerms(query)
     .map(term => lowerText.indexOf(term.toLocaleLowerCase()))
     .filter(offset => offset >= 0)
-    .map(offset => codePointCount(lowerText.slice(0, offset)))
     .sort((a, b) => a - b);
-  const hit = hitOffsets[0];
-  if (hit === undefined) return truncateCodePoints(text, maxChars);
+  const foldedHit = hitOffsets[0];
+  if (foldedHit === undefined) return truncateCodePoints(text, maxChars);
+  const hit = codePointCount(text.slice(0, originalHitOffset(text, foldedHit)));
   const leadingMarker = hit > 0 ? '…' : '';
   const trailingMarker = hit < length - maxChars ? '…' : '';
   const contentBudget = maxChars - leadingMarker.length - trailingMarker.length;
   const start = Math.max(0, Math.min(hit - Math.floor(contentBudget / 3), length - contentBudget));
-  return `${leadingMarker}${text.slice(codePointOffset(text, start), codePointOffset(text, start + contentBudget))}${trailingMarker}`;
+  return copyText(`${leadingMarker}${text.slice(codePointOffset(text, start), codePointOffset(text, start + contentBudget))}${trailingMarker}`);
 }
 
-type CanonicalSearchEntry = ParsedEntry & { searchScore: number };
+type CanonicalSearchEntry = ParsedEntry & { searchScore: number; searchMatchesFilters: boolean };
+type CanonicalSearchSession = ParsedSession & { searchMatchesProject: boolean; searchIsService: boolean };
 
 function resolveSessionFilter(db: ReturnType<DatabaseManager['getDb']>, value: string | undefined): { ids?: string[]; ambiguous: string[] } {
   if (!value) return { ambiguous: [] };
-  const rows = db.prepare('SELECT id FROM sessions WHERE id = ? OR id LIKE ? ORDER BY id LIMIT 21').all(value, `${escapeLikePattern(value)}%`) as Array<{ id: string }>;
+  const rows = db.prepare(`SELECT substr(id, 1, ${MAX_SEARCH_ID_CHARS}) AS id, length(id) > ${MAX_SEARCH_ID_CHARS} AS oversized_identity FROM sessions WHERE id = ? OR id LIKE ? ORDER BY id LIMIT 21`).all(value, `${escapeLikePattern(value)}%`) as Array<{ id: string; oversized_identity: number }>;
+  if (rows.some(row => row.oversized_identity)) throw new SessionSearchReadLimitError();
   const ids = rows.map(row => row.id);
   return ids.length === 1 ? { ids, ambiguous: [] } : { ids: [], ambiguous: ids.slice(0, 20) };
 }
@@ -230,6 +260,19 @@ function truncateUtf8(text: string, maxBytes: number): string {
 function isServiceSession(name: string | null): boolean {
   if (!name?.trim()) return false;
   return /(?:^|[\s:_-])(service|consolidation)(?:$|[\s:_-])/i.test(name.trim()) || /^(?:service|consolidation)$/i.test(name.trim());
+}
+
+/** Classify full canonical metadata before retaining only detached display fields. */
+function boundSessionForSearch(session: ParsedSession, project?: string): CanonicalSearchSession {
+  return {
+    ...session,
+    searchMatchesProject: !project || session.project === project,
+    searchIsService: isServiceSession(session.name ?? null),
+    project: truncateCodePoints(session.project, 1_000),
+    cwd: truncateCodePoints(session.cwd, 2_000),
+    name: session.name == null ? null : truncateCodePoints(session.name, 1_000),
+    title: null, metadata: null, startedAt: truncateCodePoints(session.startedAt, 200),
+  };
 }
 
 function canonicalEligibleForRow(row: { session_id: string }, options: SessionSearchEvidenceOptions): boolean {
@@ -252,14 +295,13 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
   if (options.sessionId && !resolved.ids?.length) return { results: [], ambiguousSessionIds: resolved.ambiguous };
   const terms = collectLikeTerms(query);
   const normalized = normalizeFts5Query(query);
-  type CandidateRow = { session_id: string; entry_id: string; role: string; kind: string; tool_name: string | null; tool_call_id: string | null; timestamp: string; project: string; cwd: string; name: string | null; bm25_score: number | null };
+  type CandidateRow = { session_id: string; entry_id: string; oversized_identity: number; role: string; kind: string; timestamp: string; bm25_score: number | null };
   const filterSql = `${resolved.ids?.length ? `AND m.session_id IN (${resolved.ids.map(() => '?').join(',')})` : ''} ${options.project ? 'AND s.project = ?' : ''} ${options.role ? 'AND m.role = ?' : ''} ${options.since ? 'AND m.timestamp >= ?' : ''}`;
   const filterParams = [...(resolved.ids ?? []), ...(options.project ? [options.project] : []), ...(options.role ? [options.role] : []), ...(options.since ? [options.since] : [])];
   let candidateRows: CandidateRow[];
   try {
     candidateRows = db.prepare(`
-      SELECT m.session_id, m.entry_id, m.role, m.kind, m.tool_name, m.tool_call_id, m.timestamp,
-             s.project, s.cwd, s.name, bm25(message_fts) AS bm25_score
+      SELECT ${CANDIDATE_FIELDS}, bm25(message_fts) AS bm25_score
       FROM messages m JOIN sessions s ON s.id = m.session_id
       LEFT JOIN message_fts ON message_fts.rowid = m.rowid
       WHERE m.entry_id IS NOT NULL AND (m.rowid IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?) OR ${terms.length ? terms.map(() => 'm.content LIKE ? ESCAPE \'\\\'').join(' OR ') : '0'}) ${filterSql}
@@ -269,30 +311,38 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
     // Malformed MATCH expressions are untrusted input; use a bounded LIKE candidate scan.
     if (!terms.length) return { results: [], ambiguousSessionIds: [] };
     candidateRows = db.prepare(`
-      SELECT m.session_id, m.entry_id, m.role, m.kind, m.tool_name, m.tool_call_id, m.timestamp,
-             s.project, s.cwd, s.name, NULL AS bm25_score
+      SELECT ${CANDIDATE_FIELDS}, NULL AS bm25_score
       FROM messages m JOIN sessions s ON s.id = m.session_id
       WHERE m.entry_id IS NOT NULL AND (${terms.map(() => 'm.content LIKE ? ESCAPE \'\\\'').join(' OR ')}) ${filterSql}
       ORDER BY m.timestamp DESC, m.session_id ASC, m.entry_id ASC LIMIT ?`).all(...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20) as CandidateRow[];
   }
+  if (candidateRows.some(row => row.oversized_identity)) throw new SessionSearchReadLimitError();
   const requestedEntries = new Map<string, Set<string>>();
   for (const row of candidateRows) {
     if (!requestedEntries.has(row.session_id)) requestedEntries.set(row.session_id, new Set());
     requestedEntries.get(row.session_id)!.add(row.entry_id);
   }
   const budget = { remainingBytes: SESSION_SEARCH_MAX_SCAN_BYTES };
-  const canonicalCache = new Map<string, ParsedSession | null>();
-  const resolveCanonical = (sessionId: string): ParsedSession | null => {
+  const canonicalCache = new Map<string, CanonicalSearchSession | null>();
+  const resolveCanonical = (sessionId: string): CanonicalSearchSession | null => {
     if (!canonicalCache.has(sessionId)) {
-      const owner = canonicalSessionOwners(db, sessionId, options.sessionsDir, file => parseSessionFileForSearch(file, {
-        sessionId, budget, entryIds: requestedEntries.get(sessionId),
-        transformEntry: entry => ({
-          ...entry,
-          searchScore: terms.reduce((sum, term) => sum + (entry.content.toLocaleLowerCase().includes(term.toLocaleLowerCase()) ? 1 : 0), 0),
-          content: safeSnippet(entry.content, query, snippetChars),
-        }),
-      }))[0];
-      canonicalCache.set(sessionId, owner?.session ?? null);
+      const owner = canonicalSessionOwners(db, sessionId, options.sessionsDir, file => {
+        const session = parseSessionFileForSearch(file, {
+          sessionId, budget, entryIds: requestedEntries.get(sessionId),
+          transformEntry: entry => ({
+            ...entry,
+            searchMatchesFilters: (!options.role || entry.role === options.role) && (!options.since || (entry.timestamp !== null && entry.timestamp >= options.since)),
+            searchScore: terms.reduce((sum, term) => sum + (entry.content.toLocaleLowerCase().includes(term.toLocaleLowerCase()) ? 1 : 0), 0),
+            content: safeSnippet(entry.content, query, snippetChars),
+            timestamp: entry.timestamp === null ? null : truncateCodePoints(entry.timestamp, 200),
+            toolName: entry.toolName == null ? null : truncateCodePoints(entry.toolName, 500),
+            toolCallId: entry.toolCallId == null ? null : truncateCodePoints(entry.toolCallId, 500),
+            toolCalls: undefined, parentId: null, parentEntryId: null,
+          }),
+        });
+        return session ? boundSessionForSearch(session, options.project) : null;
+      })[0];
+      canonicalCache.set(sessionId, (owner?.session as CanonicalSearchSession | undefined) ?? null);
     }
     return canonicalCache.get(sessionId)!;
   };
@@ -302,11 +352,11 @@ export function searchSessionEvidence(dbManager: DatabaseManager, query: string,
     if (!canonicalEligibleForRow(row, options)) continue;
     const canonicalSession = resolveCanonical(row.session_id);
     const canonical = canonicalSession?.entries?.find(entry => entry.entryId === row.entry_id && entry.identityStatus !== 'ambiguous' && entry.identityStatus !== 'unresolvable') as CanonicalSearchEntry | undefined;
-    if (!canonicalSession || !canonical) continue;
+    if (!canonicalSession || !canonical || !canonicalSession.searchMatchesProject || !canonical.searchMatchesFilters) continue;
     // Privacy classification is derived from the current JSONL, never from
     // stale SQLite kind/tool/name metadata.
     const isTool = Boolean(canonical.toolName) || canonical.kind === 'tool_result' || canonical.kind === 'tool_call';
-    const isService = (canonical.kind !== 'message' && !isTool) || isServiceSession(canonicalSession.name ?? null);
+    const isService = (canonical.kind !== 'message' && !isTool) || canonicalSession.searchIsService;
     if (isService && !options.includeService) continue;
     if (isTool && !options.includeToolOutput) continue;
     // SQLite is only a candidate index. Publish the canonical payload and reject

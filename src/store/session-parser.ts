@@ -398,7 +398,9 @@ export function parseSessionFileForSearch(filePath: string, options: SessionSear
         return;
       }
       const retained = options.transformEntry?.(entry) ?? { ...entry, content: entry.content.slice(0, 4_000) };
-      entries.set(entry.entryId, { ...retained, content: retained.content.slice(0, 8_000) });
+      // A sliced string may retain the full parsed body; copy only the bounded UTF-16 units.
+      const content = Buffer.from(retained.content.slice(0, 8_000), 'utf16le').toString('utf16le');
+      entries.set(entry.entryId, { ...retained, content });
     };
     const addFragment = (part: Buffer): void => {
       lineBytes += part.length;
