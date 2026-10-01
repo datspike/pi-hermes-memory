@@ -207,4 +207,44 @@ describe("searchSessionAnchors", () => {
     assert.strictEqual(result.success, false);
     assert.match(result.message ?? "", new RegExp(`${filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:2`));
   });
+
+  it("preserves UTF-8 across chunks, blank physical lines, and a final line without LF", () => {
+    const sessionsDir = makeSessionsDir();
+    const filePath = path.join(sessionsDir, "utf8.jsonl");
+    const prefix = '{"type":"custom","data":"';
+    const first = prefix + "x".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1) + '🙂needle"}';
+    fs.writeFileSync(filePath, first + "\r\n\n \t\n" + JSON.stringify(message("2026-05-15T10:00:00.000Z", "🙂needle")));
+    const result = searchSessionAnchors("any:\n- 🙂needle", { sessionsDir });
+    assert.strictEqual(result.success, true);
+    assert.deepStrictEqual(result.ranges.map(({ startLine, endLine }) => [startLine, endLine]), [[1, 1], [4, 4]]);
+    assert.strictEqual(result.ranges[0].reason, "matched any: 🙂needle");
+  });
+
+  it("preserves CRLF split across chunks and excludes the entire contiguous range", () => {
+    const sessionsDir = makeSessionsDir();
+    const filePath = path.join(sessionsDir, "crlf.jsonl");
+    const first = JSON.stringify(message("2026-05-15T10:00:00.000Z", "needle"));
+    const second = JSON.stringify(message("2026-05-15T11:00:00.000Z", "needle secret"));
+    const last = JSON.stringify(message("2026-05-15T12:00:00.000Z", "needle"));
+    fs.writeFileSync(filePath, first + " ".repeat(64 * 1024 - Buffer.byteLength(first) - 1) + "\r\n" + second + "\n\n" + last);
+    const merged = searchSessionAnchors("any:\n- needle", { sessionsDir });
+    assert.deepStrictEqual(merged.ranges.map(({ startLine, endLine, score }) => [startLine, endLine, score]), [[1, 2, 2], [4, 4, 1]]);
+    const excluded = searchSessionAnchors("any:\n- needle\nexclude:\n- secret", { sessionsDir });
+    assert.strictEqual(excluded.success, true);
+    assert.deepStrictEqual(excluded.ranges.map(({ startLine, endLine }) => [startLine, endLine]), [[4, 4]]);
+  });
+
+  it("counts nonblank lines globally and keeps cap precedence over invalid JSON", () => {
+    const sessionsDir = makeSessionsDir();
+    writeJsonl("a.jsonl", [message("2026-05-15T10:00:00.000Z", "needle")]);
+    const filePath = path.join(sessionsDir, "b.jsonl");
+    fs.writeFileSync(filePath, JSON.stringify(message("2026-05-15T11:00:00.000Z", "x".repeat(70_000) + "needle")) + "\n \t\n{bad json}");
+    const capped = searchSessionAnchors("any:\n- needle", { sessionsDir, maxLines: 2 });
+    assert.strictEqual(capped.success, false);
+    assert.deepStrictEqual(capped.ranges, []);
+    assert.match(capped.message ?? "", /scanned 3 session lines.*scan cap of 2/);
+    const invalid = searchSessionAnchors("any:\n- needle", { sessionsDir, maxLines: 3 });
+    assert.strictEqual(invalid.success, false);
+    assert.strictEqual(invalid.message, `Invalid JSON in ${filePath}:3`);
+  });
 });

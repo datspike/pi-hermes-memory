@@ -192,6 +192,8 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     if (project) { conditions.push('s.project = ?'); params.push(project); }
     if (role) { conditions.push('m.role = ?'); params.push(role); }
     if (since) { conditions.push('m.timestamp >= ?'); params.push(since); }
+    // A canonical search cannot publish an ownerless row; reject it before sorting/over-fetch.
+    if (resolveCanonical) conditions.push('EXISTS (SELECT 1 FROM session_files owned WHERE owned.session_id = m.session_id)');
     try {
       // Bound payloads inside SQLite: a row limit does not bound large messages,
       // and selecting content twice creates two independent V8 strings.

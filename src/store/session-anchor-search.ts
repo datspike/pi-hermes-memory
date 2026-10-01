@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { readAnchorJson, type AnchorJsonValue } from "./session-anchor-json.js";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
@@ -51,7 +52,7 @@ interface LineHit {
   cwd?: string;
   timestamp?: string;
   timestampMs?: number;
-  text: string;
+  excluded: boolean;
   score: number;
   reason: string;
 }
@@ -66,7 +67,7 @@ interface PendingRange {
   endTime?: string;
   score: number;
   reason: string;
-  text: string;
+  excluded: boolean;
 }
 
 export function searchSessionAnchors(
@@ -110,9 +111,9 @@ export function searchSessionAnchors(
     ranges.push(...fileResult.ranges);
   }
 
-  const filtered = ranges.filter((range) => !containsAny(range.text, parsed.request.exclude));
+  const filtered = ranges.filter((range) => !range.excluded);
   const sorted = sortRanges(filtered, parsed.request.hasTextConstraint);
-  const limited = sorted.slice(0, parsed.request.limit).map(({ text: _text, ...range }) => range);
+  const limited = sorted.slice(0, parsed.request.limit).map(({ excluded: _excluded, ...range }) => range);
 
   return {
     success: true,
@@ -261,6 +262,13 @@ function findJsonlFiles(dir: string): string[] {
   return files;
 }
 
+/** Reconstruct only the metadata read by the existing identity/time helpers. */
+function anchorMetadata(node: AnchorJsonValue): unknown {
+  if (node.value !== undefined) return node.value;
+  if (!node.fields) return undefined;
+  return Object.fromEntries(Object.entries(node.fields).map(([key, value]) => [key, anchorMetadata(value)]));
+}
+
 function searchJsonlFile(
   filePath: string,
   request: ParsedAnchorRequest,
@@ -268,17 +276,14 @@ function searchJsonlFile(
   scannedBefore: number,
   scanCap: number,
 ): { success: true; ranges: PendingRange[]; scannedLines: number } | { success: false; message: string } {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const lines = content.split(/\r?\n/);
   const hits: LineHit[] = [];
   let currentSessionId: string | undefined;
   let currentCwd: string | undefined;
 
   let scannedLines = 0;
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line.trim().length === 0) continue;
+  const terms = [...new Set([...request.all, ...request.any, ...request.exclude].map(term => term.toLocaleLowerCase()))];
+  for (const source of readAnchorJson(filePath, terms)) {
 
     scannedLines += 1;
     if (scannedLines > maxLines) {
@@ -288,12 +293,14 @@ function searchJsonlFile(
       };
     }
 
-    let event: unknown;
+    let parsed: AnchorJsonValue;
     try {
-      event = JSON.parse(line);
-    } catch {
-      return { success: false, message: `Invalid JSON in ${filePath}:${index + 1}` };
+      parsed = source.parse();
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      return { success: false, message: `Invalid JSON in ${filePath}:${source.line}` };
     }
+    const event = anchorMetadata(parsed);
 
     const sessionId = getSessionId(event) ?? currentSessionId;
     if (sessionId) currentSessionId = sessionId;
@@ -312,7 +319,9 @@ function searchJsonlFile(
       if (request.to && timestampMs > request.to.getTime()) continue;
     }
 
-    const text = textualizeEvent(event);
+    // Terms cannot contain LF, so each matching leaf can be represented by
+    // bounded witnesses without changing the existing scoring/reason helpers.
+    const text = terms.filter((_term, index) => (parsed.flags & (1n << BigInt(index))) !== 0n).join("\n");
     const termScore = scoreTerms(text, request);
     const matchesTerms = request.hasTextConstraint ? termScore > 0 : true;
     if (!matchesTerms) continue;
@@ -321,12 +330,14 @@ function searchJsonlFile(
 
     hits.push({
       path: filePath,
-      lineNumber: index + 1,
+      lineNumber: source.line,
       sessionId,
       cwd,
       timestamp: hasValidTimestamp ? timestamp : undefined,
       timestampMs: hasValidTimestamp ? timestampMs : undefined,
-      text,
+      // Markdown terms cannot span the newline separator between merged hits.
+      // Retain the exclusion decision, not the potentially large source text.
+      excluded: containsAny(text, request.exclude),
       score: request.hasTextConstraint ? termScore : 1,
       reason: buildReason(request, text),
     });
@@ -343,7 +354,7 @@ function mergeAdjacentHits(hits: LineHit[]): PendingRange[] {
     if (last && last.path === hit.path && last.endLine + 1 === hit.lineNumber && last.reason === hit.reason) {
       last.endLine = hit.lineNumber;
       last.score += hit.score;
-      last.text += "\n" + hit.text;
+      last.excluded ||= hit.excluded;
       last.sessionId ??= hit.sessionId;
       last.cwd ??= hit.cwd;
       if (!last.startTime && hit.timestamp) last.startTime = hit.timestamp;
@@ -361,7 +372,7 @@ function mergeAdjacentHits(hits: LineHit[]): PendingRange[] {
       endTime: hit.timestamp,
       score: hit.score,
       reason: hit.reason,
-      text: hit.text,
+      excluded: hit.excluded,
     });
   }
 
@@ -434,38 +445,6 @@ function getCwd(event: unknown): string | undefined {
   return undefined;
 }
 
-function textualizeEvent(event: unknown): string {
-  const parts: string[] = [];
-  collectStrings(event, parts);
-  return parts.join("\n");
-}
-
-const METADATA_TEXT_KEYS = new Set([
-  "type",
-  "id",
-  "parentId",
-  "sessionId",
-  "session_id",
-  "timestamp",
-  "cwd",
-  "role",
-  "customType",
-]);
-
-function collectStrings(value: unknown, parts: string[], key?: string): void {
-  if (typeof value === "string") {
-    if (!key || !METADATA_TEXT_KEYS.has(key)) parts.push(value);
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) collectStrings(item, parts, key);
-    return;
-  }
-
-  if (!isRecord(value)) return;
-  for (const [childKey, item] of Object.entries(value)) collectStrings(item, parts, childKey);
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

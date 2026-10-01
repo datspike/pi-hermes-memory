@@ -140,7 +140,7 @@ export const SQLITE_BUSY_TIMEOUT_MS = 5000;
 export const SQLITE_WAL_AUTOCHECKPOINT_PAGES = 1000;
 
 const DATABASE_FILE_SUFFIXES: readonly DatabaseFileSuffix[] = ['', '-wal', '-shm'];
-const SESSION_REPAIR_VERSION = 2;
+export const SESSION_REPAIR_VERSION = 2;
 const SESSION_REPAIR_STATE_KEY = 'session_repair_state:v1';
 const DEFAULT_SESSION_REPAIR_CHUNK_SIZE = 16;
 const DEFAULT_SESSION_REPAIR_WALL_CLOCK_BUDGET_MS = 35;
@@ -732,12 +732,7 @@ export class DatabaseManager {
 
   private readSessionRepairState(db: DatabaseLike): SessionRepairState | null {
     const row = db.prepare('SELECT value FROM extension_metadata WHERE key = ?').get(SESSION_REPAIR_STATE_KEY) as { value?: unknown } | undefined;
-    if (typeof row?.value !== 'string') return null;
-    try {
-      const parsed = JSON.parse(row.value) as SessionRepairState;
-      if (parsed?.version !== 1 || !['pending', 'running', 'aborted', 'complete'].includes(parsed.status)) return null;
-      return parsed;
-    } catch { return null; }
+    return parseSessionRepairState(row?.value);
   }
 
   public getSessionRepairState(): SessionRepairState | null {
@@ -2164,4 +2159,14 @@ export class DatabaseManager {
       memories: memories.count,
     };
   }
+}
+
+/** Validate durable repair metadata identically for managed and readonly connections. */
+export function parseSessionRepairState(value: unknown): SessionRepairState | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value) as SessionRepairState;
+    if (parsed?.version !== 1 || !['pending', 'running', 'aborted', 'complete'].includes(parsed.status)) return null;
+    return parsed;
+  } catch { return null; }
 }

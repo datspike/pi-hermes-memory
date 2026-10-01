@@ -161,8 +161,12 @@ describe('session search memory bounds', () => {
     try {
       const prefix = 'я'.repeat(59_993);
       const timestamp = '2026-05-03T00:01:00Z';
-      indexSession(manager, { id: 'unowned-long-keys', project: 'memory-test', cwd: '/memory-test', startedAt: timestamp, endedAt: null,
+      const sessionId = 'owned-long-keys';
+      indexSession(manager, { id: sessionId, project: 'memory-test', cwd: '/memory-test', startedAt: timestamp, endedAt: null,
         messages: Array.from({ length: 1000 }, (_, index) => ({ id: `${prefix}${String(index).padStart(7, '0')}`, role: 'user' as const, content: 'needle', timestamp })) });
+      const owner = path.join(dir, 'owner.jsonl');
+      fs.writeFileSync(owner, JSON.stringify({ type: 'session', id: sessionId, cwd: '/memory-test', timestamp }) + '\n');
+      upsertSessionFileMetadata(manager, owner, sessionId);
       manager.close();
       for (const mode of ['fts', 'like', 'legacy']) {
         const result = searchInSmallHeap(dir, `
@@ -194,10 +198,15 @@ describe('session search memory bounds', () => {
     try {
       const prefix = 'я'.repeat(59_993);
       const timestamp = '2026-05-03T00:01:00Z';
-      for (let index = 0; index < 72; index++) indexSession(manager, {
-        id: `${prefix}${String(index).padStart(7, '0')}`, project: 'memory-test', cwd: '/memory-test', startedAt: timestamp, endedAt: null,
-        messages: [{ id: 'wanted', role: 'user', content: 'needle', timestamp }],
-      });
+      for (let index = 0; index < 72; index++) {
+        const id = `${prefix}${String(index).padStart(7, '0')}`;
+        indexSession(manager, { id, project: 'memory-test', cwd: '/memory-test', startedAt: timestamp, endedAt: null,
+          messages: [{ id: 'wanted', role: 'user', content: 'needle', timestamp }],
+        });
+        const owner = path.join(dir, `${index}.jsonl`);
+        fs.writeFileSync(owner, JSON.stringify({ type: 'session', id, cwd: '/memory-test', timestamp }) + '\n');
+        upsertSessionFileMetadata(manager, owner, id);
+      }
       manager.close();
       for (const mode of ['legacy', 'structured']) {
         const result = searchInSmallHeap(dir, `
