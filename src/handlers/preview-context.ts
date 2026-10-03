@@ -62,7 +62,7 @@ export function registerPreviewContextCommand(
       }
       const activeProjectStore = resolveProjectStore(projectStore);
       const activeProjectName = resolveProjectName(projectName);
-      const memoryBlock = store.formatForSystemPrompt();
+      const memoryBlock = store.formatForSystemPrompt(activeProjectName);
       const projectBlock = activeProjectStore ? activeProjectStore.formatProjectBlock(activeProjectName ?? "") : "";
 
       const lines: string[] = [];

@@ -201,6 +201,104 @@ describe('DatabaseManager', () => {
       assert.ok(tableNames.includes('message_fts'), 'message_fts table missing');
       assert.ok(tableNames.includes('memory_fts'), 'memory_fts table missing');
     });
+    it('migrates existing unicode61 FTS in resumable chunks and preserves indexed data', async () => {
+      const db = dbManager.getDb();
+      db.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('cjk-session', 'test-project', '/tmp/test-project', '2026-05-03T00:00:00Z');
+      db.prepare(`
+        INSERT INTO messages (id, session_id, role, content, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        'cjk-message',
+        'cjk-session',
+        'assistant',
+        '设备清单包含 NAS',
+        '2026-05-03T00:01:00Z',
+      );
+      db.prepare(`
+        INSERT INTO memories (project, target, content, created, last_referenced)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        'test-project',
+        'memory',
+        '设备清单包含 NAS',
+        '2026-05-03',
+        '2026-05-03',
+      );
+
+      db.exec(`
+        DROP TABLE message_fts;
+        DROP TABLE memory_fts;
+        CREATE VIRTUAL TABLE message_fts USING fts5(
+          content,
+          content='messages',
+          content_rowid='rowid'
+        );
+        CREATE VIRTUAL TABLE memory_fts USING fts5(
+          content,
+          content='memories',
+          content_rowid='id'
+        );
+        INSERT INTO message_fts(message_fts) VALUES ('rebuild');
+        INSERT INTO memory_fts(memory_fts) VALUES ('rebuild');
+        DELETE FROM extension_metadata WHERE key = 'fts5_tokenizer_version';
+      `);
+      dbManager.close();
+
+      dbManager = new DatabaseManager(tmpDir);
+      const migrated = dbManager.getDb();
+      assert.equal(dbManager.getSessionRepairState()?.status, 'pending');
+      for (let step = 0; step < 30 && dbManager.getSessionRepairState()?.status !== 'complete'; step++) {
+        await dbManager.runSessionRepairChunk({ chunkSize: 2 });
+      }
+      assert.equal(dbManager.getSessionRepairState()?.status, 'complete');
+      const tableSql = migrated.prepare(`
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name IN ('message_fts', 'memory_fts')
+        ORDER BY name
+      `).all() as Array<{ name: string; sql: string }>;
+
+      assert.strictEqual(tableSql.length, 2);
+      assert.ok(tableSql.every((table) => table.sql.includes("tokenize='trigram'")));
+      assert.deepStrictEqual(
+        migrated.prepare('SELECT value FROM extension_metadata WHERE key = ?').get('fts5_tokenizer_version'),
+        { value: 'trigram-v1' },
+      );
+      assert.ok(
+        migrated.prepare('SELECT rowid FROM message_fts WHERE message_fts MATCH ?').all('设备清单').length > 0,
+      );
+      assert.ok(
+        migrated.prepare('SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?').all('设备清单').length > 0,
+      );
+    });
+
+    it('does no tokenizer work on open once both indexes and the repair marker are complete', () => {
+      const db = dbManager.getDb();
+      const stateBefore = dbManager.getSessionRepairState();
+      const sqlBefore = db.prepare("SELECT name, sql FROM sqlite_master WHERE name IN ('message_fts', 'memory_fts') ORDER BY name").all();
+      dbManager.close();
+      dbManager = new DatabaseManager(tmpDir);
+      const reopened = dbManager.getDb();
+      assert.deepEqual(dbManager.getSessionRepairState(), stateBefore);
+      assert.deepEqual(reopened.prepare("SELECT name, sql FROM sqlite_master WHERE name IN ('message_fts', 'memory_fts') ORDER BY name").all(), sqlBefore);
+      assert.deepEqual(reopened.prepare('SELECT value FROM extension_metadata WHERE key = ?').get('fts5_tokenizer_version'), { value: 'trigram-v1' });
+    });
+
+    it('queues tokenizer migration even when a stale version marker remains', () => {
+      const db = dbManager.getDb();
+      db.exec(`DROP TABLE message_fts; CREATE VIRTUAL TABLE message_fts USING fts5(content, content='messages', content_rowid='rowid');`);
+      dbManager.close();
+      dbManager = new DatabaseManager(tmpDir);
+      const reopened = dbManager.getDb();
+      assert.equal(dbManager.getSessionRepairState()?.status, 'pending');
+      assert.equal(dbManager.getSessionRepairState()?.phase, 'message_fts');
+      assert.equal(reopened.prepare('SELECT value FROM extension_metadata WHERE key = ?').get('fts5_tokenizer_version'), undefined);
+      assert.throws(() => dbManager.assertSessionEvidenceAvailable(), /migration is incomplete/i);
+    });
+
 
     it('should create triggers for FTS sync', () => {
       const db = dbManager.getDb();
@@ -376,6 +474,15 @@ describe('DatabaseManager', () => {
       assert.strictEqual(rows.length, 2);
       assert.strictEqual(rows[0].content, 'existing memory');
       assert.strictEqual(rows[1].target, 'failure');
+
+      const indexes = migratedDb.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name IN ('idx_memories_project', 'idx_memories_target', 'idx_memories_category')
+      `).all() as Array<{ name: string }>;
+      assert.deepStrictEqual(
+        indexes.map((row) => row.name).sort(),
+        ['idx_memories_category', 'idx_memories_project', 'idx_memories_target'],
+      );
 
       migratedManager.close();
     });
@@ -894,7 +1001,7 @@ describe('DatabaseManager', () => {
       assert.doesNotThrow(() => dbManager.getDb());
     });
 
-    it('repairs recoverable corruption on explicit recovery and preserves readable rows', () => {
+    it('repairs recoverable corruption on deferred startup scan and preserves readable rows', async () => {
       const db = dbManager.getDb();
       db.prepare(`
         INSERT INTO sessions (id, project, cwd, started_at)
@@ -913,29 +1020,81 @@ describe('DatabaseManager', () => {
         INSERT INTO memories (project, target, content, created, last_referenced)
         VALUES (?, ?, ?, ?, ?)
       `).run(null, 'memory', 'recoverable memory', '2026-05-03', '2026-05-03');
+      db.prepare('INSERT INTO extension_metadata(key,value) VALUES (?,?)').run('protected_recovery_value', 'retained');
       dbManager.close();
 
       corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
 
       dbManager = new DatabaseManager(tmpDir);
       assert.doesNotThrow(() => dbManager.getDb());
-      assert.strictEqual(dbManager.getLastRecovery(), null);
-      dbManager.recoverFromCorruption(corruptSqliteError());
+      await dbManager.waitForStartupIntegrityScan();
       const repairedDb = dbManager.getDb();
 
       assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
       assert.deepStrictEqual(dbManager.getLastRecovery()?.recoveredRows, {
-        extension_metadata: 1,
+        extension_metadata: 2,
         sessions: 1,
         messages: 50,
         session_files: 0,
         memories: 1,
       });
+      // The derived tokenizer marker is withheld until coverage is revalidated; unrelated metadata survives.
+      assert.strictEqual(repairedDb.prepare('SELECT value FROM extension_metadata WHERE key = ?').get('protected_recovery_value').value, 'retained');
+      assert.strictEqual(dbManager.getSessionRepairState()?.status, 'pending');
       assert.deepStrictEqual(dbManager.getStats(), { sessions: 1, messages: 50, memories: 1 });
       const memory = repairedDb.prepare('SELECT content FROM memories WHERE content = ?').get('recoverable memory') as { content: string } | undefined;
       assert.ok(memory);
       assertQuickCheckOk(repairedDb as InstanceType<typeof Database>);
       assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'corrupt DB should be quarantined');
+    });
+
+    it('reopened manager runs a fresh integrity scan after close()', async () => {
+      const db = dbManager.getDb();
+      db.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('reopen-session', 'reopen-project', '/work/reopen', '2026-05-03T00:00:00Z');
+      dbManager.close();
+
+      corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
+
+      const reopenedDb = dbManager.getDb();
+      await dbManager.waitForStartupIntegrityScan();
+      const recoveredDb = dbManager.getDb();
+
+      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
+      assert.deepStrictEqual(dbManager.getStats(), { sessions: 1, messages: 0, memories: 0 });
+      assertQuickCheckOk(recoveredDb as InstanceType<typeof Database>);
+      assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'corrupt DB should be quarantined');
+    });
+
+    it('skips the startup integrity scan when disabled while preserving normal reads and writes', async () => {
+      const db = dbManager.getDb();
+      db.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('skip-scan-session', 'skip-scan-project', '/work/skip-scan', '2026-05-03T00:00:00Z');
+      db.prepare(`
+        INSERT INTO messages (id, session_id, role, content, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('skip-scan-message', 'skip-scan-session', 'user', 'readable message', '2026-05-03T00:00:00Z');
+      dbManager.close();
+
+      corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
+
+      dbManager = new DatabaseManager(tmpDir);
+      dbManager.setQuickCheckOnOpen(false);
+      const reopenedDb = dbManager.getDb();
+      await dbManager.waitForStartupIntegrityScan();
+
+      assert.strictEqual(dbManager.getLastRecovery(), null);
+      const sessionCount = reopenedDb.prepare('SELECT COUNT(*) AS count FROM sessions').get();
+      assert.strictEqual(sessionCount.count, 1);
+      reopenedDb.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('skip-scan-session-2', 'skip-scan-project', '/work/skip-scan', '2026-05-03T00:01:00Z');
+      assert.strictEqual(reopenedDb.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 2);
     });
 
     it('quarantines unrecoverable files and recreates an empty database', () => {
@@ -1144,4 +1303,27 @@ describe('DatabaseManager', () => {
       }, /FOREIGN KEY/);
     });
   });
+});
+
+it('keeps deferred startup scan errors contained without treating SQLITE_BUSY as corruption', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'db-scan-busy-'));
+  const manager = new DatabaseManager(root);
+  const internal = manager as unknown as { verifySessionRepairInWorker: (...args: unknown[]) => Promise<void> };
+  const original = internal.verifySessionRepairInWorker;
+  let checked = false;
+  internal.verifySessionRepairInWorker = async () => {
+    checked = true;
+    throw Object.assign(new Error('database is busy'), { code: 'SQLITE_BUSY' });
+  };
+  try {
+    manager.getDb();
+    await manager.waitForStartupIntegrityScan();
+    assert.equal(checked, true);
+    assert.equal(manager.getLastRecovery(), null);
+    assert.equal(manager.getSessionRepairState()?.status, 'complete');
+  } finally {
+    internal.verifySessionRepairInWorker = original;
+    manager.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

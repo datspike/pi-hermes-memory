@@ -315,7 +315,10 @@ describe("setupCorrectionDetector handler", () => {
   function makeCtx(branch: any[] = []) {
     return {
       sessionManager: { getBranch: () => branch },
-      signal: undefined as any,
+      signal: undefined,
+      cwd: "/tmp/active-project",
+      model: { provider: "local-llama", id: "local-9b" },
+      modelRegistry: {},
       ui: {
         notify: (msg: string, level: string) => {
           notifyCalls.push({ msg, level });
@@ -366,6 +369,12 @@ describe("setupCorrectionDetector handler", () => {
     await fireTurnEnd(branch);
 
     assert.ok(execCalls.length >= 1, "pi.exec should be called on correction");
+    const options = execCalls[0][2] as { cwd?: string };
+    assert.equal(options.cwd, "/tmp/active-project");
+    const args = logicalChildArgs(execCalls[0]);
+    assert.deepStrictEqual(args.slice(0, 4), [
+      "-p", "--no-session", "--model", "local-llama/local-9b",
+    ]);
   });
 
   it("passes child LLM override args and defaults thinking to off when only a model override is set", async () => {
@@ -541,6 +550,29 @@ describe("setupCorrectionDetector handler", () => {
         notifyCalls.filter((n) => n.msg === "🔧 Correction detected — memory updated"),
         [{ msg: "🔧 Correction detected — memory updated", level: "info" }],
       );
+    });
+
+    it("includes project and failure target routing in direct correction prompts", async () => {
+      const pi = createMockPi();
+      const { store } = storeWithFailureTracking();
+      const projectStore = { getMemoryEntries: () => ["existing project fact"] } as unknown as Parameters<typeof setupCorrectionDetector>[2];
+      setupCorrectionDetector(
+        pi,
+        store as unknown as MemoryStore,
+        projectStore,
+        directTransportConfig,
+        null,
+        "project-a",
+        makeDirectDeps({ ok: true, appliedCount: 1 }),
+      );
+
+      fireMessageEnd("user", "don't do that");
+      await fireTurnEnd(correctionBranch());
+
+      const options = directCalls[0][3] as { systemPrompt: string; userPrompt: string };
+      assert.match(options.systemPrompt, /project-specific facts.*target "project"/i);
+      assert.match(options.systemPrompt, /failures, corrections.*target "failure"/i);
+      assert.match(options.userPrompt, /--- Current Project Memory ---/);
     });
 
     it("skips subprocess and omits memory-updated notify when direct ok with zero applied", async () => {

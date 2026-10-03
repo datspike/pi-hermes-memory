@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatAnchorSearch } from '../../src/store/session-search-output.js';
+import { formatAnchorSearch, formatStructuredSearch } from '../../src/store/session-search-output.js';
 
 const MAX_BYTES = 1024 * 1024;
 const packetBytes = (result: unknown) => Buffer.byteLength(JSON.stringify({ type: 'result', ok: true, result }), 'utf8');
 const isLimitError = (error: any) => error.name === 'SessionSearchResponseLimitError' && error.code === 'SESSION_SEARCH_RESPONSE_LIMIT' && /1 MiB.*narrow/i.test(error.message);
+const isStructuredLimitError = (error: any) => error.name === 'SessionSearchResponseLimitError' && error.code === 'SESSION_SEARCH_RESPONSE_LIMIT' && /structured.*response|narrow.*query/i.test(error.message);
 
 test('anchors retain all 100 long paths and exact ranges within the response budget', () => {
   const ranges = Array.from({ length: 100 }, (_, i) => ({ path: `/sessions/${'p'.repeat(800)}/${i}.jsonl`, startLine: 2, endLine: 3, reason: 'matched needle' }));
@@ -43,4 +44,13 @@ test('anchors include the IPC envelope in the exact byte boundary, also for vali
   assert.ok(packetBytes(allowed) <= MAX_BYTES);
   assert.ok(MAX_BYTES - packetBytes(allowed) <= 1);
   assert.throws(() => formatAnchorSearch({ success: false, ranges: [], message: 'x'.repeat(size + 1) }), isLimitError);
+});
+
+test('structured search rejects a valid oversized identity instead of returning an empty success', () => {
+  const sessionId = 's'.repeat(60_000);
+  assert.throws(() => formatStructuredSearch({ results: [{
+    sessionId, entryId: 'entry', project: 'project', cwd: '/work/project', name: null, role: 'user', kind: 'message',
+    tool: null, tool_call_id: null, timestamp: '2026-09-30T00:00:00Z', snippet: 'needle', score: 1, scoreMode: 'like',
+    anchor: `pi://session/${sessionId}#entry=entry`,
+  }], ambiguousSessionIds: [] }), isStructuredLimitError);
 });

@@ -4,7 +4,7 @@
  *
  * Pi requires wildcard peers for host-provided packages, so the supported SDK
  * floor is tracked by this probe independently of package installation.
- * Version 0.80.1 introduced the pi-ai/compat subpath used by the extension.
+ * Version 0.80.6 supplies the public model-thinking and request-auth SDK types.
  *
  * The regular `check` job structurally cannot catch this: it installs whatever
  * the devDependency range resolves to, which is always new enough.
@@ -45,7 +45,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => { restore(); process.exit(130); });
 }
 
-const floor = "0.80.1";
+const floor = "0.80.6";
 
 console.log(`Minimum supported ${SCOPE}/pi-coding-agent: ${floor}`);
 

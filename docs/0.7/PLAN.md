@@ -85,7 +85,7 @@ Memory write targets:
 - failure: failures, corrections, insights, conventions, preferences, and tool quirks captured as categorized lessons.
 
 memory_search filters:
-- target accepts "memory", "user", or "failure".
+- target accepts `memory`, `user`, `failure`, or `project` for project-attributed memories.
 - project filters project-scoped memories by project name.
 - category filters categorized failure/lesson memories only.
 
@@ -347,3 +347,7 @@ Backward compatibility:
 - Legacy full injection remains available as an opt-in.
 - Existing Markdown memory remains readable and syncable.
 - No mandatory automatic retrieval, embeddings, or graph DB dependency is introduced.
+
+## Forwardport contract clarification
+
++ The current registration contract also accepts `project: null`, which means global-only search. `target="project"` selects project-attributed memory entries; adding a project name narrows that scope to the named project.

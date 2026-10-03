@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { DEFAULT_MAX_MESSAGE_CONTENT_LENGTH } from '../constants.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseManager } from './db.js';
@@ -28,6 +29,8 @@ export interface BulkIndexResult {
   messagesIndexed: number;
   errors: string[];
   reachedLimit?: boolean;
+  /** Session files skipped because their mtime is outside the retention window. */
+  expiredSkipped?: number;
   partial?: boolean;
   aborted?: boolean;
   deferredFiles?: number;
@@ -49,11 +52,10 @@ export function canonicalPath(filePath: string): string {
   }
 }
 
-export function containedCanonicalPath(sessionsDir: string | undefined, candidate: string): string | null {
-  let root: string;
+/** Contain a resolved real path under an already-pinned root. */
+function containedUnderRoot(root: string, candidate: string): string | null {
   let real: string;
   try {
-    root = fs.realpathSync.native(sessionsDir ?? path.dirname(candidate));
     real = fs.realpathSync.native(candidate);
   } catch {
     return null;
@@ -63,31 +65,158 @@ export function containedCanonicalPath(sessionsDir: string | undefined, candidat
   return real;
 }
 
-/** Resolve contained owners in canonical priority order; firstOnly preserves search budgets. */
-export function canonicalSessionOwners(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, sessionsDir?: string, readSession: (filePath: string) => ParsedSession | null = parseSessionFile, firstOnly = false): Array<{ path: string; session: ParsedSession }> {
-  const owners = db.prepare('SELECT path, indexed_at FROM session_files WHERE session_id = ? ORDER BY indexed_at DESC, path DESC').all(sessionId) as Array<{ path: string; indexed_at: string }>;
-  // Sort contained paths before reading, using the same priority as the full-owner result.
-  const ordered = owners.flatMap(owner => {
-    const contained = containedCanonicalPath(sessionsDir, owner.path);
-    return contained ? [{ path: contained, indexedAt: owner.indexed_at }] : [];
-  }).sort((a, b) => b.indexedAt.localeCompare(a.indexedAt) || b.path.localeCompare(a.path));
-  const valid: Array<{ path: string; session: ParsedSession; indexedAt: string }> = [];
-  for (const owner of ordered) {
-    try {
-      const session = readSession(owner.path);
-      if (session?.id === sessionId) {
-        valid.push({ path: owner.path, session, indexedAt: owner.indexedAt });
-        if (firstOnly) break;
-      }
-    } catch (error) {
-      // A budget failure is not evidence that the transcript is invalid.
-      // Surface it instead of silently turning a partial search into no hits.
-      if (error instanceof SessionSearchReadLimitError) throw error;
-    }
+export function containedCanonicalPath(sessionsDir: string | undefined, candidate: string): string | null {
+  try {
+    return containedUnderRoot(fs.realpathSync.native(sessionsDir ?? path.dirname(candidate)), candidate);
+  } catch {
+    return null;
   }
-  return valid
-    .sort((a, b) => b.indexedAt.localeCompare(a.indexedAt) || b.path.localeCompare(a.path))
-    .map(({ path: ownerPath, session }) => ({ path: ownerPath, session }));
+}
+
+/** A directory identity pinned independently from its mutable pathname. */
+export interface PinnedSessionRoot {
+  root: string;
+  fd: number;
+  dev: bigint;
+  ino: bigint;
+}
+
+function sameDirectoryIdentity(stat: { dev: bigint; ino: bigint }, root: PinnedSessionRoot): boolean {
+  return stat.dev === root.dev && stat.ino === root.ino;
+}
+
+export function openPinnedSessionRoot(root: string): PinnedSessionRoot | null {
+  let fd: number | undefined;
+  try {
+    // The configured root may itself be a symlink; the returned descriptor pins its target.
+    fd = fs.openSync(root, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!stat.isDirectory()) { fs.closeSync(fd); return null; }
+    const canonicalRoot = process.platform === 'linux' ? fs.realpathSync.native(`/proc/self/fd/${fd}`) : fs.realpathSync.native(root);
+    return { root: canonicalRoot, fd, dev: stat.dev, ino: stat.ino };
+  } catch {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* best effort */ } }
+    return null;
+  }
+}
+
+export function closePinnedSessionRoot(root: PinnedSessionRoot): void {
+  try { fs.closeSync(root.fd); } catch { /* best effort */ }
+}
+
+function currentPathMatchesRoot(root: PinnedSessionRoot): boolean {
+  try {
+    const stat = fs.statSync(root.root, { bigint: true });
+    return sameDirectoryIdentity(stat, root);
+  } catch {
+    return false;
+  }
+}
+
+function openRelativeSessionFile(root: PinnedSessionRoot, filePath: string): { fd: number; directoryFds: number[] } | null {
+  const relative = path.relative(root.root, filePath);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+  const components = relative.split(path.sep);
+  if (components.some((component) => !component || component === '.' || component === '..')) return null;
+  const directoryFds: number[] = [];
+  let directoryFd = root.fd;
+  const directoryFlags = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+  const fileFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+  try {
+    for (const component of components.slice(0, -1)) {
+      const next = fs.openSync(`/proc/self/fd/${directoryFd}/${component}`, directoryFlags);
+      directoryFds.push(next);
+      directoryFd = next;
+    }
+    const fd = fs.openSync(`/proc/self/fd/${directoryFd}/${components.at(-1)!}`, fileFlags);
+    return { fd, directoryFds };
+  } catch {
+    for (const fd of directoryFds.reverse()) { try { fs.closeSync(fd); } catch { /* best effort */ } }
+    return null;
+  }
+}
+
+/** Read a contained canonical path through a pinned root and descriptor-relative no-follow path. */
+export function readContainedSessionFile<T>(root: string, filePath: string, read: (descriptorPath: string) => T, pinnedRoot?: PinnedSessionRoot): T | null {
+  const ownerRoot = pinnedRoot ?? openPinnedSessionRoot(root);
+  if (!ownerRoot || !currentPathMatchesRoot(ownerRoot)) {
+    if (ownerRoot && ownerRoot !== pinnedRoot) closePinnedSessionRoot(ownerRoot);
+    return null;
+  }
+  let opened: { fd: number; directoryFds: number[] } | null = null;
+  try {
+    // Observe the indexed pathname for legacy race hooks, but never read from this handle.
+    // The actual payload is opened below relative to the pinned root descriptor.
+    let probeFd: number | undefined;
+    try {
+      probeFd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    } finally {
+      if (probeFd !== undefined) { try { fs.closeSync(probeFd); } catch { /* best effort */ } }
+    }
+    opened = openRelativeSessionFile(ownerRoot, filePath);
+    if (!opened) return null;
+    const initial = fs.fstatSync(opened.fd, { bigint: true });
+    if (!initial.isFile() || !currentPathMatchesRoot(ownerRoot)) return null;
+    const descriptorPath = process.platform === 'linux' ? `/proc/self/fd/${opened.fd}` : `/dev/fd/${opened.fd}`;
+    const result = read(descriptorPath);
+    const final = fs.fstatSync(opened.fd, { bigint: true });
+    if (final.size !== initial.size || final.mtimeNs !== initial.mtimeNs || final.ctimeNs !== initial.ctimeNs || !currentPathMatchesRoot(ownerRoot)) return null;
+    return result;
+  } finally {
+    if (opened) {
+      try { fs.closeSync(opened.fd); } catch { /* best effort */ }
+      for (const fd of opened.directoryFds.reverse()) { try { fs.closeSync(fd); } catch { /* best effort */ } }
+    }
+    if (ownerRoot !== pinnedRoot) closePinnedSessionRoot(ownerRoot);
+  }
+}
+
+/** Resolve contained owners in priority order; readers receive a descriptor-relative alias. */
+export function canonicalSessionOwners(db: ReturnType<DatabaseManager['getDb']>, sessionId: string, sessionsDir?: string, readSession: (filePath: string) => ParsedSession | null = parseSessionFile, firstOnly = false, pinnedSessionsRoot?: string, sharedPinnedRoot?: PinnedSessionRoot): Array<{ path: string; indexedPath: string; session: ParsedSession }> {
+  const owners = db.prepare('SELECT path, indexed_at FROM session_files WHERE session_id = ? ORDER BY indexed_at DESC, path DESC').all(sessionId) as Array<{ path: string; indexed_at: string }>;
+  // Pin the root pathname and inode. Open the configured pathname before deriving
+  // its canonical string; resolving first permits a replaced real directory to win.
+  let pinnedRoot: string | null = sharedPinnedRoot?.root ?? pinnedSessionsRoot ?? null;
+  let pinnedDirectory: PinnedSessionRoot | null = sharedPinnedRoot ?? null;
+  const ownsPinnedDirectory = sharedPinnedRoot === undefined;
+  if (sessionsDir !== undefined && pinnedRoot === null) {
+    pinnedDirectory = openPinnedSessionRoot(sessionsDir);
+    if (!pinnedDirectory) return [];
+    pinnedRoot = pinnedDirectory.root;
+  }
+  if (pinnedRoot !== null && pinnedDirectory === null) {
+    pinnedDirectory = openPinnedSessionRoot(pinnedRoot);
+    if (!pinnedDirectory) return [];
+  }
+  const ordered = owners.flatMap(owner => {
+    let root = pinnedRoot;
+    if (root === null) {
+      try { root = fs.realpathSync.native(path.dirname(owner.path)); } catch { return []; }
+    }
+    const contained = containedUnderRoot(root, owner.path);
+    return contained ? [{ path: contained, indexedPath: owner.path, root, indexedAt: owner.indexed_at }] : [];
+  }).sort((a, b) => b.indexedAt.localeCompare(a.indexedAt) || b.path.localeCompare(a.path));
+  const valid: Array<{ path: string; indexedPath: string; session: ParsedSession; indexedAt: string }> = [];
+  try {
+    for (const owner of ordered) {
+      try {
+        const session = readContainedSessionFile(owner.root, owner.path, readSession, pinnedDirectory ?? undefined);
+        if (session?.id === sessionId) {
+          valid.push({ path: owner.path, indexedPath: owner.indexedPath, session, indexedAt: owner.indexedAt });
+          if (firstOnly) break;
+        }
+      } catch (error) {
+        // A budget failure is not evidence that the transcript is invalid.
+        // Surface it instead of silently turning a partial search into no hits.
+        if (error instanceof SessionSearchReadLimitError) throw error;
+      }
+    }
+    return valid
+      .sort((a, b) => b.indexedAt.localeCompare(a.indexedAt) || b.path.localeCompare(a.path))
+      .map(({ path: ownerPath, indexedPath, session }) => ({ path: ownerPath, indexedPath, session }));
+  } finally {
+    if (ownsPinnedDirectory && pinnedDirectory) closePinnedSessionRoot(pinnedDirectory);
+  }
 }
 
 function getCanonicalSessionFiles(sessionsDir: string, projectDir?: string): string[] {
@@ -101,6 +230,39 @@ function getCanonicalSessionFiles(sessionsDir: string, projectDir?: string): str
 export interface IncrementalIndexOptions {
   projectDir?: string;
   maxFilesToIndex?: number;
+  /**
+   * Optional retention cutoff (ms epoch). JSONL session files whose mtime is
+   * strictly older than this cutoff are considered outside the retained window
+   * and are skipped entirely (not queued for indexing or counted as changed).
+   * This keeps incremental backfill aligned with session retention pruning:
+   * sessions pruned by pruneOldSessions() are never re-indexed on a later
+   * startup. Omit/0 to index every file (backwards-compatible default).
+   */
+  retentionCutoffMs?: number;
+}
+
+/**
+ * True when a session JSONL file's last-modified time falls within the
+ * retention window (mtime >= cutoff). Files older than the cutoff are treated
+ * as expired and are ineligible for backfill/indexing so that pruned sessions
+ * are not re-surfaced.
+ */
+function isWithinRetention(mtimeMs: number, retentionCutoffMs: number | undefined): boolean {
+  return !retentionCutoffMs || mtimeMs >= retentionCutoffMs;
+}
+
+export function truncateMessageContent(
+  content: string,
+  maxLength = DEFAULT_MAX_MESSAGE_CONTENT_LENGTH,
+): string {
+  if (content.length <= maxLength) return content;
+
+  const notice = `\n... (truncated, ${content.length} chars total)\n`;
+  const retainedLength = Math.max(0, maxLength - notice.length);
+  const prefixLength = Math.ceil(retainedLength / 2);
+  const suffixLength = Math.floor(retainedLength / 2);
+  const suffix = suffixLength > 0 ? content.slice(-suffixLength) : '';
+  return `${content.slice(0, prefixLength)}${notice}${suffix}`;
 }
 
 export interface BoundedBackfillOptions extends IncrementalIndexOptions {
@@ -365,16 +527,9 @@ function extractTextContent(content: unknown): string {
         if (typeof b.text === 'string') parts.push(b.text);
         break;
       case 'tool_result':
-        if (typeof b.content === 'string') {
-          parts.push(b.content);
-        } else if (Array.isArray(b.content)) {
-          for (const item of b.content) {
-            if (item && typeof item === 'object' && (item as Record<string, unknown>).type === 'text') {
-              const text = (item as Record<string, unknown>).text;
-              if (typeof text === 'string') parts.push(text);
-            }
-          }
-        }
+        // Tool results can contain unbounded file or command output. Tool
+        // calls are indexed separately, so retaining their output adds bloat
+        // without improving session search.
         break;
     }
   }
@@ -512,6 +667,7 @@ export function indexLiveSession(dbManager: DatabaseManager, sessionManager: Ses
 }
 
 function indexLiveSessionOnce(dbManager: DatabaseManager, sessionManager: SessionManagerSnapshot, sessionsDir?: string): IndexResult | null {
+  if (sessionManager.getSessionFile && !sessionManager.getSessionFile()) return null;
   const liveEntries = sessionManager.getEntries();
   if (liveEntries.length > 0) {
     const header = sessionManager.getHeader();
@@ -536,6 +692,41 @@ function indexLiveSessionOnce(dbManager: DatabaseManager, sessionManager: Sessio
 
   return indexPersistedLiveSessionOnce(dbManager, sessionManager, sessionsDir)
     ?? indexCurrentSessionOnce(dbManager, sessionManager);
+}
+
+/**
+ * Remove rows created by background review subprocesses that ran with
+ * `--no-session` before live indexing rejected ephemeral sessions.
+ */
+export function pruneEphemeralReviewSessions(dbManager: DatabaseManager): number {
+  return dbManager.withCorruptionRecovery(() => {
+    const db = dbManager.getDb();
+    const candidates = db.prepare(`
+      SELECT s.id
+      FROM sessions s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM session_files sf WHERE sf.session_id = s.id
+      )
+        AND (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) = 1
+        AND EXISTS (
+          SELECT 1
+          FROM messages m
+          WHERE m.session_id = s.id
+            AND m.content LIKE ?
+        )
+    `).all('<file name="/tmp/pi-hermes-prompt-%') as Array<{ id: string }>;
+
+    if (candidates.length === 0) return 0;
+
+    const placeholders = candidates.map(() => '?').join(', ');
+    const ids = candidates.map(({ id }) => id);
+    const remove = () => {
+      db.prepare(`DELETE FROM messages WHERE session_id IN (${placeholders})`).run(...ids);
+      return db.prepare(`DELETE FROM sessions WHERE id IN (${placeholders})`).run(...ids).changes;
+    };
+
+    return db.transaction ? db.transaction(remove)() : remove();
+  });
 }
 
 function getSessionFileMetadata(filePath: string): SessionFileMetadata {
@@ -571,6 +762,7 @@ function canonicalLiveFileIsFullyIndexed(
   }
 }
 
+/** Store the supplied fingerprint under the resolved canonical file identity. */
 export function upsertSessionFileMetadata(
   dbManager: DatabaseManager,
   filePath: string,
@@ -588,7 +780,7 @@ export function upsertSessionFileMetadata(
       size = excluded.size,
       mtime_ms = excluded.mtime_ms,
       indexed_at = excluded.indexed_at
-  `).run(metadata.path, sessionId, metadata.size, metadata.mtimeMs, indexedAt.toISOString());
+  `).run(filePath, sessionId, metadata.size, metadata.mtimeMs, indexedAt.toISOString());
 }
 
 function emptyBulkIndexResult(): BulkIndexResult {
@@ -637,21 +829,39 @@ function removeMissingCanonicalFiles(dbManager: DatabaseManager, knownFiles: rea
 
 /**
  * Index all sessions from disk.
+ * With retentionCutoffMs > 0, files whose mtime falls outside the window are
+ * skipped (counted in expiredSkipped) so a manual reindex honors the same
+ * retention policy the auto pruning enforces, instead of re-adding expired
+ * sessions that pruning just deleted.
  *
  * @param dbManager — Database manager instance
  * @param sessionsDir — Path to ~/.pi/agent/sessions/
  * @param projectDir — Optional: specific project directory to index
+ * @param retentionCutoffMs — Optional: epoch ms; files modified before it are skipped
  * @returns Bulk index result
  */
 export function indexAllSessions(
   dbManager: DatabaseManager,
   sessionsDir: string,
-  projectDir?: string
+  projectDir?: string,
+  retentionCutoffMs = 0,
 ): BulkIndexResult {
   const files = getCanonicalSessionFiles(sessionsDir, projectDir);
   const result = emptyBulkIndexResult();
+  let expiredSkipped = 0;
 
   for (const file of files) {
+    if (retentionCutoffMs > 0) {
+      try {
+        if (!isWithinRetention(getSessionFileMetadata(file).mtimeMs, retentionCutoffMs)) {
+          expiredSkipped++;
+          continue;
+        }
+      } catch {
+        // Unreadable metadata: let indexSessionFile report the real error.
+      }
+    }
+
     try {
       indexSessionFile(dbManager, file, result);
     } catch (err) {
@@ -659,6 +869,7 @@ export function indexAllSessions(
     }
   }
 
+  if (expiredSkipped > 0) result.expiredSkipped = expiredSkipped;
   try {
     const scopeRoot = canonicalPath(sessionsDir);
     const requestedRoot = projectDir ? path.resolve(scopeRoot, projectDir) : scopeRoot;
@@ -698,6 +909,12 @@ export function indexChangedSessions(
   for (const file of files) {
     try {
       const metadata = getSessionFileMetadata(file);
+      if (!isWithinRetention(metadata.mtimeMs, options.retentionCutoffMs)) {
+        // Outside the retained window (e.g. pruned by pruneOldSessions):
+        // never re-queue it for indexing, so a pruned session does not come
+        // back on the next startup backfill.
+        continue;
+      }
       if (storedSessionFileMatches(dbManager, metadata)) {
         result.sessionsSkipped++;
         continue;
@@ -791,13 +1008,11 @@ async function discoverCanonicalSessionFiles(
   const files: string[] = [];
   let complete = true;
   let passedCursor = cursor === null;
-  let cursorSeen = cursor === null;
   const emit = (filePath: string): void => {
     if (!passedCursor) {
       if (filePath <= (cursor as string)) return;
       passedCursor = true;
     }
-    cursorSeen = cursorSeen || filePath === cursor;
     files.push(filePath);
     onFileDiscovered(filePath);
   };
@@ -813,20 +1028,16 @@ async function discoverCanonicalSessionFiles(
     for (const entry of entries) {
       if (!checkBudget()) break;
       const candidate = path.join(root, entry.name);
-      if (!projectDir && !passedCursor && cursor && entry.isDirectory() && candidate < path.dirname(cursor)) {
-        await yieldFn();
-        continue;
-      }
+      if (!projectDir && !passedCursor && cursor && entry.isDirectory() && candidate < path.dirname(cursor)) continue;
+      // Skipped prefixes must not spend a fresh yield/stat budget on every startup.
+      if (!passedCursor && cursor && entry.name.endsWith('.jsonl') && candidate <= cursor) continue;
       const stat = await fs.promises.stat(candidate);
       if (stat.isDirectory() && !projectDir) {
         const children = (await fs.promises.readdir(candidate, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
         for (const child of children) {
           if (!checkBudget()) break;
           const childPath = path.join(candidate, child.name);
-          if (!passedCursor && cursor && childPath <= cursor) {
-            await yieldFn();
-            continue;
-          }
+          if (!passedCursor && cursor && childPath <= cursor) continue;
           if (child.name.endsWith('.jsonl')) {
             if ((await fs.promises.stat(childPath)).isFile()) {
               const canonical = canonicalPath(childPath);
@@ -848,10 +1059,11 @@ async function discoverCanonicalSessionFiles(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  if (complete && cursor !== null && !passedCursor && !cursorSeen) {
-    // The persisted owner disappeared or the tree was replaced. Start a new
-    // cycle rather than permanently skipping every path lexically before it.
-    return discoverCanonicalSessionFiles(sessionsDir, projectDir, signal, deadline, yieldFn, onFileDiscovered, null);
+  if (complete && cursor !== null) {
+    // A suffix is not a complete ownership inventory. Wrap before cleanup or
+    // clearing the cursor; this also restarts when its owner has disappeared.
+    const wrapped = await discoverCanonicalSessionFiles(sessionsDir, projectDir, signal, deadline, yieldFn, onFileDiscovered, null);
+    return { files: [...new Set([...files, ...wrapped.files])].sort(), complete: wrapped.complete };
   }
   return { files: [...new Set(files)].sort(), complete };
 }
@@ -870,13 +1082,22 @@ export async function indexChangedSessionsBounded(
   const maxTotalBytes = options.maxTotalBytes ?? BACKFILL_MAX_TOTAL_BYTES;
   const maxDurationMs = options.maxDurationMs ?? BACKFILL_MAX_DURATION_MS;
   const yieldFn = options.yieldFn ?? macrotaskYield;
-  const deadline = Date.now() + maxDurationMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + maxDurationMs;
+  const discoveryDeadline = startedAt + maxDurationMs / 3;
   const result = emptyBulkIndexResult();
   if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
+  const root = canonicalPath(sessionsDir);
+  const scopeRoot = options.projectDir ? canonicalPath(path.resolve(root, options.projectDir)) : root;
+  const relative = path.relative(root, scopeRoot);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    return { ...result, partial: true, errors: ['Backfill scope must remain inside the sessions root.'] };
+  }
+  const scopePrefix = scopeRoot.endsWith(path.sep) ? scopeRoot : `${scopeRoot}${path.sep}`;
   const cursor = getScanCursor(dbManager);
-  const discovery = await discoverCanonicalSessionFiles(sessionsDir, options.projectDir, options.signal, deadline, yieldFn, (file) => {
+  const discovery = await discoverCanonicalSessionFiles(sessionsDir, options.projectDir, options.signal, discoveryDeadline, yieldFn, (file) => {
     if (!options.signal?.aborted) setScanCursor(dbManager, file);
-  }, null);
+  }, cursor);
   if (!discovery.complete) {
     result.partial = true;
     result.aborted = options.signal?.aborted;
@@ -887,9 +1108,12 @@ export async function indexChangedSessionsBounded(
   const orderedFiles = cursorIndex > 0 ? [...files.slice(cursorIndex), ...files.slice(0, cursorIndex)] : files;
   const deferred = getDeferredFingerprints(dbManager);
   const changed: SessionFileMetadata[] = [];
-
+  // Reserve half the remaining time for parsing/indexing rather than metadata alone.
+  const metadataDeadline = (Date.now() + deadline) / 2;
+  let metadataComplete = true;
   for (const file of orderedFiles) {
-    if (options.signal?.aborted || Date.now() >= deadline) {
+    if (options.signal?.aborted || Date.now() >= metadataDeadline) {
+      metadataComplete = false;
       result.partial = true;
       result.aborted = options.signal?.aborted;
       break;
@@ -918,7 +1142,9 @@ export async function indexChangedSessionsBounded(
 
   const discoveryComplete = discovery.complete;
   if (discoveryComplete && !options.signal?.aborted) {
-    for (const file of Object.keys(deferred)) if (!files.includes(file)) delete deferred[file];
+    for (const file of Object.keys(deferred)) {
+      if (file.startsWith(scopePrefix) && !files.includes(file)) delete deferred[file];
+    }
   }
 
   // Newest files get priority for crash recovery. Malformed candidates do not
@@ -973,14 +1199,14 @@ export async function indexChangedSessionsBounded(
     if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
   }
 
-  const attemptedAll = changed.length <= result.sessionsProcessed + (result.deferredFiles ?? 0) && !result.reachedLimit && !result.aborted && Date.now() < deadline;
+  const attemptedAll = metadataComplete && changed.length <= result.sessionsProcessed + (result.deferredFiles ?? 0) && !result.reachedLimit && !result.aborted && Date.now() < deadline;
   if (discoveryComplete && attemptedAll && !options.signal?.aborted) writeMetadataValue(dbManager, SESSION_BACKFILL_SCAN_CURSOR_KEY, null);
   if (discoveryComplete && !options.signal?.aborted) {
-    try { removeMissingCanonicalFiles(dbManager, files, canonicalPath(sessionsDir)); }
+    try { removeMissingCanonicalFiles(dbManager, files, scopeRoot); }
     catch (error) { result.errors.push(`Error cleaning missing session files: ${error instanceof Error ? error.message : String(error)}`); result.partial = true; }
   }
   if (changed.length > result.sessionsProcessed + (result.deferredFiles ?? 0) && !result.reachedLimit && !result.aborted) result.partial = true;
-  if (Object.keys(deferred).length > 0) result.partial = true;
+  if (Object.keys(deferred).some(file => file.startsWith(scopePrefix))) result.partial = true;
   if (options.signal?.aborted) return { ...result, partial: true, aborted: true };
   setDeferredFingerprints(dbManager, deferred);
   return result;
@@ -1017,25 +1243,58 @@ function isRecentBackfillTimestamp(value: string | null, nowMs: number): boolean
  * The check stays cheap: it compares file counts and stored file size/mtime
  * metadata. Full JSONL parsing is left to the scheduled incremental backfill.
  */
-export function needsBackfill(dbManager: DatabaseManager, sessionsDir: string, now = new Date()): boolean {
+export function needsBackfill(
+  dbManager: DatabaseManager,
+  sessionsDir: string,
+  now = new Date(),
+  retentionCutoffMs = 0,
+): boolean {
   const db = dbManager.getDb();
   const files = getSessionFiles(sessionsDir);
   const indexed = db.prepare('SELECT COUNT(*) as count FROM sessions').get() as { count: number };
 
-  if (files.length > indexed.count) {
-    return true;
+  if (retentionCutoffMs <= 0) {
+    // Retention disabled: keep the historical cheap path — a plain file-count
+    // vs row-count comparison decides before any per-file stat work, so
+    // large session directories stay fast on startup.
+    if (files.length > indexed.count) {
+      return true;
+    }
+
+    for (const file of files) {
+      try {
+        const metadata = getSessionFileMetadata(file);
+        if (storedSessionFileMatches(dbManager, metadata)) continue;
+        return true;
+      } catch {
+        // An unreadable or malformed session file still needs indexing.
+        return true;
+      }
+    }
+
+    return !isRecentBackfillTimestamp(getLastBackfillTimestamp(dbManager), now.getTime());
   }
 
+  // Retention enabled: one metadata pass decides everything — a retained file
+  // with stale stored metadata demands a backfill, and when no file is inside
+  // the window there is no work at all. Returning here (instead of falling
+  // through to the periodic timestamp check) keeps an all-expired store from
+  // scheduling an empty backfill on every startup before a timestamp is ever
+  // written.
+  let hasRetainedFile = false;
   for (const file of files) {
     try {
       const metadata = getSessionFileMetadata(file);
-      if (storedSessionFileMatches(dbManager, metadata)) continue;
-      return true;
+      if (!isWithinRetention(metadata.mtimeMs, retentionCutoffMs)) continue;
+      hasRetainedFile = true;
+      if (!storedSessionFileMatches(dbManager, metadata)) return true;
     } catch {
       return true;
     }
   }
-
+  if (!hasRetainedFile) {
+    return false;
+  }
   return !isRecentBackfillTimestamp(getLastBackfillTimestamp(dbManager), now.getTime());
 }
 
@@ -1082,4 +1341,63 @@ export function getSessionStats(dbManager: DatabaseManager): {
     totalMessages: totals.messages,
     projects,
   };
+}
+
+/**
+ * Compute the retention cutoff (ms epoch) from a retention window in days.
+ * Returns 0 (no cutoff) when retention is undefined/zero/disabled.
+ */
+export function retentionCutoffMs(retentionDays: number | undefined): number {
+  if (!retentionDays || retentionDays <= 0) return 0;
+  return Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+}
+
+/**
+ * Delete sessions outside the retention window, along with their messages,
+ * to bound the growth of the session index database (see #183).
+ *
+ * A session is eligible for pruning when its session file's last-mod time is
+ * older than the window (falling back to started_at when no file metadata
+ * exists). This deliberately mirrors the backfill eligibility check in
+ * `needsBackfill`/`indexChangedSessions` (also keyed to file mtime), so a
+ * pruned session's on-disk JSONL file is never re-indexed by a later startup
+ * and never re-triggers a backfill. Retention and backfill therefore agree on
+ * the same eligible file set.
+ *
+ * `messages` and `session_files` reference `sessions`, but only `session_files`
+ * is declared `ON DELETE CASCADE`. Orphaned `messages` rows are deleted
+ * explicitly first so a `PRAGMA foreign_keys`-enabled delete never trips a
+ * FK constraint, and so an accurate `messagesRemoved` count is reported.
+ *
+ * Returns the number of sessions and messages removed.
+ */
+export function pruneOldSessions(
+  dbManager: DatabaseManager,
+  retentionDays: number,
+): { sessionsRemoved: number; messagesRemoved: number } {
+  const db = dbManager.getDb();
+  const cutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  const cutoffIso = new Date(cutoffMs).toISOString();
+
+  // Match backfill's mtime policy, but keep a linked session whenever any owner
+  // is still fresh. Eligibility and deletion share one transaction so a competing
+  // owner update cannot turn an obsolete candidate list into destructive pruning.
+  const prune = () => {
+    const eligibleSessionIds = db.prepare(`
+      SELECT s.id
+      FROM sessions s
+      LEFT JOIN session_files sf ON sf.session_id = s.id
+      GROUP BY s.id
+      HAVING (COUNT(sf.path) > 0 AND MAX(sf.mtime_ms) < ?)
+        OR (COUNT(sf.path) = 0 AND s.started_at < ?)
+    `).all(cutoffMs, cutoffIso) as Array<{ id: string }>;
+    if (!eligibleSessionIds.length) return { sessionsRemoved: 0, messagesRemoved: 0 };
+    const ids = eligibleSessionIds.map(row => row.id);
+    const placeholders = ids.map(() => '?').join(',');
+    // Messages do not cascade; delete them before their parent sessions.
+    const delMessages = db.prepare(`DELETE FROM messages WHERE session_id IN (${placeholders})`).run(...ids);
+    const delSessions = db.prepare(`DELETE FROM sessions WHERE id IN (${placeholders})`).run(...ids);
+    return { messagesRemoved: delMessages.changes, sessionsRemoved: delSessions.changes };
+  };
+  return db.transaction ? db.transaction(prune)() : prune();
 }

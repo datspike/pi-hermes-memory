@@ -22,23 +22,27 @@ export interface ApplyReviewOperationsResult {
   appliedCount: number;
   skippedCount: number;
   error?: string;
+  aborted?: boolean;
 }
 
 export interface DirectReviewResult {
   ok: boolean;
   appliedCount: number;
-  fallbackReason?: "no_model" | "no_auth" | "aborted" | "parse_error" | "provider_error" | "empty";
+  fallbackReason?: "no_model" | "no_auth" | "aborted" | "parse_error" | "provider_error" | "empty" | "empty_response";
   error?: string;
 }
 
 export interface RunDirectMemoryCompletionOptions {
   userPrompt: string;
   systemPrompt: string;
-  config: Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride">;
+  config: Pick<MemoryConfig, "llmModelOverride" | "llmFallbackModels" | "llmThinkingOverride">;
   timeoutMs?: number;
   signal?: AbortSignal;
   requireAtomicShrink?: boolean;
   expectedTarget?: ReviewMemoryOperation["target"];
+  /** Server-owned exact failure scope; null means global, never all projects. */
+  failureProject?: string | null;
+  failureEntries?: readonly string[];
 }
 
 /** Shared transport gate: review/flush/consolidation/correction all default to
@@ -48,7 +52,16 @@ export function usesDirectTransport(config: Pick<MemoryConfig, "reviewTransport"
   return (config.reviewTransport ?? "direct") === "direct";
 }
 
-type ReviewLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride">;
+/** One shared budget for a single review/flush/correction/consolidation
+ * completion, on both the direct transport and the `pi -p` subprocess
+ * fallback. Deliberately not configurable (#197): the bug was the double
+ * spend, not the number — after the empty-response short-circuit the
+ * painful case is one 120s call. Consolidation keeps its separate
+ * `consolidationTimeoutMs` because it is user-visible and must actually
+ * shrink. */
+export const REVIEW_COMPLETION_TIMEOUT_MS = 120_000;
+
+type ReviewLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmFallbackModels" | "llmThinkingOverride">;
 
 function findExactModelReferenceMatch(modelReference: string, availableModels: Model<Api>[]): Model<Api> | undefined {
   const trimmedReference = modelReference.trim();
@@ -83,25 +96,110 @@ function normalizedModelOverride(config: ReviewLlmConfig): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function collectFallbackOverrides(config: ReviewLlmConfig): string[] {
+  const out: string[] = [];
+  for (const raw of config.llmFallbackModels ?? []) {
+    const t = raw.trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+function allModelOverrides(config: ReviewLlmConfig): string[] {
+  const primary = normalizedModelOverride(config);
+  const fallbacks = collectFallbackOverrides(config);
+  const chain = primary ? [primary, ...fallbacks] : fallbacks;
+  return [...new Set(chain)];
+}
+
 function effectiveThinkingOverride(config: ReviewLlmConfig): ThinkingLevel | undefined {
   return config.llmThinkingOverride ?? (normalizedModelOverride(config) ? "off" : undefined);
 }
 
 type ReviewModelRegistry = ExtensionContext["modelRegistry"];
 
+/** Derived from the installed SDK so headers/baseUrl track ProviderHeaders instead of a local mirror. */
+export type ResolvedRequestAuth = Awaited<ReturnType<ReviewModelRegistry["getApiKeyAndHeaders"]>>;
+
+type DirectReviewAuth = Omit<Extract<ResolvedRequestAuth, { ok: true }>, "ok">;
+
+type DirectRequestHeaders = DirectReviewAuth["headers"];
+
+/** Context the direct transport needs: request routing plus the session the
+ * gateway attributes the background request to (#250). */
+export type DirectReviewContext = Pick<ExtensionContext, "model" | "modelRegistry" | "sessionManager">;
+
+// Restated from pi-coding-agent's internal getSessionHeaders, read at
+// dist/core/provider-attribution.js in v0.87.1. The package exports no seam for
+// it, and pi-ai only grew its own injection in v0.86.0 while this extension
+// declares a 0.80.6 floor. Re-read that file when bumping the floor past
+// 0.86.0, and check that pi did not add a provider or change the client value.
+//
+// The header is set directly rather than through StreamOptions.sessionId
+// because pi-ai's openai-responses default of sendSessionIdHeader is true, so
+// passing sessionId would also start sending an OpenAI session_id header to
+// every OpenAI Responses user.
+const OPENCODE_SESSION_HEADER = "x-opencode-session";
+const OPENCODE_CLIENT_HEADER = "x-opencode-client";
+const OPENCODE_HOST = "opencode.ai";
+
+function matchesHost(baseUrl: string | undefined, expectedHost: string): boolean {
+  try {
+    return new URL(baseUrl ?? "").hostname === expectedHost;
+  } catch {
+    return false;
+  }
+}
+
+/** A missing session id degrades to the pre-#250 behaviour: the attempt still
+ * goes out, and the subprocess fallback owns recovery. */
+function readSessionId(sessionManager: DirectReviewContext["sessionManager"]): string | undefined {
+  try {
+    return sessionManager.getSessionId() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Returns a copy whenever a header is added: the registry hands out a shared
+ * object, and the credential-rotation comparison below must not read hermes'
+ * own header as a credential change.
+ *
+ * An operator-configured session header short-circuits both additions, so that
+ * request carries no client header. pi keeps its client header in that case.
+ * The divergence is deliberate, because honouring the operator's session id
+ * completely is the more predictable contract. */
+function directRequestHeaders(
+  model: Model<Api>,
+  headers: DirectRequestHeaders,
+  sessionId: string | undefined,
+): DirectRequestHeaders {
+  if (!sessionId) return headers;
+  const isOpenCode = model.provider === "opencode"
+    || model.provider === "opencode-go"
+    || matchesHost(model.baseUrl, OPENCODE_HOST);
+  if (!isOpenCode) return headers;
+  const alreadySet = Object.keys(headers ?? {}).some(
+    (key) => key.toLowerCase() === OPENCODE_SESSION_HEADER,
+  );
+  if (alreadySet) return headers;
+  return {
+    ...headers,
+    [OPENCODE_SESSION_HEADER]: sessionId,
+    [OPENCODE_CLIENT_HEADER]: "pi",
+  };
+}
+
 export function buildDirectReviewCompletionOptions(
   model: Model<Api>,
-  auth: {
-    apiKey: string;
-    headers?: Record<string, string>;
-    env?: Record<string, string>;
-  },
+  auth: DirectReviewAuth,
   thinking: ThinkingLevel | undefined,
   signal: AbortSignal,
+  sessionId: string | undefined,
 ): SimpleStreamOptions {
   const options: SimpleStreamOptions = {
     apiKey: auth.apiKey,
-    headers: auth.headers,
+    headers: directRequestHeaders(model, auth.headers, sessionId),
     env: auth.env,
     signal,
   };
@@ -124,6 +222,28 @@ export function resolveReviewModel(
   return ctxModel;
 }
 
+export function resolveReviewModels(
+  ctxModel: Model<Api> | undefined,
+  modelRegistry: ReviewModelRegistry,
+  config: ReviewLlmConfig,
+): Model<Api>[] {
+  const chain = allModelOverrides(config);
+  if (chain.length === 0) return ctxModel ? [ctxModel] : [];
+  const all = modelRegistry.getAll();
+  const resolved: Model<Api>[] = [];
+  for (const ref of chain) {
+    const m = findExactModelReferenceMatch(ref, all);
+    if (m) resolved.push(m);
+  }
+  // If none of the chain resolved, fall back to active model so we still try something
+  if (resolved.length === 0 && ctxModel) resolved.push(ctxModel);
+  return resolved;
+}
+
+export function getReviewModelChain(config: ReviewLlmConfig): string[] {
+  return allModelOverrides(config);
+}
+
 /**
  * Provider responses that mean "this key is no longer good", as opposed to a
  * transport hiccup or a model error worth falling back to a subprocess for.
@@ -142,49 +262,152 @@ export function isAuthRejection(message: string): boolean {
   return AUTH_REJECTION_PATTERN.test(message);
 }
 
-/**
- * Mirrors the SDK's ResolvedRequestAuth. pi-coding-agent declares it in
- * core/model-registry but does not re-export it from the package root, and its
- * `exports` map blocks deep imports — so name it here. tsc still checks the
- * shape against the real registry at the call below, so drift is a build error.
- */
-export type ResolvedRequestAuth =
-  | { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
-  | { ok: false; error: string };
+const CREDENTIAL_HEADER_NAMES = new Set(["authorization", "x-api-key", "cf-aig-authorization"]);
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+// Bedrock (AWS profile/SSO) signs inside its SDK, so empty auth is normal there.
+// Not for OAuth: empty OAuth auth means the token refresh failed.
+function hasRequestAuth(
+  modelRegistry: ReviewModelRegistry,
+  model: Model<Api>,
+  auth: DirectReviewAuth,
+): boolean {
+  if (isNonEmptyString(auth.apiKey)) return true;
+  const hasCredentialHeader = Object.entries(auth.headers ?? {}).some(
+    ([key, value]) => CREDENTIAL_HEADER_NAMES.has(key.toLowerCase()) && isNonEmptyString(value),
+  );
+  if (hasCredentialHeader) return true;
+  return modelRegistry.hasConfiguredAuth(model) && !modelRegistry.isUsingOAuth(model);
+}
+
+function sameStringRecord(
+  left: Record<string, string> | undefined,
+  right: Record<string, string> | undefined,
+): boolean {
+  const leftEntries = Object.entries(left ?? {});
+  const rightKeys = Object.keys(right ?? {});
+  return leftEntries.length === rightKeys.length
+    && leftEntries.every(([key, value]) => right?.[key] === value);
+}
+
+function headerPairs(headers: DirectReviewAuth["headers"]): Array<[string, string | null]> {
+  return Object.entries(headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]);
+}
+
+function sameHeaders(
+  left: DirectReviewAuth["headers"],
+  right: DirectReviewAuth["headers"],
+): boolean {
+  const remaining = headerPairs(right);
+  const leftPairs = headerPairs(left);
+  if (leftPairs.length !== remaining.length) return false;
+  for (const [key, value] of leftPairs) {
+    const index = remaining.findIndex((pair) => pair[0] === key && pair[1] === value);
+    if (index === -1) return false;
+    remaining.splice(index, 1);
+  }
+  return true;
+}
+
+function sameRequestAuth(left: DirectReviewAuth, right: DirectReviewAuth): boolean {
+  return left.apiKey === right.apiKey
+    && sameHeaders(left.headers, right.headers)
+    && sameStringRecord(left.env, right.env);
+}
 
 /**
- * Resolve request auth against credentials re-read from disk.
- *
- * Pi's AuthStorage parses auth.json once in its constructor and only reloads
- * it when an OAuth refresh fails, and ExtensionRunner hands every event the
- * same ModelRegistry singleton — so an api_key credential is effectively
- * frozen for the process lifetime. A key rotated on disk by another tool
- * (e.g. @lnilluv/pi-opencode-go-rotation swapping an opencode-go subscription
- * key after a weekly limit) stays invisible to this session, and every direct
- * memory completion keeps presenting the revoked key (#139).
- *
- * reload() is public and is a synchronous re-read of that one file, so pay it
- * per completion — a handful per session — instead of caching a key forever.
+ * Resolve request auth through the public ModelRegistry API. Resolve it again
+ * after an auth rejection so Pi can supply refreshed credentials when its
+ * registry supports that, without reaching into version-sensitive internals.
  */
-export async function resolveFreshRequestAuth(
+export async function resolveRequestAuth(
   modelRegistry: ReviewModelRegistry,
   model: Model<Api>,
 ): Promise<ResolvedRequestAuth> {
-  try {
-    modelRegistry.authStorage?.reload();
-  } catch {
-    // A malformed or unreadable auth.json must not take the review path down;
-    // fall through to whatever credentials are already loaded.
-  }
   return modelRegistry.getApiKeyAndHeaders(model);
 }
 
-function extractJsonPayload(text: string): unknown {
+/** A JSON object extracted from a model response, validated to carry an
+ * `operations` array. Candidate payloads without one are declined at every
+ * extraction step, so a log line, counterexample, or stray snippet cannot
+ * claim the parse and force the subprocess fallback (#235). */
+type JsonObjectPayload = { operations?: unknown };
+
+function isJsonObjectPayload(value: unknown): value is JsonObjectPayload {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Balanced {...} regions at any nesting depth, string- and escape-aware.
+ * Recording every matched pair — not just top-level ones — means an
+ * unbalanced "{" in surrounding prose cannot hide a later object: the
+ * object still forms its own balanced region nested inside the phantom
+ * one (#235). */
+function balancedObjectSpans(text: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const open: number[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (inString) {
+      if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      open.push(i);
+    } else if (ch === "}") {
+      const start = open.pop();
+      if (start !== undefined) spans.push([start, i]);
+    }
+  }
+  return spans;
+}
+
+/** CoT routinely restates the schema before answering, so the first-to-last
+ * slice above is invalid JSON across that span. Scan balanced objects from
+ * the end and return the last one that parses with an `operations` array —
+ * the answer trailing the preamble (#197). */
+function lastParseableOperationsObject(text: string): JsonObjectPayload | null {
+  const spans = balancedObjectSpans(text);
+  for (let s = spans.length - 1; s >= 0; s--) {
+    const span = spans[s];
+    if (!span) continue;
+    try {
+      const parsed: unknown = JSON.parse(text.slice(span[0], span[1] + 1));
+      if (isJsonObjectPayload(parsed) && Array.isArray(parsed.operations)) {
+        return parsed;
+      }
+    } catch {
+      // keep scanning
+    }
+  }
+  return null;
+}
+
+function extractJsonPayload(text: string): JsonObjectPayload | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
+  const asObject = (value: unknown): JsonObjectPayload | null =>
+    isJsonObjectPayload(value) && Array.isArray(value.operations) ? value : null;
+
+  // A declined candidate (valid JSON, no `operations` array) must fall through
+  // to the later paths rather than exit — exiting here is how a stray snippet
+  // claimed the parse and forced the subprocess while a valid trailing
+  // answer was present (#235).
   try {
-    return JSON.parse(trimmed);
+    const parsed = asObject(JSON.parse(trimmed));
+    if (parsed) return parsed;
   } catch {
     // continue
   }
@@ -192,7 +415,8 @@ function extractJsonPayload(text: string): unknown {
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
     try {
-      return JSON.parse(fenced[1].trim());
+      const parsed = asObject(JSON.parse(fenced[1].trim()));
+      if (parsed) return parsed;
     } catch {
       // continue
     }
@@ -202,12 +426,44 @@ function extractJsonPayload(text: string): unknown {
   const end = trimmed.lastIndexOf("}");
   if (start >= 0 && end > start) {
     try {
-      return JSON.parse(trimmed.slice(start, end + 1));
+      const parsed = asObject(JSON.parse(trimmed.slice(start, end + 1)));
+      if (parsed) return parsed;
     } catch {
-      return null;
+      return lastParseableOperationsObject(trimmed);
     }
   }
 
+  return lastParseableOperationsObject(trimmed);
+}
+
+/** A winning thinking-channel candidate plus whether it sits at the tail of
+ * the channel — the trust boundary for thinking-sourced operations. */
+interface ThinkingOperationsCandidate {
+  payload: JsonObjectPayload;
+  trailing: boolean;
+}
+
+/** Thinking-sourced text takes its own extraction (#235): candidates are
+ * validated on their `operations` array and scanned from the end, because a
+ * chain of thought routinely restates the schema — or drafts an operation it
+ * then rejects — before the final answer. The shared cascade would let an
+ * earlier fenced draft win before this scan runs. The winner is the last
+ * ops-bearing object; `trailing` reports whether anything follows it, which
+ * decides how much to trust it. */
+function extractThinkingOperations(text: string): ThinkingOperationsCandidate | null {
+  const spans = balancedObjectSpans(text);
+  for (let s = spans.length - 1; s >= 0; s--) {
+    const span = spans[s];
+    if (!span) continue;
+    try {
+      const parsed: unknown = JSON.parse(text.slice(span[0], span[1] + 1));
+      if (isJsonObjectPayload(parsed) && Array.isArray(parsed.operations)) {
+        return { payload: parsed, trailing: text.slice(span[1] + 1).trim() === "" };
+      }
+    } catch {
+      // keep scanning
+    }
+  }
   return null;
 }
 
@@ -234,11 +490,16 @@ export function parseReviewOperations(text: string): ReviewMemoryOperation[] | n
   }
 
   const payload = extractJsonPayload(text);
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  if (!payload) {
     return null;
   }
 
-  const operations = (payload as { operations?: unknown }).operations;
+  return mapOperationsArray(payload.operations);
+}
+
+/** Map a candidate `operations` array to validated review operations; null
+ * means the payload is not an operations payload at all. */
+function mapOperationsArray(operations: unknown): ReviewMemoryOperation[] | null {
   if (!Array.isArray(operations)) return null;
 
   const parsed: ReviewMemoryOperation[] = [];
@@ -270,6 +531,9 @@ export async function applyReviewOperations(
   options: {
     requireAtomicShrink?: boolean;
     expectedTarget?: ReviewMemoryOperation["target"];
+    failureProject?: string | null;
+    failureEntries?: readonly string[];
+    signal?: AbortSignal;
   } = {},
 ): Promise<ApplyReviewOperationsResult> {
   if (options.requireAtomicShrink) {
@@ -304,6 +568,9 @@ export async function applyReviewOperations(
       };
     }
 
+    if (options.signal?.aborted) {
+      return { appliedCount: 0, skippedCount: operations.length, aborted: true };
+    }
     const activeStore = target === "project" ? projectStore! : store;
     const memoryTarget = target === "project" ? "memory" : target;
     const mutationOperations = operations.map((operation) => ({
@@ -312,9 +579,17 @@ export async function applyReviewOperations(
       oldText: operation.old_text,
       category: target === "failure" ? operation.category ?? "failure" : operation.category,
       failureReason: operation.failure_reason,
-      project: target === "failure" ? projectName ?? undefined : undefined,
+      project: target === "failure" ? (options.failureProject !== undefined ? options.failureProject : projectName) ?? undefined : undefined,
     }));
-    const result = await activeStore.applyMutationPlan(memoryTarget, mutationOperations, { requireShrink: true });
+    const result = await activeStore.applyMutationPlan(memoryTarget, mutationOperations, {
+      requireShrink: true,
+      failureProject: options.failureProject,
+      failureEntries: options.failureEntries,
+      signal: options.signal,
+    });
+    if (options.signal?.aborted && !result.success) {
+      return { appliedCount: 0, skippedCount: operations.length, aborted: true };
+    }
     return result.success
       ? { appliedCount: operations.length, skippedCount: 0 }
       : {
@@ -327,7 +602,12 @@ export async function applyReviewOperations(
   let appliedCount = 0;
   let skippedCount = 0;
 
-  for (const op of operations) {
+  for (let i = 0; i < operations.length; i++) {
+    if (options.signal?.aborted) {
+      skippedCount += operations.length - i;
+      return { appliedCount, skippedCount, aborted: appliedCount === 0 };
+    }
+    const op = operations[i];
     if (op.target === "project" && !projectStore) {
       skippedCount++;
       continue;
@@ -350,6 +630,7 @@ export async function applyReviewOperations(
             category,
             failureReason: op.failure_reason,
             project: projectName ?? undefined,
+            signal: options.signal,
           });
           if (result.success) {
             appliedCount++;
@@ -357,7 +638,7 @@ export async function applyReviewOperations(
             skippedCount++;
           }
         } else {
-          result = await activeStore.add(memoryTarget, op.content);
+          result = await activeStore.add(memoryTarget, op.content, options.signal);
           if (result.success) {
             appliedCount++;
           } else {
@@ -371,7 +652,7 @@ export async function applyReviewOperations(
           skippedCount++;
           continue;
         }
-        result = await activeStore.replace(memoryTarget, op.old_text, op.content);
+        result = await activeStore.replace(memoryTarget, op.old_text, op.content, options.signal);
         if (result.success) {
           appliedCount++;
         } else {
@@ -384,7 +665,7 @@ export async function applyReviewOperations(
           skippedCount++;
           continue;
         }
-        result = await activeStore.remove(memoryTarget, op.old_text);
+        result = await activeStore.remove(memoryTarget, op.old_text, options.signal);
         if (result.success) {
           appliedCount++;
         } else {
@@ -397,134 +678,297 @@ export async function applyReviewOperations(
         continue;
     }
 
+    if (options.signal?.aborted) {
+      skippedCount += operations.length - i - 1;
+      return { appliedCount, skippedCount, aborted: appliedCount === 0 };
+    }
   }
 
   return { appliedCount, skippedCount };
 }
 
-function responseText(content: unknown): string {
-  if (!Array.isArray(content)) return "";
-  return content
+/** Channel-aware text extraction: text blocks when present, otherwise the
+ * thinking channel — thinking-default servers park the whole answer in the
+ * reasoning channel (e.g. vLLM with DEFAULT_THINKING=max, regardless of the
+ * client-side level), so it is recovered there rather than treated as a
+ * parse error (#197). The source decides which extraction path parses it:
+ * the text channel keeps the shared cascade, thinking takes its own
+ * end-scan (#235). */
+function responseChannelText(content: unknown): { text: string; source: "text" | "thinking" } {
+  if (!Array.isArray(content)) return { text: "", source: "text" };
+  const text = content
     .filter((block): block is { type: "text"; text: string } => (
       !!block && typeof block === "object" && (block as { type?: string }).type === "text"
     ))
     .map((block) => block.text)
     .join("\n");
+  if (text.trim()) return { text, source: "text" };
+
+  // Anthropic redacted_thinking arrives as {type:"thinking", redacted:true}
+  // after normalization — there is no recoverable payload in it, and letting
+  // it through would turn a redacted-only completion into a parse_error and
+  // burn the subprocess fallback (#197).
+  const thinking = content
+    .filter((block): block is { type: "thinking"; thinking: string } => (
+      !!block && typeof block === "object" && (block as { type?: string }).type === "thinking"
+      && (block as { redacted?: boolean }).redacted !== true
+    ))
+    .map((block) => block.thinking)
+    .join("\n");
+  return { text: thinking, source: "thinking" };
+}
+
+const defaultProviderNoticeState = { logged: false };
+
+/** Fired once per process when a provider returns the whole answer in its
+ * thinking channel with an empty answer channel. That signature means the
+ * provider's server-side thinking default is swallowing the output (the #197
+ * report), so thinking-channel recovery is a workaround for a
+ * misconfiguration, not a feature to rely on. */
+function notifyThinkingChannelProvider(
+  model: { provider?: unknown; id?: unknown },
+  deps: { onProviderNotice?: (message: string) => void; providerNoticeState?: { logged: boolean } },
+): void {
+  const state = deps.providerNoticeState ?? defaultProviderNoticeState;
+  if (state.logged) return;
+  state.logged = true;
+  const modelRef = typeof model?.provider === "string" && typeof model?.id === "string"
+    ? `${model.provider}/${model.id}`
+    : "the active model";
+  const sink = deps.onProviderNotice ?? ((message: string) => console.warn(message));
+  sink(
+    `[pi-hermes-memory] Provider misconfiguration: ${modelRef} returned the whole answer in its thinking channel and left the answer channel empty. `
+      + "This usually means server-side thinking is forced on for this provider (for example a vLLM server started with DEFAULT_THINKING=max). "
+      + "Review recovery from the thinking channel is best-effort and can miss saves. "
+      + "Ask your Pi to fix this as well.",
+  );
 }
 
 export async function runDirectMemoryCompletion(
-  ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+  ctx: DirectReviewContext,
   store: MemoryStore,
   projectStore: MemoryStore | null,
   options: RunDirectMemoryCompletionOptions,
   dbManager: DatabaseManager | null = null,
   projectName?: string | null,
-  deps: { completeSimple?: typeof completeSimple } = {},
+  deps: {
+    completeSimple?: typeof completeSimple;
+    /** Test seam: replaces the console.warn sink for the provider notice. */
+    onProviderNotice?: (message: string) => void;
+    /** Test seam: dedupe state for the provider notice; omit for the process default. */
+    providerNoticeState?: { logged: boolean };
+  } = {},
 ): Promise<DirectReviewResult> {
   const complete = deps.completeSimple ?? completeSimple;
-  const model = resolveReviewModel(ctx.model, ctx.modelRegistry, options.config);
-  if (!model) {
+  const aborted = (): DirectReviewResult => ({ ok: false, appliedCount: 0, fallbackReason: "aborted" });
+  if (options.signal?.aborted) return aborted();
+
+  const models = resolveReviewModels(ctx.model, ctx.modelRegistry, options.config);
+  if (models.length === 0) {
     return { ok: false, appliedCount: 0, fallbackReason: "no_model" };
   }
 
-  const auth = await resolveFreshRequestAuth(ctx.modelRegistry, model);
-  if (!auth.ok || !auth.apiKey) {
-    return {
-      ok: false,
-      appliedCount: 0,
-      fallbackReason: "no_auth",
-      error: auth.ok ? `No API key for ${model.provider}` : auth.error,
-    };
-  }
-  let requestAuth = { apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
+  // One id per completion, reused across the chain: the whole chain is a single
+  // job for a single conversation.
+  const sessionId = readSessionId(ctx.sessionManager);
 
-  const controller = new AbortController();
-  const timeoutMs = options.timeoutMs ?? 120000;
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  if (options.signal) {
-    options.signal.addEventListener("abort", () => controller.abort(), { once: true });
-  }
-
-  const thinking = effectiveThinkingOverride(options.config);
-  const userMessage: Message = {
-    role: "user",
-    content: [{ type: "text", text: options.userPrompt }],
-    timestamp: Date.now(),
-  };
-
-  const request = { systemPrompt: options.systemPrompt, messages: [userMessage] };
-
-  try {
-    let response;
-    try {
-      response = await complete(
-        model,
-        request,
-        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal),
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (controller.signal.aborted || !isAuthRejection(message)) throw err;
-
-      // The provider rejected the key mid-flight. A rotation tool may have
-      // written a new one since we resolved auth; re-read and retry once, but
-      // only if the key actually changed — otherwise this is a real auth
-      // problem and the subprocess fallback should handle it (#139).
-      const rotated = await resolveFreshRequestAuth(ctx.modelRegistry, model);
-      if (!rotated.ok || !rotated.apiKey || rotated.apiKey === requestAuth.apiKey) throw err;
-
-      requestAuth = { apiKey: rotated.apiKey, headers: rotated.headers, env: rotated.env };
-      response = await complete(
-        model,
-        request,
-        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal),
-      );
-    }
-
-    if (response.stopReason === "aborted") {
-      return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
-    }
-
-    const text = responseText(response.content);
-    const operations = parseReviewOperations(text);
-    if (operations === null) {
-      return { ok: false, appliedCount: 0, fallbackReason: "parse_error" };
-    }
-    if (operations.length === 0) {
-      return { ok: true, appliedCount: 0, fallbackReason: "empty" };
-    }
-
-    const applied = await applyReviewOperations(
-      store,
-      projectStore,
-      operations,
-      dbManager,
-      projectName,
-      {
-        requireAtomicShrink: options.requireAtomicShrink,
-        expectedTarget: options.expectedTarget,
-      },
-    );
-    if (applied.error) {
-      return {
+  // Try each model in chain: primary + llmFallbackModels. Only retry on
+  // provider/auth/transport failures; parse errors are prompt-specific so we
+  // still try the next model as it may have better instruction following.
+  let lastResult: DirectReviewResult | undefined;
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi]!;
+    // A caller abort (user cancel, shutdown bound) ends the whole chain: the
+    // next iteration's listener would never fire for an already-aborted
+    // signal, so continuing would burn a full timeout per remaining model.
+    if (options.signal?.aborted) return aborted();
+    const auth = await resolveRequestAuth(ctx.modelRegistry, model);
+    if (options.signal?.aborted) return aborted();
+    if (!auth.ok || !hasRequestAuth(ctx.modelRegistry, model, auth)) {
+      lastResult = {
         ok: false,
         appliedCount: 0,
-        fallbackReason: "provider_error",
-        error: applied.error,
+        fallbackReason: "no_auth",
+        error: auth.ok ? `No request authentication for ${model.provider}` : auth.error,
       };
+      if (mi < models.length - 1) continue;
+      return lastResult;
     }
-    return { ok: true, appliedCount: applied.appliedCount };
-  } catch (err) {
-    if (controller.signal.aborted) {
-      return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+    let requestAuth: DirectReviewAuth = { apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
+
+    const controller = new AbortController();
+    const timeoutMs = options.timeoutMs ?? REVIEW_COMPLETION_TIMEOUT_MS;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const onExternalAbort = () => controller.abort();
+    if (options.signal) {
+      options.signal.addEventListener("abort", onExternalAbort, { once: true });
+      if (options.signal.aborted) controller.abort();
     }
-    return {
-      ok: false,
-      appliedCount: 0,
-      fallbackReason: "provider_error",
-      error: err instanceof Error ? err.message : String(err),
+
+    const thinking = effectiveThinkingOverride(options.config);
+    const userMessage: Message = {
+      role: "user",
+      content: [{ type: "text", text: options.userPrompt }],
+      timestamp: Date.now(),
     };
-  } finally {
-    clearTimeout(timeout);
+
+    const request = { systemPrompt: options.systemPrompt, messages: [userMessage] };
+
+    const completeOnce = async () => {
+      const response = await complete(
+        model,
+        request,
+        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal, sessionId),
+      );
+      if (response.stopReason === "error" && isAuthRejection(response.errorMessage ?? "")) {
+        throw new Error(response.errorMessage ?? "error");
+      }
+      return response;
+    };
+
+    try {
+      let response;
+      try {
+        response = await completeOnce();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (controller.signal.aborted || !isAuthRejection(message)) throw err;
+
+        // Thrown failures and error assistant responses share this path. API keys
+        // and OAuth headers can both rotate, so re-resolve through Pi and retry
+        // once only when the effective request auth actually changed; otherwise
+        // this is a real auth problem and the subprocess fallback should handle
+        // it (#139).
+        const rotated = await resolveRequestAuth(ctx.modelRegistry, model);
+        if (!rotated.ok || !hasRequestAuth(ctx.modelRegistry, model, rotated) || sameRequestAuth(rotated, requestAuth)) throw err;
+
+        requestAuth = { apiKey: rotated.apiKey, headers: rotated.headers, env: rotated.env };
+        response = await completeOnce();
+      }
+
+      if (options.signal?.aborted) {
+        clearTimeout(timeout);
+        return aborted();
+      }
+      if (response.stopReason === "aborted" || controller.signal.aborted) {
+        lastResult = { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+        if (mi < models.length - 1) { clearTimeout(timeout); continue; }
+        return lastResult;
+      }
+
+      const { text, source } = responseChannelText(response.content);
+      // The thinking-only signature means the provider's server-side thinking
+      // default is swallowing the answer channel (#197). Recovery works, but
+      // it is best-effort; surface the misconfiguration once per process so
+      // the user can fix the provider instead of relying on the recovery.
+      if (source === "thinking" && text.trim() !== "") {
+        notifyThinkingChannelProvider(model, deps);
+      }
+
+      // Thinking-sourced text takes its own extraction (#235): candidates are
+      // validated on their `operations` array and scanned from the end, and
+      // the winner's trailing-ness sets how much to trust it. The text channel
+      // keeps the shared cascade untouched so today's parse successes do not
+      // move.
+      let operations: ReviewMemoryOperation[] | null;
+      let unparsableThinking = false;
+      if (source === "thinking") {
+        const extraction = extractThinkingOperations(text);
+        if (extraction) {
+          operations = mapOperationsArray(extraction.payload.operations) ?? [];
+          // A candidate that is not trailing is draft-grade: apply only its
+          // adds. Trusting a draft's replace/remove — or reaching back to an
+          // earlier candidate when the trailing one is empty — would execute
+          // operations the model may have rejected; a missed save is
+          // recoverable, a wrong deletion is not.
+          if (!extraction.trailing) {
+            operations = operations.filter((operation) => operation.action === "add");
+          }
+        } else {
+          operations = null;
+          unparsableThinking = true;
+        }
+      } else {
+        operations = parseReviewOperations(text);
+      }
+
+      // A clean stop with no usable output — nothing in either channel, or
+      // thinking-sourced output that parses to nothing — settles
+      // empty_response: the subprocess would run the same model against the
+      // same server-side thinking default and fail the same way (#197). The
+      // chain still walks llmFallbackModels first, like parse_error does: a
+      // silent primary model should not end the review while a configured
+      // fallback may answer (#235). Never the subprocess on this path.
+      // Truncated responses (stopReason "length") still fall through to
+      // parse_error so the chain can retry them.
+      if ((!text.trim() || unparsableThinking) && response.stopReason === "stop") {
+        lastResult = { ok: true, appliedCount: 0, fallbackReason: "empty_response" };
+        if (mi < models.length - 1) { clearTimeout(timeout); continue; }
+        return lastResult;
+      }
+      if (operations === null) {
+        lastResult = { ok: false, appliedCount: 0, fallbackReason: "parse_error" };
+        if (mi < models.length - 1) { clearTimeout(timeout); continue; }
+        return lastResult;
+      }
+      if (operations.length === 0) {
+        clearTimeout(timeout);
+        return { ok: true, appliedCount: 0, fallbackReason: "empty" };
+      }
+      if (controller.signal.aborted || options.signal?.aborted) {
+        return aborted();
+      }
+
+      const applied = await applyReviewOperations(
+        store,
+        projectStore,
+        operations,
+        dbManager,
+        projectName,
+        {
+          requireAtomicShrink: options.requireAtomicShrink,
+          expectedTarget: options.expectedTarget,
+          failureProject: options.failureProject,
+          failureEntries: options.failureEntries,
+          signal: options.signal,
+        },
+      );
+      if (applied.aborted && applied.appliedCount === 0) {
+        return aborted();
+      }
+      if (applied.error) {
+        lastResult = {
+          ok: false,
+          appliedCount: 0,
+          fallbackReason: "provider_error",
+          error: applied.error,
+        };
+        if (mi < models.length - 1) { clearTimeout(timeout); continue; }
+        return lastResult;
+      }
+      clearTimeout(timeout);
+      return { ok: true, appliedCount: applied.appliedCount };
+    } catch (err) {
+      if (options.signal?.aborted) {
+        clearTimeout(timeout);
+        return aborted();
+      }
+      if (controller.signal.aborted) {
+        lastResult = { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+      } else {
+        lastResult = {
+          ok: false,
+          appliedCount: 0,
+          fallbackReason: "provider_error",
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (mi < models.length - 1) { clearTimeout(timeout); continue; }
+      return lastResult!;
+    } finally {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", onExternalAbort);
+    }
   }
+  return lastResult ?? { ok: false, appliedCount: 0, fallbackReason: "provider_error", error: "All fallback models failed" };
 }

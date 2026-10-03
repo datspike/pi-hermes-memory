@@ -37,7 +37,7 @@ pi install npm:pi-hermes-memory
 /learn-memory-tool
 ```
 
-## Upgrade Notes (v0.7.10)
+## Upgrade Notes (v0.9.9)
 
 If you’re upgrading from older versions, startup now auto-migrates extension data safely:
 
@@ -61,11 +61,11 @@ No manual action is needed. Launch Pi once after upgrade to let migration/normal
 | 📚 **Procedural Skills** | The agent saves *how* it solved problems as reusable docs |
 | ⚡ **Background Learning** | Every 10 turns (or 15 tool calls) the agent reviews and saves |
 | 🔧 **Correction Detection** | When you correct the agent, it saves immediately |
-| 🔄 **Auto-Consolidation** | When memory hits capacity, auto-merges instead of erroring |
+| 🔄 **Auto-Consolidation** | When legacy-inject memory hits capacity, auto-merges instead of erroring |
 | 🛡️ **Secret Scanning** | API keys, tokens, SSH keys blocked from persistence |
 | 📊 **Memory Aging** | Entries carry timestamps — consolidation knows what's stale |
 | 🏗️ **Two-Tier Memory** | Global + per-project memory, both searchable |
-| 💾 **Extended Store** | Unlimited searchable memories beyond core 5,000-char limit |
+| 💾 **Extended Store** | Policy-only memories remain searchable in SQLite beyond the Markdown export cap |
 | 🎓 **Onboarding** | `/memory-interview` pre-fills your profile on first session |
 
 ## How It Works
@@ -121,6 +121,32 @@ Or test locally without installing:
 ```bash
 pi -e /path/to/pi-hermes-memory/src/index.ts
 ```
+
+### DeepSeek Harness
+
+Use persistent memory in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+through [pi2dsh](https://github.com/weijiafu14/pi2dsh):
+
+```bash
+dsh plugin --profile web add -w pi2dsh pi-hermes-memory
+dsh web
+```
+
+If pnpm requests build approval, run `dsh plugin --profile web approve-builds`,
+approve `better-sqlite3` and `esbuild` when listed, then restart `dsh web`.
+
+In one conversation, ask:
+
+> Use memory_add to remember that my project codename is ZEPHYR-7741.
+
+Start a **new session** and ask:
+
+> Use memory_search to recall my project codename.
+
+Use `memory_replace` to update a saved fact and `memory_remove` to delete it.
+The package manages its own memory files and SQLite store under
+`$DSH_HOME/pi2dsh/agent/` (with the default DSH home when `DSH_HOME` is unset).
+For the headless CLI, install into `--profile headless` instead of `web`.
 
 ### Homebrew / Node ABI mismatches
 
@@ -223,6 +249,8 @@ Agent: "I remember you prefer pnpm over npm. Let me use that."
 
 The agent learns from its mistakes so you don't have to repeat yourself.
 
+In `legacy-inject` mode, recent failure lessons include only global entries and entries attributed to the active project. Without an active project, only global lessons are injected. `/memory-preview-context` uses the same boundary. A damaged project metadata comment is not treated as global; the original record remains stored for repair.
+
 Memory blocks are wrapped in `<memory-context>` XML tags with a guard note ("NOT new user input") to prevent the LLM from treating stored facts as instructions.
 
 ## Usage
@@ -274,6 +302,8 @@ For `create` and `update`, the preferred shape is structured input instead of ha
 
 The tool renders these into a valid `SKILL.md` body with `## When to Use`, `## Procedure`, `## Pitfalls`, and `## Verification` automatically. Raw `content` is still supported for compatibility, but structured fields are the recommended path.
 
+Pi discovers skills by the frontmatter `description` alone — `when_to_use` and the other structured fields render into the body, which Pi reads only after the skill has been selected. Put the trigger phrasings a user would actually type (symptoms, error strings, tool names) in `description`.
+
 Global skill creation also has duplicate/similarity guards:
 
 - exact slug match → blocked (update existing via `patch`/`update`)
@@ -285,13 +315,13 @@ Each skill uses a structured `SKILL.md` body:
 ```markdown
 ---
 name: debug-typescript-errors
-description: Step-by-step approach to debugging TS errors in monorepos
+description: Debug TypeScript errors in a monorepo — tsc --noEmit failures, type-check errors in CI, tsconfig extends-chain breakage
 version: 1
 created: 2026-04-26
 updated: 2026-04-26
 ---
 ## When to Use
-When you see TypeScript compilation errors, especially in monorepo setups.
+TypeScript compilation errors in this workspace, especially monorepo setups. Not for runtime-only type issues.
 
 ## Procedure
 1. Read the error message carefully
@@ -333,23 +363,33 @@ By default, the extension indexes your Pi session history into a SQLite database
 | Tool | What it does |
 |---|---|---|
 | `session_search` | Search past conversations — "what did we discuss about auth?" |
-| `memory_search` | Search extended memory store — unlimited capacity, keyword-based |
+| `memory_search` | Search extended memory store — unlimited capacity, keyword-based, up to 20 results per call |
+| `session_get` | Read an exact canonical entry, nearby context, outline or session metadata |
 
 Search behavior notes:
 - Multi-word natural-language queries are supported for both `memory_search` and `session_search`.
 - Exact phrases can be requested with quotes, for example `"memory search"`.
 - Advanced FTS queries with operators like `OR` still work when you need them.
-- All `session_search` variants run in a separate process using the same Node/Bun runtime. SQLite connections are readonly and query-only, without schema setup, recovery or native-module rebuilds. The child formats the bounded public response before sending it back, so SQL, JSONL parsing and large intermediate arrays do not block Pi's main event loop.
+- FTS5 uses the trigram tokenizer so CJK substrings are searchable. One- and two-character CJK `memory_search` terms use a scoped literal fallback because the trigram index cannot match them.
+- All `session_search` variants run in a separate process using the same Node/Bun runtime. Connections to the indexed database are readonly and query-only, without schema setup, recovery or native-module rebuilds. The child formats the bounded public response before sending it back, so SQL, JSONL parsing and large intermediate arrays do not block Pi's main event loop.
 - Searches report progress, accept Pi's cancellation signal, and have a 60-second execution deadline. Cancellation and timeout terminate the child, including an active native SQLite statement, and wait for its resources to close. These failures remain explicit errors, not empty or partial successful results. Node search children use a 256 MiB heap; the existing allocation and canonical-read budgets remain in place for both runtimes.
 - Indexed searches require recognized, complete repair metadata and the current schema marker. Missing metadata tables or required columns, invalid repair state, and mismatched schema markers return `session_evidence_unavailable`; the readonly worker never initializes or repairs the database. A missing index file retains the usual first-use empty-index response without creating a database.
-- Canonical legacy searches exclude indexed messages without registered file owners before applying the SQL candidate limit. Registered ownership is only a preliminary filter: containment, identity and canonical facts are still checked before publishing evidence. Structured search retains its existing candidate selection and ranking to avoid expanding canonical reads past the request budget; broad structured queries may still take tens of seconds. The indexed-only legacy store helper retains its existing behavior.
-- Legacy session search loads at most 4,000 content characters per candidate inside SQLite, then applies the requested snippet limit. Truncated results retain the original SQLite character count; other candidate fields are bounded too.
+- Canonical legacy searches exclude indexed messages without registered file owners or exact entry IDs before applying the SQL candidate limit. Registered ownership is only a preliminary filter: containment, identity and current canonical facts are checked before publishing evidence. Legacy and structured searches verify full canonical text with the same normalized MATCH expression in a one-row, transient in-memory SQLite table, including NOT, AND, OR, NEAR and phrases; short literal queries retain the explicit LIKE fallback. Query alternatives share one read budget and pinned root. A canonical match hidden by privacy filters does not trigger a second full scan. Broad structured queries may still take tens of seconds. The indexed-only legacy store helper retains its existing SQL filters and behavior.
+- Legacy session search loads at most 4,000 content characters per indexed candidate inside SQLite. Canonical validation retains detached previews of at most 4,000 characters, then applies the requested snippet limit; the reported character count comes from the canonical text. Indexed-only results keep the SQLite character count. Other candidate fields are bounded too.
 - Session search first selects compact rowids and key sizes. Each SQL candidate pass has an 8 MiB key-allocation estimate, charged conservatively at four bytes per Unicode code point before loading exact keys into JavaScript. Payloads are fetched in batches of 64, with key sizes rechecked inside SQL to prevent a concurrent index update from bypassing the budget.
-- Structured session search loads bounded keys and scalar metadata, not repeated session names, working directories or tool payloads. Canonical validation streams JSONL and retains only requested entries and detached, bounded display fields; small excerpts cannot keep their large source strings alive. Search stops after the first valid contained owner in canonical priority order, so lower-priority aliases cannot consume its scan budget; the full owner-validation policy for `session_get` is unchanged. Role, project and date filters are rechecked against full canonical facts before truncation.
+- Structured session search loads bounded keys and scalar metadata, not repeated session names, working directories or tool payloads. Canonical validation streams JSONL and retains only requested entries and detached, bounded display fields; small excerpts cannot keep their large source strings alive. Search stops after the first valid contained owner in canonical priority order, so lower-priority aliases cannot consume its scan budget; the full owner-validation policy for `session_get` is unchanged. Canonical project, role and date filters run only after JSONL validation, never against potentially stale indexed facts. Scoped searches inspect one extra numeric candidate descriptor, without loading its identity or payload: if canonical filters reject candidates and the window ends before the requested result count with more candidates remaining, an explicit read-budget error replaces a misleading empty or partial answer.
 - Canonical search reads share a 512 MiB budget per request, with an 8 MiB limit per JSONL line and 100,000 valid records per file. Search rejects session or entry identities longer than 65,536 characters instead of truncating anchors. Exceeding a limit raises an explicit search error asking for narrower filters, rather than returning a misleading partial result. A transcript changed during a read is not published as canonical evidence.
+- Canonical owners are opened without following a leaf symlink and validated through the actual open descriptor before any payload read. Parsers read a pinned descriptor alias, and identity, size, modification/change timestamps and containment are rechecked before publishing. Legacy fallback attempts retain the same resolved root. New file metadata stores the canonical path; cleanup compares an older lexical alias with its validated indexed key, so a valid symlink-root `session_get` does not remove its index. Linux Node/Bun/compiled routes are tested; if the filesystem cannot resolve a descriptor alias to its contained source path, canonical access fails closed rather than falling back to an unchecked pathname.
 - These canonical-read bounds apply to legacy and structured `session_search`; indexing, anchor-mode file scanning, and `session_get` keep their existing behavior. Anchor responses have a separate output budget below.
+- Structured search omits tool output and service entries by default; `includeToolOutput` and `includeService` opt into those categories. An empty default response can therefore be intentional even when legacy search finds the same transcript.
+- `memory_search` validates an integer `limit` from 1 to 20 and also normalizes runtime calls, including negative, fractional and non-finite values. Direct store callers retain their positive custom limits, but cannot use SQLite's negative-limit unbounded-read behavior.
+- `session_get` caps both public JSON text and details at 50 KiB. Exact `session_id`, `entry_id` and anchors are never shortened; if they cannot fit the response, the tool returns `session_get_response_limit` rather than oversized or misleading success.
+- Upgrades from an older tokenizer queue a durable migration instead of rebuilding FTS during database open. The migration preserves its phase and cursor across cancellation and restart; indexed searches fail explicitly until it finishes. SQLite copies complete message and embedded tool-result text without a JavaScript payload round-trip or upstream truncation.
+- Replacing the legacy two-target memory table restores its exact attached trigger definitions inside the same transaction. Insert, update and delete coverage is retained both for an already-trigram index and through tokenizer repair; new memories remain searchable after the upgrade.
+- FTS copy steps and SQLite integrity checks run in separate processes under the existing mutation/recovery fence. Cancellation waits for child closure before releasing the fence; shutdown waits for the cancelled repair task and reports a refused database close. Initial shadow-table recreation has a five-minute deadline, ordinary copy chunks retain 60 seconds, and full integrity verification has a database-size-derived deadline capped at one hour. Startup integrity checks use the same isolated path. On large trigram indexes, SQLite `quick_check` still visits FTS postings and can take several minutes; timer responsiveness is not a measurement of TUI keyboard latency.
+- Reopening a nonempty database with previously complete repair metadata queues an asynchronous `coverage` check. Indexed evidence remains unavailable until the exact source/docsize key sets, external-content and shadow schemas, key constraints, all six FTS triggers, and foreign keys are verified. Healthy coverage does not rebuild postings or repeat full `quick_check`; full verification after rebuilding and separately configured startup integrity scans keep that check. An incomplete or structurally incorrect index returns to the corresponding resumable FTS phase. Readiness is published only under the mutation fence with an unchanged schema version.
 
-Session history is indexed automatically during the active session and on session shutdown. Startup also runs a bounded incremental backfill for missed sessions: it compares stored file metadata and only parses files without matching metadata, capped per startup. To bulk-import existing sessions manually:
+Session history is indexed automatically during the active session and on session shutdown. Startup also runs a bounded incremental backfill for missed sessions: it compares stored file metadata and only parses files without matching metadata, capped per startup. Discovery resumes after the persisted cursor, reserves time for metadata/indexing, and wraps to build a complete inventory before removing stale owners. Scoped runs preserve owners outside their scope; an out-of-root scope fails explicitly. To bulk-import existing sessions manually:
 
 ```
 /memory-index-sessions
@@ -376,6 +416,8 @@ This is the **hybrid memory architecture**:
 
 Important: if core Markdown memory is full and consolidation cannot free space, the write still fails. This package does **not** silently spill failed core-memory writes into SQLite-only storage.
 
+Failure-memory synchronization distinguishes valid global metadata, valid project metadata and malformed attribution. Malformed records remain in Markdown for repair but are not imported into a global searchable scope; stale mirror rows in the reconciled scopes are removed. Prompt injection and consolidation also reject malformed attribution rather than treating it as global.
+
 ### Correction Detection
 
 When you correct the agent, it saves immediately — no waiting for the background review. Examples of corrections the agent detects:
@@ -391,14 +433,14 @@ When you correct the agent, it saves immediately — no waiting for the backgrou
 
 ### Auto-Consolidation
 
-When memory, user profile, or failure memory hits its character limit, the extension automatically consolidates instead of returning an error:
+In `legacy-inject` mode, when memory, user profile, or failure memory hits its character limit, the extension automatically consolidates instead of returning an error:
 
 1. Spawns a one-shot `pi.exec()` process with a consolidation prompt
-2. The child agent merges related entries, removes outdated ones, keeps the most important facts
-3. Parent reloads from disk and retries the original save
-4. If consolidation fails, falls back to the original error
+2. The child agent proposes merges, removals, and concise replacements
+3. For failure memory, global and active-project lessons are processed separately. Direct and subprocess responses return JSON operation plans; the parent applies each plan atomically in its exact scope and supplied slice, preserves project metadata, and requires a net shrink. Other projects are not sent to the model or modified. Proposal subprocesses disable model tools with `--no-tools`, omit automatic Hermes loading, and retain trusted provider/auth sources, including on an override retry
+4. The parent reloads from disk and retries the original save. If eligible scopes cannot free enough space, the save still fails; partial progress is reported rather than attributed to a different project
 
-You can also trigger this manually with `/memory-consolidate`.
+In `policy-only` mode, SQLite is the query authority, so adds, replacements, and atomic mutation plans can exceed the Markdown export cap without automatic consolidation. You can still trigger consolidation manually with `/memory-consolidate`.
 
 ### Tool-Call-Aware Review
 
@@ -499,6 +541,7 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 
 ```json
 {
+  "lazyInitialization": false,
   "memoryMode": "policy-only",
   "memoryPolicyStyle": "full",
   "memoryCharLimit": 5000,
@@ -507,8 +550,11 @@ Create `~/.pi/agent/hermes-memory-config.json`:
   "memoryDir": "~/.pi/agent/pi-hermes-memory",
   "projectsMemoryDir": "projects-memory",
   "sessionSearch": { "variant": "legacy" },
+  "sessionRetentionDays": 0,
+  "quickCheckOnOpen": true,
   "llmModelOverride": "openrouter/deepseek/deepseek-v4-flash",
   "llmThinkingOverride": "off",
+  "childExtensionPaths": ["~/.pi/agent/git/github.com/example/custom-provider-extension/index.ts"],
   "nudgeInterval": 10,
   "nudgeToolCalls": 15,
   "reviewRecentMessages": 0,
@@ -521,7 +567,12 @@ Create `~/.pi/agent/hermes-memory-config.json`:
   "failureInjectionMaxAgeDays": 7,
   "failureInjectionMaxEntries": 5,
   "consolidationTimeoutMs": 180000,
+  "consolidationChunking": false,
+  "consolidationChunkChars": 4000,
+  "overflowGraceMs": 180000,
+  "autoConsolidationWarnOnFailure": true,
   "flushOnCompact": true,
+  "flushCompactTimeoutMs": 60000,
   "flushOnShutdown": true,
   "flushMinTurns": 6,
   "flushRecentMessages": 0,
@@ -531,27 +582,34 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 
 | Setting | Default | Description |
 |---|---|---|
+| `lazyInitialization` | `false` | Opt in to first-use initialization in `policy-only` mode. Defers Markdown/SQLite sync, ordinary memory loading, maintenance and session indexing until a memory operation needs them. `legacy-inject` keeps eager loading to preserve session snapshots. See below for lifecycle tradeoffs. |
 | `memoryMode` | `policy-only` | Prompt behavior: `policy-only` injects only memory policy; `legacy-inject` restores full memory prompt injection |
 | `memoryPolicyStyle` | `full` | Policy text used in `policy-only` mode: `full` preserves the default v0.7 policy; `compact` uses shorter built-in guidance; `custom` uses `memoryPolicyCustomText`; `none` injects no policy text |
 | `memoryPolicyCustomText` | unset | Custom policy text used when `memoryPolicyStyle` is `custom`; blank or missing text falls back to `compact` |
 | `standingInstructionsEnabled` | `true` | Inject `STANDING.md` (pinned via `/memory-pin`) into every session, in every memory mode |
-| `memoryCharLimit` | `5000` | Max characters in MEMORY.md |
-| `userCharLimit` | `5000` | Max characters in USER.md |
-| `projectCharLimit` | `5000` | Max characters in project-scoped MEMORY.md |
+| `memoryCharLimit` | `5000` | Max characters in MEMORY.md in `legacy-inject` mode; policy-only writes may exceed the Markdown export cap |
+| `userCharLimit` | `5000` | Max characters in USER.md in `legacy-inject` mode; policy-only writes may exceed the Markdown export cap |
+| `projectCharLimit` | `5000` | Max characters in project-scoped MEMORY.md in `legacy-inject` mode; policy-only writes may exceed the Markdown export cap |
 | `memoryDir` | `~/.pi/agent/pi-hermes-memory` | Custom directory for extension storage files |
 | `projectsMemoryDir` | `projects-memory` | Subdirectory under `~/.pi/agent/` for project-scoped memory |
 | `sessionSearch` | `{ "variant": "legacy" }` | Session search implementation: `legacy` keeps the existing SQLite/FTS snippet search; `anchors` uses the opt-in Markdown request surface and returns compact JSONL line-range anchors from `~/.pi/agent/sessions/` |
+| `sessionRetentionDays` | `0` | Opt-in SQLite session retention, in days. `0` (default) disables pruning entirely and keeps the legacy count-only backfill preflight. When positive, sessions are pruned from SQLite at startup only when all registered JSONL owners are older than the window; sessions without file metadata use their session start time — **rows only; the JSONL files in `~/.pi/agent/sessions/` are never deleted** — and both the deferred backfill and `/memory-index-sessions` skip files outside the window, so pruned sessions stay pruned instead of being re-indexed |
+| `quickCheckOnOpen` | `true` | Run a full SQLite integrity check asynchronously after opening the database; set to `false` to skip the startup scan (operation-time recovery remains enabled) |
 | `llmModelOverride` | unset | Optional model override for background review (direct and subprocess), correction save, session flush, and consolidation |
 | `llmThinkingOverride` | unset | Optional thinking override for those LLM calls; valid values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`. If `llmModelOverride` is set and this is omitted, review/child calls default to `off` |
-| `childExtensionPaths` | unset | Trusted provider/auth adapter entry paths explicitly allowed in isolated child Pi processes; sibling packages matching the `*-oauth-adapter`/`*-auth-adapter` naming convention (including scoped packages, via their `package.json` `pi.extensions` manifest) are detected automatically — this setting is only needed for adapters that don't match that convention. In-process direct transport (the default for review/flush/correction/consolidation) doesn't need this at all, since it reads whatever provider auth is already registered |
+| `childExtensionPaths` | unset | Trusted provider/auth extension sources explicitly allowed in isolated child Pi processes. Values are passed to Pi's standard `-e` resolver, so absolute paths, `~/...`, paths relative to the child working directory, and `git:`/`npm:` package sources are supported. Sibling packages matching the `*-oauth-adapter`/`*-auth-adapter` naming convention (including scoped packages, via their `package.json` `pi.extensions` manifest) are detected automatically. This setting is only needed for custom providers or adapters that are not detected. In-process direct transport (the default for review/flush/correction/consolidation) doesn't need it, since it reads whatever provider auth is already registered. |
 | `nudgeInterval` | `10` | Turns between auto-reviews |
 | `nudgeToolCalls` | `15` | Tool calls between auto-reviews (OR with turns) |
 | `reviewRecentMessages` | `0` | Recent messages included in background review (`0` = all) |
 | `reviewEnabled` | `true` | Enable/disable background learning loop |
 | `reviewTransport` | `direct` | LLM transport for background review, session flush, correction save, and manual consolidation: `direct` uses in-process `completeSimple()` with subprocess fallback; `subprocess` forces legacy `pi -p` only |
-| `memoryOverflowStrategy` | `auto-consolidate` | Behavior when MEMORY.md, USER.md, failures.md, or project-scoped memory reaches its character limit: `auto-consolidate` runs the existing consolidation flow; `reject` returns an error; `fifo-evict` rotates older entries in file order until the new entry fits |
+| `memoryOverflowStrategy` | `auto-consolidate` | Legacy-inject behavior when a Markdown memory file reaches its character limit: `auto-consolidate` runs the existing consolidation flow; `reject` returns an error; `fifo-evict` rotates older entries in file order until the new entry fits |
 | `autoConsolidate` | `true` | Legacy alias for `memoryOverflowStrategy` when `memoryOverflowStrategy` is not set (`true` = `auto-consolidate`, `false` = `reject`) |
-| `consolidationTimeoutMs` | `180000` | Maximum time in milliseconds for a consolidation run (auto and `/memory-consolidate` alike). Configured values are used verbatim; a consolidation pays child-process boot plus a full LLM turn, so values below the default are frequently killed mid-run and log a warning at startup |
+| `consolidationTimeoutMs` | `180000` | Maximum time in milliseconds for a consolidation run (auto and `/memory-consolidate` alike). Also bounds the TOTAL time of a chunked consolidation trigger, so a trigger never blocks longer than the single call it replaced. Configured values are used verbatim; a consolidation pays child-process boot plus a full LLM turn, so values below the default are frequently killed mid-run and log a warning at startup |
+| `consolidationChunking` | `false` | Enables chunked subprocess consolidation: stores whose entries exceed `consolidationChunkChars` are consolidated in bounded rounds with per-round timeouts and resume-from-disk, instead of one whole-store child call. Off by default — enable it if whole-store consolidations time out on your model. Has no effect on the direct in-process transport |
+| `consolidationChunkChars` | `4000` | When chunking is enabled, entries above this many joined characters split subprocess work into bounded rounds sharing `consolidationTimeoutMs`. The loop stops at the capacity goal; small stores use one round. Failure-memory rounds remain inside their exact project/global scope. Exit code 0 without a valid shrinking plan is not success. Has no effect on direct transport. Minimum 500 |
+| `overflowGraceMs` | `180000` | Wall-clock grace period after a memory overflow before automatic consolidation is retried; this gives the active agent time to consolidate manually. Set to `0` to disable the grace period |
+| `autoConsolidationWarnOnFailure` | `true` | Log failed automatic consolidation attempts to the session console. Set to `false` to suppress only this warning; the memory tool result still reports the failure reason |
 | `correctionDetection` | `true` | Detect user corrections and save immediately |
 | `correctionStrongPatterns` | unset | Optional case-insensitive regex sources replacing strong correction patterns; omitted preserves defaults, invalid entries are ignored |
 | `correctionWeakPatterns` | unset | Optional case-insensitive regex sources replacing weak correction patterns; omitted preserves defaults, invalid entries are ignored |
@@ -561,9 +619,94 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 | `failureInjectionMaxAgeDays` | `7` | Legacy mode only: maximum age in days for injected failure memories |
 | `failureInjectionMaxEntries` | `5` | Legacy mode only: maximum number of failure memories to inject |
 | `flushOnCompact` | `true` | Flush memories before Pi compacts context |
+| `flushCompactTimeoutMs` | `60000` | Approximate ceiling in milliseconds for the pre-compaction flush (direct + optional subprocess). Both transports share this one window; the subprocess fallback gets only the remainder, never a second full window. The child's watchdog teardown can add ~5s past the window. Configured values are used verbatim; values below the default warn at startup the same way `consolidationTimeoutMs` does, while `0` or lower silently disables the compact flush. Raise this for slow/local models; lower it if you would rather compact fast than wait for a save |
 | `flushOnShutdown` | `true` | Flush memories when session ends |
 | `flushMinTurns` | `6` | Minimum turns before flush triggers |
 | `flushRecentMessages` | `0` | Recent messages included in session flush (`0` = all) |
+
+### Optional Lazy Initialization
+
+For installations on slow or shared storage, enable:
+
+```json
+{
+  "memoryMode": "policy-only",
+  "lazyInitialization": true
+}
+```
+
+With this option, opening Pi or sending an ordinary prompt does not initialize
+the memory database or read the ordinary memory stores. Tools and commands are
+still registered immediately. The first memory search, write, or data-dependent
+memory command waits for migration, synchronization and loading. Concurrent
+callers share the load; a failed load can be retried by the next operation.
+
+Important boundaries:
+
+- Pinned `STANDING.md` instructions and skill discovery remain available at
+  startup. Pins in a legacy storage root are read independently of migration or
+  SQLite; the primary file, even if empty, takes precedence. `/memory-pin` writes
+  to the primary path without dropping the legacy instructions it loaded.
+- `legacy-inject` ignores the lazy option and preserves its startup snapshot.
+- Automatic review, correction capture and flush retain their existing triggers;
+  when a trigger fires, it initializes memory before reading or writing it.
+  Lazy initialization does not disable automatic learning or its model costs.
+- Session indexing starts after memory activation. Until then, Pi's original
+  JSONL session files remain the source of history. First use joins the scheduled
+  catch-up pass to completion (at most 50 changed files), without using the
+  five-second shutdown timeout. Use `/memory-index-sessions` for a larger backlog.
+  Anchor-mode session search
+  reads JSONL directly and does not activate the memory database.
+- Closing an unused session does not initialize memory just to index it. A
+  configured flush that meets its minimum-turn threshold can still activate it.
+  Shutdown joins in-flight preparation and memory tool/command execution before
+  closing SQLite. Escape cancels a tool's wait without cancelling shared work.
+- Project listing, prompt preview and anchor search do not activate SQLite.
+- This defers data initialization, not extension SDK imports. The direct
+  completion SDK remains a static import so Pi's jiti aliases also work in
+  production installs without package-local SDK peers. First use pays the
+  deferred data-loading cost; this is not a guarantee of faster searches.
+
+The default remains `false`, so existing installations keep eager initialization.
+
+## Diagnosing lifecycle latency
+
+Run Pi with timing enabled to see which memory lifecycle step is slow:
+
+```bash
+PI_TIMING=1 pi
+```
+
+`pi-hermes-memory` writes these spans to stderr only when timing is enabled:
+
+- `session-start.persistence-sync` and `session-start.load`
+- `memory-init.persistence-sync` and `memory-init.load` instead, when lazy initialization is enabled
+- `session-backfill.check` and `session-backfill.callback`
+- `live-index.callback`
+- `shutdown.flush`, `shutdown.active-index`, `shutdown.index-waits`, and `shutdown.database-close`
+- `database.open`, `database.quick-check`, and `database.checkpoint`
+
+The deferred backfill, live-index, and integrity-check spans may appear after startup spans because they run on later timer turns. `/reload` does not run `shutdown.flush`; other shutdown reasons keep the configured direct completion and subprocess fallback. Use the measured spans before changing indexing, checkpoint, or synchronization policy.
+
+From a development checkout, compare eager and lazy extension initialization
+without model calls or access to your real memory:
+
+```bash
+node --import tsx scripts/benchmark-memory-startup.mjs
+node --import tsx scripts/benchmark-memory-startup.mjs --lazy
+```
+
+The benchmark uses a disposable agent root with synthetic memories for 20
+projects. It reports import, registration, session startup and first-search
+times separately; it does not measure the full Pi TUI. Run variants sequentially
+and repeat to account for filesystem cache effects. Set `TMPDIR` to a directory
+on shared storage to measure that storage's data initialization cost.
+
+`npm run check:production` packs the checkout, installs it in a temporary directory
+without dev/peer dependencies, and loads it through Pi's real jiti loader. It
+exercises the direct-completion path against a loopback HTTP fixture, not a paid
+model or real memory. npm access is required to install production dependencies;
+native install scripts are disabled because the fixture writes no memories.
 
 ## Where Data Lives
 
@@ -591,19 +734,20 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 └── ...
 ```
 
-These are plain markdown files. You can read and edit them directly if you want to curate what the agent remembers. Memory entries are separated by `§` (section sign). Skills use Pi-compatible `SKILL.md` files with frontmatter.
+These are plain markdown files. You can read and edit them directly if you want to curate what the agent remembers. Writes verify the displaced file before publishing a replacement, including when reusing an existing recovery checkpoint; a concurrent editor change is retried or preserved as a conflict rather than blindly overwritten. Reused checkpoints move displaced versions into the existing bounded retired-recovery tier. Memory entries are separated by `§` (section sign). Skills use Pi-compatible `SKILL.md` files with frontmatter.
 
 If you are upgrading from a version that stored project memory directly at `~/.pi/agent/<project>/MEMORY.md`, the extension copies or merges those entries into `~/.pi/agent/projects-memory/<project>/MEMORY.md` on startup. The old folders are left in place as a backup.
 
 The `sessions.db` SQLite database stores session history and extended memory entries. It's searchable via FTS5 full-text search.
 
 ## Known Limitations
+- **CJK search length**: The trigram tokenizer supports CJK substring search for terms of three or more characters. One- and two-character `memory_search` terms may need a longer phrase or an English/ASCII token.
 
 - **`§` delimiter**: Memory entries are separated by `§` (section sign). If an entry naturally contains `§`, it will be split incorrectly on reload. This is rare in English text but possible. [Hermes uses the same delimiter.]
 - **Background review cost**: Each review cycle costs one full LLM API call via a child `pi -p` process. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
 - **Session search requires indexing**: Past sessions must be indexed before they're searchable. Run `/memory-index-sessions` to bulk-import, or let the extension auto-index on session shutdown.
 - **Older Markdown memories may need backfill**: If you saved memories before the SQLite mirror existed or search looks stale, run `/memory-sync-markdown`.
-- **Core memory limits still apply**: SQLite search mirroring does not bypass the 5,000-char core Markdown limit. If consolidation cannot free space, the write fails instead of becoming SQLite-only memory invisibly.
+- **Core memory limits apply in `legacy-inject` mode**: policy-only writes can exceed the Markdown export cap because SQLite is the query authority, while manual `/memory-consolidate` remains available.
 - **System prompts are invisible**: Pi's TUI does not display the system prompt. Use `/memory-preview-context` to inspect whether policy-only or legacy memory injection is active.
 - **Project skill visibility depends on Pi discovery cycles**: project skills are exposed through `resources_discover` using the active project's `skills/` path. If a moved or newly created project skill doesn't show up immediately in a running session, trigger a reload/new session so Pi refreshes discovered resources.
 - **Project move requires active project context**: in `/memory-skills`, the `p` hotkey is disabled when Pi is not currently in a detected project directory.

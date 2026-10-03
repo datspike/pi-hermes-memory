@@ -7,7 +7,7 @@ import { DatabaseManager } from '../../src/store/db.js';
 import { indexSession, indexLiveSession } from '../../src/store/session-indexer.js';
 import { searchSessions, searchSessionEvidence } from '../../src/store/session-search.js';
 
-test('legacy does not let ownerless records exhaust the canonical candidate allowance', () => {
+test('legacy and structured search do not let ownerless records exhaust the canonical candidate allowance', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'owned-search-'));
   const manager = new DatabaseManager(root);
   const file = path.join(root, 'canonical.jsonl');
@@ -27,7 +27,9 @@ test('legacy does not let ownerless records exhaust the canonical candidate allo
     assert.equal(results.length, 1);
     assert.equal(results[0].sessionId, id);
     assert.equal(searchSessions(manager, 'needle', { limit: 1 })[0].sessionId, 'ownerless-session', 'legacy callers without a canonical root keep their original indexed-only contract');
-    // Structured's bounded candidate window must not expand its canonical-read work.
-    assert.equal(searchSessionEvidence(manager, 'needle', { sessionsDir: root, limit: 1 }).results.length, 0, 'structured retains its original bounded candidate selection');
+    // Structured search excludes ownerless rows before its bounded canonical window.
+    const structured = searchSessionEvidence(manager, 'needle', { sessionsDir: root, limit: 1 });
+    assert.equal(structured.results.length, 1);
+    assert.equal(structured.results[0].sessionId, id);
   } finally { manager.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });

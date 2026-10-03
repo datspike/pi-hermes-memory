@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { DatabaseManager } from '../store/db.js';
@@ -65,7 +66,6 @@ function boundedDetails(value: Record<string, any>): Record<string, any> {
       if (typeof value.content === 'string') value.content = truncateUtf8(value.content, MAX_DETAIL_CONTENT_BYTES);
       if (typeof value.tool_name === 'string') value.tool_name = truncateUtf8(value.tool_name, 256);
       if (typeof value.tool_call_id === 'string') value.tool_call_id = truncateUtf8(value.tool_call_id, 256);
-      if (typeof value.anchor === 'string') value.anchor = truncateUtf8(value.anchor, 512);
       if (Array.isArray(value.tool_calls)) {
         value.tool_calls = value.tool_calls.slice(0, 64).map((call: unknown) => typeof call === 'string' ? truncateUtf8(call, 128) : call);
       }
@@ -77,7 +77,7 @@ function boundedDetails(value: Record<string, any>): Record<string, any> {
   compactEntries(result.entries);
   const session = result.session;
   if (session && typeof session === 'object') {
-    for (const key of ['session_id', 'project', 'cwd', 'started_at', 'ended_at', 'name', 'title']) {
+    for (const key of ['project', 'cwd', 'started_at', 'ended_at', 'name', 'title']) {
       if (typeof session[key] === 'string') session[key] = truncateUtf8(session[key], key === 'cwd' ? 2_000 : 1_000);
     }
   }
@@ -106,12 +106,16 @@ function boundedDetails(value: Record<string, any>): Record<string, any> {
     result.truncated = true;
   }
   if (byteSize(result) > SESSION_GET_MAX_OUTPUT_BYTES) {
-    return {
+    const compact = {
       success: Boolean(result.success),
       session: result.session ? { ...result.session, cwd: '', project: '' } : undefined,
       entry: result.entry ? { ...result.entry, content: '' } : undefined,
       before: [], after: [], truncated: true,
     };
+    // Exact identities and their anchors must never be shortened to fit the response.
+    return byteSize(compact) <= SESSION_GET_MAX_OUTPUT_BYTES
+      ? compact
+      : { success: false, error: 'session_get_response_limit' };
   }
   return result;
 }
@@ -207,7 +211,8 @@ function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, ent
   // Remove rows that disappeared or became invalid, but never follow an
   // unindexed `${sessionId}.jsonl` fallback or an outside-root symlink.
   const rows = db.prepare('SELECT path FROM session_files WHERE session_id = ?').all(sessionId) as Array<{ path: string }>;
-  for (const row of rows) if (!owners.some((owner) => owner.path === row.path)) removeMissingCanonicalFile(dbManager, row.path);
+  // Compare the validated indexed key, not its realpath: historical owners may be lexical aliases.
+  for (const row of rows) if (!owners.some((owner) => owner.indexedPath === row.path) && !fs.existsSync(row.path)) removeMissingCanonicalFile(dbManager, row.path);
   // Owner choice is independent of entry lookup, so stale entry IDs produce a
   // precise entry_unresolvable response instead of hiding a valid transcript.
   return owners[0]?.session ?? null;

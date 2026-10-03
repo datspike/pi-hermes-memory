@@ -1,3 +1,4 @@
+import { measureLifecycle, measureLifecycleSync } from '../lifecycle-timing.js';
 import type { DatabaseManager } from '../store/db.js';
 import {
   indexChangedSessions,
@@ -35,9 +36,15 @@ export interface ScheduleSessionBackfillOptions {
   setTimeoutFn?: SetTimeoutFn;
   needsBackfillFn?: typeof needsBackfill;
   needsBackfillQuickFn?: typeof needsBackfillQuick;
-  indexSessionsFn?: typeof indexChangedSessions | typeof indexChangedSessionsBounded | ((dbManager: DatabaseManager, sessionsDir: string, options: { maxFilesToIndex: number; signal?: AbortSignal }) => BulkIndexResult | Promise<BulkIndexResult>);
+  indexSessionsFn?: typeof indexChangedSessions | typeof indexChangedSessionsBounded | ((dbManager: DatabaseManager, sessionsDir: string, options: { maxFilesToIndex: number; signal?: AbortSignal; retentionCutoffMs?: number }) => BulkIndexResult | Promise<BulkIndexResult>);
   maxFilesToIndex?: number;
   touchBackfillTimestampFn?: typeof touchBackfillTimestamp;
+  /**
+   * Optional retention cutoff (ms epoch). Files older than this are excluded
+   * from the backfill file set so that sessions pruned by retention are not
+   * re-indexed and do not repeatedly schedule a startup backfill.
+   */
+  retentionCutoffMs?: number;
 }
 
 function formatBackfillResult(result: BulkIndexResult): string {
@@ -78,13 +85,16 @@ export function scheduleSessionBackfill(
   const indexSessionsFn = options.indexSessionsFn ?? indexChangedSessionsBounded;
   const maxFilesToIndex = options.maxFilesToIndex ?? SESSION_BACKFILL_MAX_FILES;
   const touchBackfillTimestampFn = options.touchBackfillTimestampFn ?? touchBackfillTimestamp;
+  const retentionCutoffMs = options.retentionCutoffMs ?? 0;
 
   if (state.inProgress) {
     return false;
   }
 
   try {
-    if (options.needsBackfillFn ? !needsBackfillFn(dbManager, sessionsDir) : !needsBackfillQuickFn(dbManager)) {
+    if (!measureLifecycleSync('session-backfill.check', () => options.needsBackfillFn || retentionCutoffMs > 0
+      ? needsBackfillFn(dbManager, sessionsDir, undefined, retentionCutoffMs)
+      : needsBackfillQuickFn(dbManager))) {
       return false;
     }
   } catch (err) {
@@ -119,7 +129,9 @@ export function scheduleSessionBackfill(
         return;
       }
       try {
-        const result = await indexSessionsFn(dbManager, sessionsDir, { maxFilesToIndex, signal: abortController.signal });
+        const result = await measureLifecycle('session-backfill.callback', async () => indexSessionsFn(dbManager, sessionsDir, {
+          maxFilesToIndex, signal: abortController.signal, retentionCutoffMs,
+        }));
         const complete = !result.partial && !result.aborted && !result.reachedLimit && !result.deferredFiles && result.errors.length === 0;
         if (complete && !abortController.signal.aborted) touchBackfillTimestampFn(dbManager);
         notifyBestEffort(options.notify, formatBackfillResult(result), complete ? 'info' : 'warning');
@@ -146,6 +158,14 @@ export function scheduleSessionBackfill(
   };
 
   return true;
+}
+
+/**
+ * First-use readiness has no shutdown deadline: the scheduled pass must settle
+ * before a search can read its index. Each extension owns its own state.
+ */
+export async function joinSessionBackfill(state: SessionBackfillState = sessionBackfillState): Promise<void> {
+  await state.promise;
 }
 
 /**

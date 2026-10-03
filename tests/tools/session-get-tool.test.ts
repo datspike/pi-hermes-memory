@@ -207,4 +207,49 @@ describe('session_get', () => {
       assert.match(schema, /outline/);
     } finally { db.close(); }
   });
+
+  it('fails explicitly when an exact identity cannot fit the response budget', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-identity-'));
+    const db = new DatabaseManager(root);
+    try {
+      const ids = ['x'.repeat(65_000), 'Ж😀'.repeat(10_000), '"\\'.repeat(20_000)];
+      for (const [index, entryId] of ids.entries()) {
+        const file = path.join(root, `entry-${index}.jsonl`);
+        const sessionId = `large-identity-${index}`;
+        writeSession(file, sessionId, [{ type: 'message', id: entryId, timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'small content' } }]);
+        const parsed = parseSessionFile(file)!;
+        indexSession(db, parsed); upsertSessionFileMetadata(db, file, parsed.id);
+        const result = await capture(db).execute('large-id', { session_id: sessionId, entry_id: entryId });
+        assert.deepEqual(result.details, { success: false, error: 'session_get_response_limit' });
+        assert.ok(Buffer.byteLength(result.content[0].text, 'utf8') <= 50 * 1024);
+        assert.ok(Buffer.byteLength(JSON.stringify(result.details), 'utf8') <= 50 * 1024);
+        assert.deepEqual(JSON.parse(result.content[0].text), result.details);
+      }
+      const file = path.join(root, 'session-identity.jsonl');
+      const sessionId = 's'.repeat(65_000);
+      writeSession(file, sessionId, []);
+      const parsed = parseSessionFile(file)!;
+      indexSession(db, parsed); upsertSessionFileMetadata(db, file, parsed.id);
+      const metadata = await capture(db).execute('large-session-id', { session_id: sessionId, view: 'metadata' });
+      assert.deepEqual(metadata.details, { success: false, error: 'session_get_response_limit' });
+    } finally { db.close(); }
+  });
+
+  it('preserves full session identities and anchors when they fit the response budget', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-exact-id-'));
+    const db = new DatabaseManager(root);
+    try {
+      const sessionId = 's'.repeat(2_000), entryId = 'e'.repeat(2_000);
+      const file = path.join(root, 'exact-identity.jsonl');
+      writeSession(file, sessionId, [{ type: 'message', id: entryId, timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'content' } }]);
+      const parsed = parseSessionFile(file)!;
+      indexSession(db, parsed); upsertSessionFileMetadata(db, file, parsed.id);
+      const result = await capture(db).execute('exact', { session_id: sessionId, entry_id: entryId });
+      assert.equal(result.details.success, true);
+      assert.equal(result.details.session.session_id, sessionId);
+      assert.equal(result.details.entry.entry_id, entryId);
+      assert.equal(result.details.entry.anchor, `pi://session/${sessionId}#entry=${entryId}`);
+      assert.ok(Buffer.byteLength(JSON.stringify(result.details), 'utf8') <= 50 * 1024);
+    } finally { db.close(); }
+  });
 });

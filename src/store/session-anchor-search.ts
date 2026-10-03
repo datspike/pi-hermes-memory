@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { readAnchorJson, type AnchorJsonValue } from "./session-anchor-json.js";
+import { closePinnedSessionRoot, openPinnedSessionRoot, readContainedSessionFile } from "./session-indexer.js";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
@@ -87,10 +88,16 @@ export function searchSessionAnchors(
     return { success: false, ranges: [], message: `sessionsDir does not exist: ${options.sessionsDir}` };
   }
 
-  const files = findJsonlFiles(options.sessionsDir).sort();
+  const pinnedRoot = openPinnedSessionRoot(options.sessionsDir);
+  if (!pinnedRoot) {
+    return { success: false, ranges: [], message: "Canonical sessions root unavailable or changed during search." };
+  }
+  const sessionsRoot = pinnedRoot.root;
+  const files = findJsonlFiles(sessionsRoot).sort();
   const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
   const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
   if (files.length > maxFiles) {
+    closePinnedSessionRoot(pinnedRoot);
     return {
       success: false,
       ranges: [],
@@ -100,15 +107,26 @@ export function searchSessionAnchors(
 
   const ranges: PendingRange[] = [];
   let scannedLines = 0;
-
-  for (const file of files) {
-    const remainingLines = maxLines - scannedLines;
-    const fileResult = searchJsonlFile(file, parsed.request, remainingLines, scannedLines, maxLines);
-    if (!fileResult.success) {
-      return { success: false, ranges: [], message: fileResult.message };
+  try {
+    for (const file of files) {
+      const remainingLines = maxLines - scannedLines;
+      let fileResult: ReturnType<typeof searchJsonlFile> | null;
+      try {
+        const canonicalFile = fs.realpathSync.native(file);
+        fileResult = readContainedSessionFile(sessionsRoot, canonicalFile,
+          descriptorPath => searchJsonlFile(file, parsed.request, remainingLines, scannedLines, maxLines, descriptorPath), pinnedRoot);
+      } catch {
+        fileResult = null;
+      }
+      if (fileResult === null) return { success: false, ranges: [], message: "Canonical session file unavailable or changed during search." };
+      if (!fileResult.success) {
+        return { success: false, ranges: [], message: fileResult.message };
+      }
+      scannedLines += fileResult.scannedLines;
+      ranges.push(...fileResult.ranges);
     }
-    scannedLines += fileResult.scannedLines;
-    ranges.push(...fileResult.ranges);
+  } finally {
+    closePinnedSessionRoot(pinnedRoot);
   }
 
   const filtered = ranges.filter((range) => !range.excluded);
@@ -275,6 +293,7 @@ function searchJsonlFile(
   maxLines: number,
   scannedBefore: number,
   scanCap: number,
+  sourcePath = filePath,
 ): { success: true; ranges: PendingRange[]; scannedLines: number } | { success: false; message: string } {
   const hits: LineHit[] = [];
   let currentSessionId: string | undefined;
@@ -283,7 +302,7 @@ function searchJsonlFile(
   let scannedLines = 0;
 
   const terms = [...new Set([...request.all, ...request.any, ...request.exclude].map(term => term.toLocaleLowerCase()))];
-  for (const source of readAnchorJson(filePath, terms)) {
+  for (const source of readAnchorJson(sourcePath, terms)) {
 
     scannedLines += 1;
     if (scannedLines > maxLines) {

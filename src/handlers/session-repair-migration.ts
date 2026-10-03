@@ -144,20 +144,26 @@ export function registerSessionRepairCommand(pi: ExtensionAPI, dbManager: Databa
   });
 }
 
+/** A cancellable timeout waits for the repair task to release its writer fence. */
 export async function waitForSessionRepairMigration(
   timeoutMs = SESSION_REPAIR_SHUTDOWN_TIMEOUT_MS,
   state: SessionRepairMigrationState = sessionRepairMigrationState,
 ): Promise<boolean> {
   const promise = state.promise;
   if (!state.inProgress || !promise) return true;
+  const canCancel = typeof state.cancel === 'function';
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
+    const completed = await Promise.race([
       promise.then(() => true),
       new Promise<boolean>((resolve) => {
         timeout = setTimeout(() => { state.cancel?.(); resolve(false); }, timeoutMs);
       }),
     ]);
+    // Cancellation requests process termination; task settlement confirms reaping
+    // and releases the manager's mutation lease before shutdown closes SQLite.
+    if (!completed && canCancel) await promise;
+    return completed;
   } finally {
     if (timeout) clearTimeout(timeout);
   }

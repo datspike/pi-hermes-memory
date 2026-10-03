@@ -56,12 +56,14 @@ export const SCHEMA_SQL = `
     diagnostics TEXT
   );
 
-  -- FTS5 index for full-text search across messages
-  -- content='messages' + content_rowid='rowid' keeps FTS in sync with the content table
+  -- FTS5 trigram indexes support substring search for CJK and retain
+  -- normal token search for English. Queries shorter than three characters
+  -- are not indexed by the trigram tokenizer.
   CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
     content,
     content='messages',
-    content_rowid='rowid'
+    content_rowid='rowid',
+    tokenize='trigram'
   );
 
   -- Triggers to keep message_fts in sync with messages table and provide the
@@ -95,12 +97,12 @@ export const SCHEMA_SQL = `
     last_referenced DATE NOT NULL
   );
 
-  -- FTS5 index for memory search
-  -- content='memories' + content_rowid='id' keeps FTS in sync
+  -- FTS5 trigram index for memory substring search
   CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     content,
     content='memories',
-    content_rowid='id'
+    content_rowid='id',
+    tokenize='trigram'
   );
 
   -- Triggers to keep memory_fts in sync with memories table

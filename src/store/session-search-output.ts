@@ -40,6 +40,10 @@ export function formatLegacySearch(results: SessionSearchResult[], totalMessages
   return textResult(output.text, { success: true, count: results.length, truncatedCount, snippetChars, outputChars: output.text.length, outputTruncated: output.truncated });
 }
 
+function structuredResponseLimitError(): Error {
+  return Object.assign(new Error('Structured session search response exceeds 50 KiB; narrow the query or lower the result limit.'), { name: 'SessionSearchResponseLimitError', code: 'SESSION_SEARCH_RESPONSE_LIMIT' });
+}
+
 /** Build bounded JSONL evidence and retain details only for published entries. */
 export function formatStructuredSearch(outcome: SessionSearchEvidenceOutcome): SessionSearchToolResult {
   if (outcome.ambiguousSessionIds.length > 0) {
@@ -60,7 +64,10 @@ export function formatStructuredSearch(outcome: SessionSearchEvidenceOutcome): S
   let count = 0;
   for (const line of lines) {
     const next = output ? `${output}\n${line}` : line;
-    if (Buffer.byteLength(next, 'utf8') > SESSION_SEARCH_EVIDENCE_MAX_BYTES) break;
+    if (Buffer.byteLength(next, 'utf8') > SESSION_SEARCH_EVIDENCE_MAX_BYTES) {
+      if (count === 0) throw structuredResponseLimitError();
+      break;
+    }
     output = next; count++;
   }
   return textResult(output || 'No results found.', {

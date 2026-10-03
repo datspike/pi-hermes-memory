@@ -4,13 +4,13 @@
 
 This is a Pi coding agent extension that brings Hermes-style persistent memory and a learning loop to any Pi user. After `pi install`, users get persistent memory across sessions, a background learning loop, and session-end flush.
 
-**v0.1 is complete** (119 tests, v0.1.0 tagged). Current work is **v0.2: Skills + Smart Curation** — see `docs/0.2/TASKS.md`.
+This checkout is the forwardport of the local fork onto upstream `0.9.9`; retained fork contracts and their evidence are recorded in `docs/FORK_LEDGER.md`. The user-facing behavior and configuration are documented in `README.md`.
 
 ## Architecture
 
 - **Language**: TypeScript (loaded via jiti, no compilation needed at runtime)
 - **Runtime**: Pi extension API (`@earendil-works/pi-coding-agent`)
-- **Storage**: Two markdown files (`MEMORY.md`, `USER.md`) in `~/.pi/agent/memory/`
+- **Storage**: Markdown remains the editable source of truth; SQLite stores searchable memory and indexed session history under the configured Pi data directory
 - **Entry point**: `src/index.ts` — registers tools, event handlers, and commands
 
 ## Key Files
@@ -26,9 +26,9 @@ This is a Pi coding agent extension that brings Hermes-style persistent memory a
 | `src/handlers/background-review.ts` | `setupBackgroundReview()` — learning loop via `pi.exec` |
 | `src/handlers/session-flush.ts` | `setupSessionFlush()` — pre-compaction/shutdown flush |
 | `src/handlers/insights.ts` | `registerInsightsCommand()` — `/memory-insights` command |
-| `PLAN.md` | Full v0.1 implementation plan with Hermes source file reference map |
+| `README.md` | User-facing behavior, configuration, migration and search guarantees |
 | `docs/ROADMAP.md` | Full roadmap with Hermes competitive analysis + gap analysis |
-| `docs/0.2/TASKS.md` | v0.2 task breakdown — Skills + Smart Curation |
+| `docs/FORK_LEDGER.md` | Forwardport contracts, decisions and current verification evidence |
 
 ## Design Decisions
 
@@ -36,7 +36,7 @@ This is a Pi coding agent extension that brings Hermes-style persistent memory a
 2. **Atomic writes** — Temp file + `fs.rename()` for crash safety
 3. **`pi.exec()` for background review** — Stays within Pi's intended extension API
 4. **`§` delimiter** — Same as Hermes for consistency
-5. **No SQLite** — Pi has its own `SessionManager`, we read from it directly
+5. **SQLite search is bounded and isolated** — indexed reads use readonly/query-only workers; Markdown remains the durable editable source
 
 ## Hermes Source Reference
 
@@ -44,18 +44,18 @@ The implementation is ported from the Hermes agent harness. See `PLAN.md` → "H
 
 ## Roadmap & Task Tracking
 
-- **Roadmap**: `docs/ROADMAP.md` — full roadmap with Hermes competitive analysis, gap analysis, and phased plan (v0.1 → v0.5 → v1.0)
+- **Roadmap**: `docs/ROADMAP.md` — historical roadmap and Hermes gap analysis
 - **v0.1 tasks** (complete): `docs/0.1/TASKS.md`
-- **v0.2 tasks** (current): `docs/0.2/TASKS.md` — Skills, auto-consolidation, correction detection, tool-call-aware nudge
+- **Current contract**: `docs/FORK_LEDGER.md` — forwardport scope, preserved guarantees and release gates
 
 **Workflow:**
-1. Pick a task from `docs/0.2/TASKS.md`
-2. Mark it `[~]` (in progress)
-3. Implement it
-4. Mark it `[x]` (done) with the commit hash
-5. Move to the next task
+1. Read `docs/FORK_LEDGER.md` and the relevant section of `README.md`
+2. Reproduce the relevant contract with the project test/check commands
+3. Implement the smallest complete change
+4. Update the ledger and documentation with current evidence
+5. Inspect tracked and untracked changes before committing
 
-**Before starting any work, read `docs/0.2/TASKS.md` to see what's next.**
+**Before starting work, read `docs/FORK_LEDGER.md` and the relevant project documentation to identify the active contract and its gates.**
 
 ## Git Workflow
 

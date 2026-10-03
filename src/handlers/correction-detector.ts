@@ -12,6 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "../store/memory-store.js";
 import { DatabaseManager } from "../store/db.js";
 import {
+  buildMemoryTargetRoutingGuidance,
   CORRECTION_SAVE_PROMPT,
   CORRECTION_STRONG_PATTERNS,
   CORRECTION_WEAK_PATTERNS,
@@ -21,8 +22,9 @@ import {
   ENTRY_DELIMITER,
 } from "../constants.js";
 import type { MemoryConfig } from "../types.js";
+import type { EnsureMemoryReady } from "../memory-initialization.js";
 import { getMessageText } from "../types.js";
-import { execChildPrompt } from "./pi-child-process.js";
+import { execChildPrompt, resolveChildPiModel } from "./pi-child-process.js";
 import { resolveProjectName, resolveProjectStore, type ProjectNameRef, type ProjectStoreRef } from "../project-context.js";
 import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
 
@@ -128,11 +130,11 @@ export function setupCorrectionDetector(
   config: MemoryConfig,
   dbManager: DatabaseManager | null = null,
   projectName: ProjectNameRef = null,
-  deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
+  deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion; ensureMemoryReady?: EnsureMemoryReady } = {},
 ): void {
   if (!config.correctionDetection) return;
 
-  let pendingCorrection = false;
+  let pendingCorrection: string | undefined;
   let turnsSinceLastCorrection = 3; // Start at threshold so first correction can fire immediately
   let correctionInProgress = false;
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
@@ -143,7 +145,7 @@ export function setupCorrectionDetector(
     const text = getMessageText(event.message);
     if (!text) return;
     if (isCorrection(text, config)) {
-      pendingCorrection = true;
+      pendingCorrection = text;
     }
   });
 
@@ -153,16 +155,25 @@ export function setupCorrectionDetector(
       turnsSinceLastCorrection++;
       return;
     }
-    pendingCorrection = false;
+    if (correctionInProgress) return;
+    const correctionText = pendingCorrection;
+    pendingCorrection = undefined;
 
     // Rate limit: max 1 correction save per 3 turns
     if (turnsSinceLastCorrection < 3) return;
-    if (correctionInProgress) return;
 
-    turnsSinceLastCorrection = 0;
     correctionInProgress = true;
 
     try {
+      try {
+        await deps.ensureMemoryReady?.(ctx, ctx.signal);
+      } catch {
+        // Keep the correction eligible for the next turn after a transient load
+        // failure, without consuming the successful-capture rate limit.
+        pendingCorrection ??= correctionText;
+        return;
+      }
+      turnsSinceLastCorrection = 0;
       // Build conversation snapshot
       const entries = ctx.sessionManager.getBranch();
       const parts: string[] = [];
@@ -203,6 +214,9 @@ export function setupCorrectionDetector(
 
       promptBody.push(
         "",
+        "--- User Correction to Save ---",
+        correctionText,
+        "",
         "--- Recent Conversation ---",
         recentParts.join("\n\n"),
       );
@@ -210,8 +224,16 @@ export function setupCorrectionDetector(
       let savedViaLlm = false;
 
       const runSubprocessCorrection = async (): Promise<void> => {
-        const subprocessPrompt = [CORRECTION_SAVE_PROMPT, "", ...promptBody].join("\n");
+        const subprocessPrompt = [
+          CORRECTION_SAVE_PROMPT,
+          "",
+          buildMemoryTargetRoutingGuidance(activeProjectStore !== null),
+          "",
+          ...promptBody,
+        ].join("\n");
         const result = await execChildPrompt(pi, subprocessPrompt, config, {
+          cwd: ctx.cwd,
+          model: resolveChildPiModel(ctx.model),
           signal: ctx.signal,
           timeoutMs: 30000,
         });
@@ -229,7 +251,11 @@ export function setupCorrectionDetector(
             store,
             activeProjectStore,
             {
-              systemPrompt: DIRECT_CORRECTION_SYSTEM_PROMPT,
+              systemPrompt: [
+                DIRECT_CORRECTION_SYSTEM_PROMPT,
+                "",
+                buildMemoryTargetRoutingGuidance(activeProjectStore !== null),
+              ].join("\n"),
               userPrompt: promptBody.join("\n"),
               config,
               timeoutMs: 30000,
@@ -257,14 +283,6 @@ export function setupCorrectionDetector(
 
       // Also save as a failure memory for learning
       try {
-        let lastUserMsg: string | undefined;
-        for (let i = recentParts.length - 1; i >= 0; i--) {
-          if (recentParts[i].startsWith("[USER]")) {
-            lastUserMsg = recentParts[i];
-            break;
-          }
-        }
-        const correctionText = lastUserMsg ? lastUserMsg.replace(/^\[USER\]:\s*/, "") : "";
         if (correctionText) {
           const directive = extractCorrectionDirective(correctionText);
           const failureReason = "User corrected the agent";

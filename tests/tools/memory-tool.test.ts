@@ -9,7 +9,7 @@ import path from "node:path";
 import { registerMemoryTool } from "../../src/tools/memory-tool.js";
 import { MemoryStore } from "../../src/store/memory-store.js";
 import { DatabaseManager } from "../../src/store/db.js";
-import { getMemories, syncMemoryEntry } from "../../src/store/sqlite-memory-store.js";
+import { getMemories, searchMemories, syncMemoryEntry } from "../../src/store/sqlite-memory-store.js";
 import { ENTRY_DELIMITER, MEMORY_FILE } from "../../src/constants.js";
 import { Value } from "typebox/value";
 
@@ -145,6 +145,86 @@ describe("registerMemoryTool", () => {
     const results = getMemories(dbManager, { target: 'memory', project: null });
     assert.strictEqual(results.length, 1);
     assert.strictEqual(results[0].content, 'Entry one');
+  });
+
+  it("lands over-cap policy-only adds in searchable SQLite", async () => {
+    let capturedResult: any;
+    const mockPi = {
+      registerTool: (def: any) => {
+        if (!capturedResult || def.name === "memory_add") capturedResult = def;
+      },
+    } as unknown as ExtensionAPI;
+    const store = new MemoryStore({
+      memoryMode: "policy-only",
+      memoryCharLimit: 40,
+      userCharLimit: 5000,
+      projectCharLimit: 5000,
+      nudgeInterval: 10,
+      reviewEnabled: false,
+      flushOnCompact: false,
+      flushOnShutdown: false,
+      flushMinTurns: 6,
+      autoConsolidate: false,
+      correctionDetection: false,
+      failureInjectionEnabled: true,
+      failureInjectionMaxAgeDays: 7,
+      failureInjectionMaxEntries: 5,
+      nudgeToolCalls: 15,
+      consolidationTimeoutMs: 60000,
+      memoryDir: tmpDir,
+    });
+    await store.loadFromDisk();
+    registerMemoryTool(mockPi, store, null, dbManager);
+    const first = await capturedResult.execute("tc-1", { action: "add", target: "memory", content: "alpha entry" }, undefined as any, undefined as any, undefined as any);
+    assert.strictEqual(first.details.success, true);
+    const second = await capturedResult.execute("tc-2", { action: "add", target: "memory", content: "beta entry past the tiny cap" }, undefined as any, undefined as any, undefined as any);
+    assert.strictEqual(second.details.success, true);
+    const results = searchMemories(dbManager, "beta entry past the tiny cap", { target: "memory" });
+    assert.ok(results.some((r) => r.content.includes("beta entry past the tiny cap")));
+  });
+
+  it("reports the matching target when replace is sent to the wrong target", async () => {
+    let removeTool: any;
+    const mockPi = {
+      registerTool: (def: any) => {
+        if (def.name === "memory_remove") removeTool = def;
+      },
+    } as unknown as ExtensionAPI;
+    const store = new MemoryStore({
+      memoryMode: "policy-only",
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      projectCharLimit: 5000,
+      nudgeInterval: 10,
+      reviewEnabled: false,
+      flushOnCompact: false,
+      flushOnShutdown: false,
+      flushMinTurns: 6,
+      autoConsolidate: false,
+      correctionDetection: false,
+      failureInjectionEnabled: true,
+      failureInjectionMaxAgeDays: 7,
+      failureInjectionMaxEntries: 5,
+      nudgeToolCalls: 15,
+      consolidationTimeoutMs: 60000,
+      memoryDir: tmpDir,
+    });
+    await store.loadFromDisk();
+    await store.addFailure("use pnpm for lockfiles", { category: "correction" });
+
+    registerMemoryTool(mockPi, store, null);
+    const result = await removeTool.execute(
+      "tc-1",
+      { target: "memory", old_text: "use pnpm for lockfiles" },
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    assert.equal(result.details.success, false);
+    assert.match(result.details.error, /No match in target "memory"/);
+    assert.match(result.details.error, /target "failure"/);
+    assert.deepEqual(result.details.matching_targets, ["failure"]);
   });
 
   it("prunes same-scope SQLite orphans after a Markdown mutation", async () => {
@@ -618,6 +698,48 @@ describe("registerMemoryTool", () => {
     await capturedResult.execute("tc-1", { action: "replace", target: "memory", content: "new", old_text: "old" }, undefined as any, undefined as any, undefined as any);
 
     assert.deepStrictEqual(replaceArgs, ["memory", "old", "new"], "should pass target, old_text, content to store.replace");
+  });
+
+  it("binds project identity from execute ctx.cwd instead of a factory snapshot", async () => {
+    let capturedResult: any;
+    const boundCwds: string[] = [];
+    const mockPi = {
+      registerTool: (def: any) => {
+        if (!capturedResult || def.name === "memory_add") capturedResult = def;
+      },
+    } as unknown as ExtensionAPI;
+
+    const mockProjectStore = {
+      add: () => ({
+        success: true,
+        target: "memory",
+        entries: ["from session cwd"],
+        usage: "2% — 20/5000 chars",
+        entry_count: 1,
+        message: "Entry added.",
+      }),
+    } as unknown as MemoryStore;
+
+    registerMemoryTool(
+      mockPi,
+      {} as MemoryStore,
+      mockProjectStore,
+      dbManager,
+      "factory-project",
+      (cwd) => {
+        if (cwd) boundCwds.push(cwd);
+      },
+    );
+
+    await capturedResult.execute(
+      "tc-1",
+      { target: "project", content: "from session cwd" },
+      undefined,
+      undefined,
+      { cwd: "/tmp/opened-session-project" },
+    );
+
+    assert.deepStrictEqual(boundCwds, ["/tmp/opened-session-project"]);
   });
 
 });

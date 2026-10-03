@@ -3,10 +3,13 @@ import fs from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
+import { FtsRepairProcess } from './session-fts-repair-async.js';
 import { SCHEMA_SQL } from './schema.js';
 import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
 import { canonicalStoragePathSync } from './canonical-storage-path.js';
 import { isBunRuntime, loadBetterSqlite3 } from './sqlite-native.js';
+import { measureLifecycle, measureLifecycleSync } from '../lifecycle-timing.js';
+import { MDSYNC_METADATA_KEY_PREFIX } from '../constants.js';
 
 type StatementLike = {
   run: (...args: any[]) => any;
@@ -86,7 +89,7 @@ export class SessionEvidenceUnavailableError extends Error {
   }
 }
 
-export type SessionRepairPhase = 'rows' | 'duplicates' | 'message_fts' | 'memory_fts' | 'verify';
+export type SessionRepairPhase = 'rows' | 'duplicates' | 'message_fts' | 'memory_fts' | 'coverage' | 'verify';
 
 export interface SessionRepairState {
   version: 1;
@@ -138,6 +141,24 @@ class DatabaseCorruptionError extends Error {
 
 export const SQLITE_BUSY_TIMEOUT_MS = 5000;
 export const SQLITE_WAL_AUTOCHECKPOINT_PAGES = 1000;
+export const FTS5_MIGRATION_MAX_LOCK_ATTEMPTS = 3;
+
+const FTS5_TOKENIZER_VERSION_KEY = 'fts5_tokenizer_version';
+const FTS5_TOKENIZER_VERSION = 'trigram-v1';
+const FTS5_TRIGRAM_TABLES = {
+  message: `CREATE VIRTUAL TABLE message_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='rowid',
+    tokenize='trigram'
+  )`,
+  memory: `CREATE VIRTUAL TABLE memory_fts USING fts5(
+    content,
+    content='memories',
+    content_rowid='id',
+    tokenize='trigram'
+  )`,
+} as const;
 
 const DATABASE_FILE_SUFFIXES: readonly DatabaseFileSuffix[] = ['', '-wal', '-shm'];
 export const SESSION_REPAIR_VERSION = 2;
@@ -216,13 +237,14 @@ let cachedDatabaseCtor: DatabaseCtor | null = null;
  * Resolved on first use, never at import time. A module-scope native load turns
  * any SQLite resolve/ABI failure into "Failed to load extension", which hides
  * the actionable rebuild message and bricks the whole extension (issue #117).
+ * Readonly/transient search callers pass false to forbid native-module rebuilds.
  */
-function getDatabaseCtor(): DatabaseCtor {
+export function getDatabaseCtor(allowRebuild = true): DatabaseCtor {
   if (!cachedDatabaseCtor) {
     const require = createRequire(import.meta.url);
     cachedDatabaseCtor = isBunRuntime()
       ? createBunCompatDatabaseCtor(require)
-      : (loadBetterSqlite3({ requireImpl: require }) as DatabaseCtor);
+      : (loadBetterSqlite3({ requireImpl: require, allowRebuild }) as DatabaseCtor);
   }
   return cachedDatabaseCtor;
 }
@@ -445,6 +467,10 @@ export class DatabaseManager {
   private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
   private lastRecovery: DatabaseRecoveryResult | null = null;
   private openGuard: (() => void) | null = null;
+  private pendingOpenIntegrityScan: Promise<void> | null = null;
+  private openIntegrityAbort: AbortController | null = null;
+  private ftsRepairProcess: FtsRepairProcess | null = null;
+  private quickCheckOnOpen = true;
   private activeRecoveryLease: { coordinator: AtomicLockCoordinator; key: string; token: string } | null = null;
   private activePublicationLease: { coordinator: AtomicLockCoordinator; key: string; token: string } | null = null;
   /** Narrow deterministic fault seam used by publication crash-matrix tests. */
@@ -464,6 +490,10 @@ export class DatabaseManager {
 
   setOpenGuard(guard: (() => void) | null): void {
     this.openGuard = guard;
+  }
+
+  setQuickCheckOnOpen(enabled: boolean): void {
+    this.quickCheckOnOpen = enabled;
   }
 
   /**
@@ -620,31 +650,63 @@ export class DatabaseManager {
    * Open the database and initialize schema.
    */
   private open(): DatabaseLike {
-    const dir = path.dirname(this.dbPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    return measureLifecycleSync('database.open', () => {
+      const dir = path.dirname(this.dbPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    this.reconcilePendingJournalOnStartup();
-    this.rejectOrphanPublicationOnStartup();
-    this.waitForMissingPathRecovery();
-    let barrier = this.activeRecoveryLease ? null : this.acquireMutation();
-    try {
-      return this.openUnchecked();
-    } catch (err) {
-      if (!DatabaseManager.isCorruptionError(err)) {
-        throw err;
+      this.reconcilePendingJournalOnStartup();
+      this.rejectOrphanPublicationOnStartup();
+      this.waitForMissingPathRecovery();
+      let barrier = this.activeRecoveryLease ? null : this.acquireMutation();
+      let opened: DatabaseLike;
+      try {
+        opened = this.openUnchecked();
+      } catch (err) {
+        if (!DatabaseManager.isCorruptionError(err)) throw err;
+        barrier?.release();
+        barrier = null;
+        this.lastRecovery = this.recoverDatabaseFile(err, () => {});
+        barrier = this.acquireMutation();
+        opened = this.openUnchecked();
+      } finally {
+        barrier?.release();
       }
+      this.scheduleOpenIntegrityScan(opened);
+      return opened;
+    });
+  }
 
-      barrier?.release();
-      barrier = null;
-      const recovery = this.recoverDatabaseFile(err, () => {});
-      this.lastRecovery = recovery;
-      barrier = this.acquireMutation();
-      return this.openUnchecked();
-    } finally {
-      barrier?.release();
-    }
+  /** Defer the full check and reject stale native handles before recovery. */
+  private scheduleOpenIntegrityScan(db: DatabaseLike): void {
+    const phase = this.readSessionRepairState(db)?.phase;
+    if (!this.quickCheckOnOpen || this.pendingOpenIntegrityScan || phase === 'message_fts' || phase === 'memory_fts') return;
+    const controller = new AbortController();
+    this.openIntegrityAbort = controller;
+    const scan = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        const check = async () => {
+          try {
+            if (controller.signal.aborted || this.native !== db || !this.sameGeneration()) return;
+            await measureLifecycle('database.quick-check', () => this.verifySessionRepairInWorker(controller.signal, false));
+          } catch (err) {
+            // Only a verified failure of the same live generation may recover.
+            if (controller.signal.aborted || this.native !== db || !this.sameGeneration() || !DatabaseManager.isCorruptionError(err)) return;
+            try { this.recoverFromCorruption(err); } catch { /* operations retry recovery */ }
+          } finally {
+            if (this.pendingOpenIntegrityScan === scan) this.pendingOpenIntegrityScan = null;
+            if (this.openIntegrityAbort === controller) this.openIntegrityAbort = null;
+            resolve();
+          }
+        };
+        void check().catch(() => resolve());
+      }, 0);
+    });
+    this.pendingOpenIntegrityScan = scan;
+  }
+
+  /** Wait for the scheduled startup scan without initiating another scan. */
+  async waitForStartupIntegrityScan(): Promise<void> {
+    await this.pendingOpenIntegrityScan;
   }
 
   private openUnchecked(): DatabaseLike {
@@ -699,6 +761,8 @@ export class DatabaseManager {
     this.ensureLegacySchemaColumns(db);
     this.ensureSessionEntryColumns(db);
     this.migrateLegacyMemoriesTargetConstraint(db);
+    // Legacy table replacement removes its attached indexes.
+    this.ensureMemoryIndexes(db);
     const repairVersion = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined;
     const state = this.readSessionRepairState(db);
     // user_version is only a schema marker, never proof that durable repair
@@ -706,14 +770,16 @@ export class DatabaseManager {
     if (Number(repairVersion?.user_version ?? 0) !== SESSION_REPAIR_VERSION || !state || state.status !== 'complete') {
       this.ensureSessionRepairState(db, Number(repairVersion?.user_version ?? 0) === SESSION_REPAIR_VERSION && !state);
     }
+    this.migrateFtsTokenizer(db);
   }
 
   private ensureSessionRepairState(db: DatabaseLike, forcePending = false): void {
     const hasMessage = db.prepare('SELECT 1 AS present FROM messages LIMIT 1').get() as { present?: unknown } | undefined;
     const existing = this.readSessionRepairState(db);
-    const empty = !forcePending && !hasMessage;
+    const empty = !forcePending && !hasMessage && (!existing || existing.status === 'complete');
     const total = existing?.total ?? 0;
     const next: SessionRepairState = {
+      ...existing,
       version: 1,
       status: empty ? 'complete' : (existing?.status === 'aborted' ? 'aborted' : 'pending'),
       cursor: existing?.cursor ?? 0,
@@ -753,8 +819,10 @@ export class DatabaseManager {
     const lease = coordinator.tryAcquire(lockKey, { staleMs: 0 });
     if (!lease) return this.getSessionRepairState();
     const budgetMs = Math.max(1, options.wallClockBudgetMs ?? DEFAULT_SESSION_REPAIR_WALL_CLOCK_BUDGET_MS);
+    let mutationLease: { release: () => void } | undefined;
     try {
       const db = this.getDb();
+      mutationLease = this.acquireMutation();
       // Keep repair's WAL checkpoints small as well as its transactions; the
       // normal application checkpoint setting can create a multi-hundred-ms
       // pause after thousands of tiny durable updates.
@@ -826,27 +894,21 @@ export class DatabaseManager {
         }
       } else if (state.phase === 'message_fts' || state.phase === 'memory_fts') {
         const table = state.phase === 'message_fts' ? 'message_fts' : 'memory_fts';
-        const source = state.phase === 'message_fts' ? 'messages' : 'memories';
-        const key = state.phase === 'message_fts' ? 'rowid' : 'id';
-        if (!state.ftsInitialized) {
-          // Existing external-content rows are not proof of full coverage.
-          // Always walk the source in bounded chunks and upsert every row; this
-          // repairs partially written FTS tables without a monolithic rebuild.
-          state = { ...state, ftsInitialized: true, cursor: 0 };
-        } else {
-          const rows = db.prepare(`SELECT ${key} AS id, content FROM ${source} WHERE ${key} > ? ORDER BY ${key} LIMIT ?`).all(state.cursor, chunkSize) as Array<{ id: number; content: string }>;
-          const workRows = rows.slice(0, Math.max(1, Math.min(rows.length, boundedChunkSize)));
-          if (workRows.length > 0) {
-            commit(() => {
-              const insert = db.prepare(`INSERT OR REPLACE INTO ${table}(rowid, content) VALUES (?, ?)`);
-              for (const row of workRows) insert.run(row.id, row.content);
-            });
-            state = { ...state, cursor: Number(workRows[workRows.length - 1].id) };
-          } else {
-            state = state.phase === 'message_fts'
-              ? { ...state, phase: 'memory_fts', cursor: 0, ftsInitialized: false }
-              : { ...state, phase: 'verify', cursor: 0, ftsInitialized: undefined };
-          }
+        const identity = fs.statSync(this.dbPath);
+        this.ftsRepairProcess ??= new FtsRepairProcess();
+        try {
+          state = await this.ftsRepairProcess.run({
+            dbPath: this.dbPath, identity: { dev: identity.dev, ino: identity.ino },
+            sqliteModule: isBunRuntime() ? undefined : createRequire(import.meta.url).resolve('better-sqlite3'),
+            repairKey: SESSION_REPAIR_STATE_KEY, phase: state.phase, cursor: state.cursor,
+            initialized: !!state.ftsInitialized, recreate: !state.ftsInitialized || !this.ftsUsesTrigram(db, table),
+            schemaSql: state.phase === 'message_fts' ? FTS5_TRIGRAM_TABLES.message : FTS5_TRIGRAM_TABLES.memory,
+            triggersSql: this.ftsUpdateTriggerSql(table, true), chunkSize: boundedChunkSize,
+          }, options.signal);
+          if (!this.sameGeneration()) throw new Error('SQLite generation changed during FTS repair');
+        } catch (error) {
+          if (!options.signal?.aborted) throw error;
+          state = { ...(this.readSessionRepairState(db) ?? state), status: 'aborted', updatedAt: new Date().toISOString() };
         }
       } else {
         // Keep the generation fence across verification and marker publication;
@@ -854,9 +916,37 @@ export class DatabaseManager {
         const mutation = this.acquireMutation();
         try {
           const generation = this.generation;
-          await this.verifySessionRepairInWorker(options.signal);
+          const schemaVersion = (db.prepare('PRAGMA schema_version').get() as { schema_version: number }).schema_version;
+          let verified = false;
+          try {
+            await this.verifySessionRepairInWorker(options.signal, true, state!.phase !== 'coverage');
+            verified = true;
+          } catch (error) {
+            const code = (error as Error & { code?: string }).code;
+            if (code !== 'FTS_COVERAGE_MESSAGE' && code !== 'FTS_COVERAGE_MEMORY') throw error;
+            state = { ...state!, status: 'pending', phase: code === 'FTS_COVERAGE_MESSAGE' ? 'message_fts' : 'memory_fts',
+              cursor: 0, ftsInitialized: false, completedAt: undefined };
+          }
           if (!generation || !this.sameGeneration()) throw new Error('SQLite generation changed during session repair verification');
-          commit(() => {
+          if (verified && (db.prepare('PRAGMA schema_version').get() as { schema_version: number }).schema_version !== schemaVersion) {
+            verified = false;
+            state = { ...state!, status: 'pending', phase: 'coverage', cursor: 0, ftsInitialized: false, completedAt: undefined };
+          }
+          if (verified && state!.phase === 'coverage') {
+            const messageTriggersReady = this.ftsTriggersMatchContract(db, 'message_fts');
+            const memoryTriggersReady = this.ftsTriggersMatchContract(db, 'memory_fts');
+            if (!messageTriggersReady || !memoryTriggersReady) {
+              verified = false;
+              state = { ...state!, status: 'pending', phase: messageTriggersReady ? 'memory_fts' : 'message_fts',
+                cursor: 0, ftsInitialized: false, completedAt: undefined };
+            }
+          }
+          if (verified) commit(() => {
+            if (state!.phase !== 'coverage') {
+              this.installFtsUpdateTriggers(db, 'message_fts', false);
+              this.installFtsUpdateTriggers(db, 'memory_fts', false);
+            }
+            this.publishFtsTokenizerVersion(db);
             db.exec(`PRAGMA user_version = ${SESSION_REPAIR_VERSION}`);
             const completed: SessionRepairState = { ...state!, status: 'complete', phase: undefined, completedAt: new Date().toISOString() };
             state = completed;
@@ -870,6 +960,7 @@ export class DatabaseManager {
       if (state.status !== 'complete') this.storeSessionRepairState(db, state);
       return state;
     } finally {
+      mutationLease?.release();
       lease.release();
       // A resolved no-op callback can still starve timers across thousands of
       // chunks. Yield to the macrotask queue by default; this is cooperative
@@ -972,53 +1063,63 @@ export class DatabaseManager {
   }
 
   /** Run full SQLite verification off the extension event loop before publication. */
-  private async verifySessionRepairInWorker(signal?: AbortSignal): Promise<void> {
-    if (isBunRuntime()) {
-      if (signal?.aborted) throw new Error('Session repair verification cancelled');
-      const db = this.getDb();
-      this.assertIntegrityOk(db, 'quick_check', 'after session repair');
-      this.assertForeignKeysOk(db);
-      return;
-    }
-    const sqliteModule = createRequire(import.meta.url).resolve('better-sqlite3');
+  private async verifySessionRepairInWorker(signal?: AbortSignal, checkCoverage = true, checkQuickIntegrity = true): Promise<void> {
+    const bun = isBunRuntime();
+    const sqliteModule = bun ? '' : createRequire(import.meta.url).resolve('better-sqlite3');
+    // Trigram integrity walks every posting, even for quick_check. A fixed
+    // small timeout cannot verify a large valid index; keep the work isolated
+    // and cancellable, with a finite size-derived deadline.
+    const gib = Math.ceil(fs.statSync(this.dbPath).size / (1024 ** 3));
+    const timeoutMs = Math.max(30_000, Math.min(3_600_000, gib * 120_000));
     await new Promise<void>((resolve, reject) => {
       if (signal?.aborted) { reject(new Error('Session repair verification cancelled')); return; }
-      const child = spawn(process.execPath, ['-e', `
-        const Database = require(process.env.PH009_SQLITE_MODULE);
+      const child = spawn(process.execPath, [...(bun ? [] : ['--max-old-space-size=256']), '-e', `
+        const Database = process.versions.bun ? require('bun:sqlite').Database : require(process.env.PH009_SQLITE_MODULE);
         const db = new Database(process.env.PH009_DB_PATH, { readonly: true });
         try {
-          const quick = db.prepare('PRAGMA quick_check').all();
-          if (quick.some((row) => String(Object.values(row)[0] ?? '').toLowerCase() !== 'ok')) process.exitCode = 2;
-          const foreign = db.prepare('PRAGMA foreign_key_check').all();
-          if (foreign.length > 0) process.exitCode = 3;
+          db.exec('PRAGMA query_only=ON; BEGIN');
+          // Read integer keys through the covering index, never message bodies.
+          const sources = [
+            ['SELECT rowid AS id FROM messages INDEXED BY idx_messages_timestamp', 'message_fts_docsize', 5],
+            ['SELECT id FROM memories', 'memory_fts_docsize', 6],
+          ];
+          if (process.env.PH009_VERIFY_COVERAGE === '1') for (const [sourceKeys, shadow, failureCode] of sources) {
+            if (db.prepare(sourceKeys + ' EXCEPT SELECT id FROM ' + shadow + ' LIMIT 1').get()
+              || db.prepare('SELECT id FROM ' + shadow + ' EXCEPT ' + sourceKeys + ' LIMIT 1').get()) {
+              process.exitCode = failureCode; break;
+            }
+          }
+          if (!process.exitCode) {
+            if (process.env.PH009_VERIFY_QUICK_INTEGRITY === '1') {
+              const quick = db.prepare('PRAGMA quick_check(1)').get();
+              if (!quick || String(Object.values(quick)[0] ?? '').toLowerCase() !== 'ok') process.exitCode = 2;
+            }
+            if (db.prepare('PRAGMA foreign_key_check').get()) process.exitCode = 3;
+          }
+          db.exec('ROLLBACK');
+        } catch (error) {
+          process.exitCode = String(error?.code ?? '').startsWith('SQLITE_CORRUPT') ? 2 : 4;
         } finally { db.close(); }
       `], {
-        env: { ...process.env, PH009_SQLITE_MODULE: sqliteModule, PH009_DB_PATH: this.dbPath },
+        env: { ...process.env, NODE_OPTIONS: '', ...(bun ? { BUN_BE_BUN: '1' } : {}), PH009_SQLITE_MODULE: sqliteModule, PH009_DB_PATH: this.dbPath, PH009_VERIFY_COVERAGE: checkCoverage ? '1' : '0', PH009_VERIFY_QUICK_INTEGRITY: checkQuickIntegrity ? '1' : '0' },
         stdio: 'ignore',
-        ...(process.platform === 'win32' ? {} : { nice: 10 }),
       });
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        child.kill('SIGKILL');
-        finish(new Error('SQLite worker verification timed out'));
-      }, 30_000);
-      const abort = () => {
-        if (settled) return;
-        child.kill('SIGTERM');
-        setTimeout(() => { if (!settled) child.kill('SIGKILL'); }, 250);
-        finish(new Error('SQLite worker verification cancelled'));
-      };
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
+      let failure: Error | undefined;
+      const stop = (error: Error) => { if (failure) return; failure = error; child.kill('SIGKILL'); };
+      const timer = setTimeout(() => stop(new Error(`SQLite worker verification timed out after ${timeoutMs} ms`)), timeoutMs);
+      const abort = () => stop(new Error('SQLite worker verification cancelled'));
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      child.once('error', (error) => { failure ??= error; });
+      child.once('close', (code) => {
         clearTimeout(timer);
         signal?.removeEventListener('abort', abort);
-        if (error) reject(error); else resolve();
-      };
-      signal?.addEventListener('abort', abort, { once: true });
-      child.once('error', (error) => finish(error));
-      child.once('exit', (code) => code === 0 ? finish() : finish(new Error(`SQLite worker verification failed with exit code ${code}`)));
+        if (failure) reject(failure);
+        else if (code === 0) resolve();
+        else if (code === 2) reject(new DatabaseCorruptionError('SQLite worker quick_check failed'));
+        else if (code === 5 || code === 6) reject(Object.assign(new Error('FTS source-key coverage is incomplete'), { code: code === 5 ? 'FTS_COVERAGE_MESSAGE' : 'FTS_COVERAGE_MEMORY' }));
+        else reject(new Error(`SQLite worker verification failed with exit code ${code}`));
+      });
     });
   }
 
@@ -1559,13 +1660,21 @@ export class DatabaseManager {
   }
 
   private copyRecoverableRows(source: DatabaseLike, target: DatabaseLike): Record<string, number> {
-    return {
+    const counts = {
       extension_metadata: this.copyExtensionMetadata(source, target),
       sessions: this.copySessions(source, target),
       messages: this.copyMessages(source, target),
       session_files: this.copySessionFiles(source, target),
       memories: this.copyMemories(source, target),
     };
+    // Markdown-scope fingerprints describe the rows in their source db; the
+    // copies above coerce invalid values instead of dropping rows, so a copied
+    // fingerprint can agree with coerced rows while content drifted. A rebuilt
+    // database re-mirrors markdown exactly once, at zero cost when healthy.
+    // The pattern follows the shared prefix constant, so bumping its version
+    // keeps this strip in step instead of silently missing the new keys.
+    target.prepare("DELETE FROM extension_metadata WHERE key LIKE ?").run(`${MDSYNC_METADATA_KEY_PREFIX}%`);
+    return counts;
   }
 
   private copyExtensionMetadata(source: DatabaseLike, target: DatabaseLike): number {
@@ -2007,6 +2116,14 @@ export class DatabaseManager {
       update.run(project, row.id);
     }
   }
+  private ensureMemoryIndexes(db: DatabaseLike): void {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
+      CREATE INDEX IF NOT EXISTS idx_memories_target ON memories(target);
+      CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+    `);
+  }
+
 
   private migrateLegacyMemoriesTargetConstraint(db: DatabaseLike): void {
     const tableSqlRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'").get() as { sql?: string } | undefined;
@@ -2016,6 +2133,9 @@ export class DatabaseManager {
     // Legacy schema allowed only memory/user. New schema must allow failure too.
     const hasLegacyTargetCheck = /target\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*target\s+IN\s*\(\s*'memory'\s*,\s*'user'\s*\)\s*\)/i.test(tableSql);
     if (!hasLegacyTargetCheck) return;
+    // DROP TABLE also removes its triggers. Restore the exact definitions in
+    // the same transaction, including insert coverage and any migration guards.
+    const triggers = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'memories' AND sql IS NOT NULL").all() as Array<{ sql: string }>;
 
     if (!db.transaction) {
       db.exec('PRAGMA foreign_keys = OFF');
@@ -2044,6 +2164,7 @@ export class DatabaseManager {
 
         db.exec('DROP TABLE memories');
         db.exec('ALTER TABLE memories_new RENAME TO memories');
+        for (const trigger of triggers) db.exec(trigger.sql);
         db.exec('COMMIT');
       } catch (err) {
         db.exec('ROLLBACK');
@@ -2078,6 +2199,7 @@ export class DatabaseManager {
 
       db.exec('DROP TABLE memories');
       db.exec('ALTER TABLE memories_new RENAME TO memories');
+      for (const trigger of triggers) db.exec(trigger.sql);
     });
 
     db.exec('PRAGMA foreign_keys = OFF');
@@ -2088,18 +2210,112 @@ export class DatabaseManager {
     }
   }
 
-  private rebuildMemoryFts(db: DatabaseLike): void {
-    const ftsTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_fts'").get() as { name?: string } | undefined;
-    if (!ftsTable) return;
+  /** Check the external-content tokenizer and required shadow schema without scanning rows. */
+  private ftsUsesTrigram(db: DatabaseLike, table: string): boolean {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql?: string } | undefined;
+    if (typeof row?.sql !== 'string' || !/\btokenize\s*=\s*['"]trigram['"]/i.test(row.sql)) return false;
+    const source = table === 'message_fts' ? 'messages' : 'memories';
+    const key = table === 'message_fts' ? 'rowid' : 'id';
+    const sql = row.sql.replace(/\s/g, '').toLowerCase();
+    if (!sql.includes(`content='${source}'`) || !sql.includes(`content_rowid='${key}'`)) return false;
+    const definitions = [
+      ['data', '(id INTEGER PRIMARY KEY, block BLOB)'],
+      ['idx', '(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID'],
+      ['docsize', '(id INTEGER PRIMARY KEY, sz BLOB)'],
+      ['config', '(k PRIMARY KEY, v) WITHOUT ROWID'],
+    ] as const;
+    const normalize = (value: string): string => value.replace(/[\s'"`\[\];]/g, '').toLowerCase();
+    for (const [suffix, definition] of definitions) {
+      const shadow = `${table}_${suffix}`;
+      const actual = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(shadow) as { sql?: string } | undefined;
+      if (typeof actual?.sql !== 'string' || normalize(actual.sql) !== normalize(`CREATE TABLE ${shadow}${definition}`)) return false;
+    }
+    return true;
+  }
 
-    // Keep FTS index consistent after table rebuild/migrations.
-    db.exec("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')");
+  /** Only the standard attached triggers can certify automatic future FTS coverage. */
+  private ftsTriggersMatchContract(db: DatabaseLike, table: 'message_fts' | 'memory_fts'): boolean {
+    const source = table === 'message_fts' ? 'messages' : 'memories';
+    const normalize = (sql: string): string => sql.replace(/\bIF NOT EXISTS\b/gi, '').replace(/[;\s]/g, '').toLowerCase();
+    const expected = [...SCHEMA_SQL.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)[\s\S]*?END;/g)]
+      .filter(match => ['ai', 'ad', 'au'].some(suffix => match[1] === `${source}_${suffix}`));
+    return expected.length === 3 && expected.every(match => {
+      const actual = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(match[1]) as { sql?: string } | undefined;
+      return typeof actual?.sql === 'string' && normalize(actual.sql) === normalize(match[0]);
+    });
+  }
+
+  private publishFtsTokenizerVersion(db: DatabaseLike): void {
+    db.prepare('INSERT INTO extension_metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(FTS5_TOKENIZER_VERSION_KEY, FTS5_TOKENIZER_VERSION);
+  }
+
+  /** Queue tokenizer work without scanning or rebuilding source tables on open. */
+  private migrateFtsTokenizer(db: DatabaseLike): void {
+    const state = this.readSessionRepairState(db);
+    const messageReady = this.ftsUsesTrigram(db, 'message_fts') && (state?.status !== 'complete' || this.ftsTriggersMatchContract(db, 'message_fts'));
+    const memoryReady = this.ftsUsesTrigram(db, 'memory_fts') && (state?.status !== 'complete' || this.ftsTriggersMatchContract(db, 'memory_fts'));
+    if (messageReady && memoryReady) {
+      if (state?.status === 'complete') {
+        const hasRows = db.prepare('SELECT 1 FROM messages NOT INDEXED LIMIT 1').get() || db.prepare('SELECT 1 FROM memories NOT INDEXED LIMIT 1').get()
+          || db.prepare('SELECT 1 FROM message_fts_docsize LIMIT 1').get() || db.prepare('SELECT 1 FROM memory_fts_docsize LIMIT 1').get();
+        if (hasRows) {
+          db.prepare('DELETE FROM extension_metadata WHERE key = ?').run(FTS5_TOKENIZER_VERSION_KEY);
+          this.storeSessionRepairState(db, { ...state, status: 'pending', phase: 'coverage', cursor: 0,
+            ftsInitialized: false, completedAt: undefined, updatedAt: new Date().toISOString() });
+        } else this.publishFtsTokenizerVersion(db);
+      }
+      return;
+    }
+    if (!state) throw new SessionEvidenceUnavailableError();
+    db.prepare('DELETE FROM extension_metadata WHERE key = ?').run(FTS5_TOKENIZER_VERSION_KEY);
+    if (state.status === 'complete' || state.phase === 'verify' || state.phase === 'coverage' || (state.phase === 'memory_fts' && !messageReady)) {
+      this.storeSessionRepairState(db, {
+        ...state, status: 'pending', phase: messageReady ? 'memory_fts' : 'message_fts',
+        cursor: 0, ftsInitialized: false, completedAt: undefined, updatedAt: new Date().toISOString(),
+      });
+    } else if (state.ftsInitialized && ((state.phase === 'message_fts' && !messageReady) || (state.phase === 'memory_fts' && !memoryReady))) {
+      this.storeSessionRepairState(db, { ...state, cursor: 0, ftsInitialized: false, updatedAt: new Date().toISOString() });
+    }
+  }
+
+  /** Guard deletes of not-yet-indexed rows while preserving ordinary live updates. */
+  private installFtsUpdateTriggers(db: DatabaseLike, table: 'message_fts' | 'memory_fts', migrating: boolean): void {
+    db.exec(this.ftsUpdateTriggerSql(table, migrating));
+  }
+
+  private ftsUpdateTriggerSql(table: 'message_fts' | 'memory_fts', migrating: boolean): string {
+    const source = table === 'message_fts' ? 'messages' : 'memories';
+    const key = table === 'message_fts' ? 'rowid' : 'id';
+    const when = table === 'message_fts' ? 'WHEN old.content IS NOT new.content' : '';
+    const insertTrigger = SCHEMA_SQL.match(new RegExp(`CREATE TRIGGER IF NOT EXISTS ${source}_ai[\\s\\S]*?END;`))?.[0].replace('IF NOT EXISTS ', '');
+    if (!insertTrigger) throw new Error('Canonical FTS insert trigger definition is missing');
+    const deleteSql = migrating
+      ? `INSERT INTO ${table}(${table}, rowid, content) SELECT 'delete', old.${key}, old.content WHERE EXISTS (SELECT 1 FROM ${table}_docsize WHERE id = old.${key});`
+      : `INSERT INTO ${table}(${table}, rowid, content) VALUES ('delete', old.${key}, old.content);`;
+    return `
+      DROP TRIGGER IF EXISTS ${source}_ai;
+      ${insertTrigger}
+      DROP TRIGGER IF EXISTS ${source}_ad;
+      DROP TRIGGER IF EXISTS ${source}_au;
+      CREATE TRIGGER ${source}_ad AFTER DELETE ON ${source} BEGIN ${deleteSql} END;
+      CREATE TRIGGER ${source}_au AFTER UPDATE ON ${source} ${when} BEGIN
+        ${deleteSql}
+        INSERT INTO ${table}(rowid, content) VALUES (new.${key}, new.content);
+      END;
+    `;
   }
 
   /**
    * Close the database connection.
    */
   close(keepFacade = false): boolean {
+    this.openIntegrityAbort?.abort();
+    this.openIntegrityAbort = null;
+    // Keep the recovery fence until an interrupted child writer has closed.
+    if (this.ftsRepairProcess?.busy) { this.ftsRepairProcess.stop(); return false; }
+    this.ftsRepairProcess?.stop();
+    this.ftsRepairProcess = null;
     this.facade?.resetAfterManagerClose();
     if (this.mutationLeaseDepth > 0) {
       try { this.native?.exec('ROLLBACK'); } catch {}
@@ -2118,7 +2334,7 @@ export class DatabaseManager {
       }
       if (!this.activeRecoveryLease && !barrier) return false;
       try {
-        try { native.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch {}
+        try { measureLifecycleSync('database.checkpoint', () => native.exec('PRAGMA wal_checkpoint(TRUNCATE)')); } catch {}
       } finally {
         barrier?.release();
         try { native.close(); } catch {}
@@ -2128,6 +2344,7 @@ export class DatabaseManager {
     this.db = null;
     if (!keepFacade) this.facade = null;
     this.generation = null;
+    this.pendingOpenIntegrityScan = null;
     return true;
   }
 

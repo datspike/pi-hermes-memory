@@ -17,10 +17,12 @@ import {
   removeSyncedMemories,
   replaceSyncedMemories,
   syncMemoryEntry,
+  isFts5QueryError,
 } from "../store/sqlite-memory-store.js";
 import { MEMORY_TOOL_DESCRIPTION } from "../constants.js";
 import { resolveProjectName, resolveProjectStore, type ProjectNameRef, type ProjectStoreRef } from "../project-context.js";
 import type { MemoryCategory, MemoryResult } from "../types.js";
+import { normalizeMemoryLookupText } from "../store/memory-lookup.js";
 import { createSharedToolResultRenderer } from "./shared-output-view.js";
 import { memoryResultView } from "./tool-result-views.js";
 
@@ -69,6 +71,44 @@ function sqliteProjectFor(rawTarget: "memory" | "user" | "project" | "failure", 
 function sqliteTargetFor(rawTarget: "memory" | "user" | "project" | "failure"): "memory" | "user" | "failure" {
   if (rawTarget === "project") return "memory";
   return rawTarget;
+}
+
+function matchingMutationTargets(
+  oldText: string,
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+): Array<"memory" | "user" | "failure" | "project"> {
+  const lookup = normalizeMemoryLookupText(oldText);
+  if (!lookup) return [];
+
+  const targets: Array<"memory" | "user" | "failure" | "project"> = [];
+  if (store.getMemoryEntries().some((entry) => entry.includes(lookup))) targets.push("memory");
+  if (store.getUserEntries().some((entry) => entry.includes(lookup))) targets.push("user");
+  if (store.getAllFailureEntries().some((entry) => entry.includes(lookup))) targets.push("failure");
+  if (projectStore?.getMemoryEntries().some((entry) => entry.includes(lookup))) targets.push("project");
+  return targets;
+}
+
+function addWrongTargetHint(
+  result: MemoryResult,
+  rawTarget: "memory" | "user" | "project" | "failure",
+  oldText: string,
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+): MemoryResult {
+  if (result.success || !result.error?.startsWith("No entry matched")) return result;
+
+  const alternatives = matchingMutationTargets(oldText, store, projectStore)
+    .filter((target) => target !== rawTarget);
+  if (alternatives.length === 0) return result;
+
+  const quotedTargets = alternatives.map((target) => `"${target}"`).join(", ");
+  const noun = alternatives.length === 1 ? "target" : "targets";
+  return {
+    ...result,
+    error: `No match in target "${rawTarget}"; matching entry found in ${noun} ${quotedTargets}. Retry with the displayed target.`,
+    matching_targets: alternatives,
+  };
 }
 
 async function syncAddToSqlite(
@@ -199,20 +239,34 @@ async function reconcileStoreScope(
   if (!dbManager) return undefined;
   try {
     if (rawTarget === "failure") {
-      reconcileMarkdownFailureScopes(dbManager, entries);
-      return null;
+      return degradedRepairMessage(reconcileMarkdownFailureScopes(dbManager, entries));
     }
     const target = sqliteTargetFor(rawTarget);
-    reconcileMarkdownMemoryScope(
-      dbManager,
-      entries,
-      target,
-      sqliteProjectFor(rawTarget, projectName) ?? null,
+    return degradedRepairMessage(
+      reconcileMarkdownMemoryScope(
+        dbManager,
+        entries,
+        target,
+        sqliteProjectFor(rawTarget, projectName) ?? null,
+      ),
     );
-    return null;
   } catch (err) {
-    return `Saved to Markdown, but SQLite search reconciliation failed: ${err instanceof Error ? err.message : String(err)}`;
+    const detail = err instanceof Error ? err.message : String(err);
+    if (isFts5QueryError(err)) {
+      return degradedRepairMessage({ degraded: true, degradedReason: detail });
+    }
+    return `Saved to Markdown, but SQLite search reconciliation failed: ${detail}`;
   }
+}
+
+// A degraded reconcile result means the Markdown write succeeded but the
+// SQLite search mirror could not be updated (genuine FTS5 index error). The
+// caller must tell the user how to repair the index instead of looking like a
+// plain success.
+function degradedRepairMessage(result: { degraded?: boolean; degradedReason?: string }): string | null {
+  return result.degraded
+    ? `Saved to Markdown. Search may be temporarily unavailable (FTS5 index error: ${result.degradedReason}). Run /memory-sync-markdown to rebuild the search index.`
+    : null;
 }
 
 type MemoryAction = "add" | "replace" | "remove";
@@ -230,6 +284,7 @@ export function registerMemoryTool(
   projectStore: ProjectStoreRef,
   dbManager: DatabaseManager | null = null,
   projectName: ProjectNameRef = null,
+  bindProjectFromCwd?: (cwd?: string) => void | Promise<void>,
 ): (candidate: MemoryStore | null) => void {
   const reconciledStores = new WeakSet<MemoryStore>();
   const attachMutationObserver = (candidate: MemoryStore | null, isProjectStore = false): void => {
@@ -301,6 +356,7 @@ export function registerMemoryTool(
           result = await store_.addFailure(content, {
             category: memoryCategory,
             failureReason: failure_reason,
+            signal,
           });
           if (result.success && !syncHandled) {
             syncWarning = await syncAddToSqlite(rawTarget, content, memoryCategory, failure_reason, dbManager, activeProjectName);
@@ -328,6 +384,10 @@ export function registerMemoryTool(
           syncWarning = await syncRemoveFromSqlite(rawTarget, old_text, dbManager, activeProjectName);
         }
         break;
+    }
+
+    if (action !== "add" && old_text) {
+      result = addWrongTargetHint(result, rawTarget, old_text, store, activeProjectStore);
     }
 
     if (result.success && !syncHandled && typeof store_.getRawEntriesForSync === "function") {
@@ -366,7 +426,10 @@ This action-specific tool accepts only the parameters listed in its schema.`;
       ],
       renderResult: createSharedToolResultRenderer(memoryResultView),
       parameters,
-      async execute(_toolCallId, params, signal) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx?: { cwd?: string }) {
+        if (bindProjectFromCwd && ctx?.cwd) {
+          await bindProjectFromCwd(ctx.cwd);
+        }
         return executeAction(action, params as MemoryToolParams, signal);
       },
     });

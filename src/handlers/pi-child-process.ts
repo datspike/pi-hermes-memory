@@ -16,10 +16,27 @@ interface PiExecResult {
   killed?: boolean;
 }
 
+export interface ChildPiModel {
+  provider: string;
+  id: string;
+}
+
+export function resolveChildPiModel(
+  model: { provider?: string; id?: string } | undefined,
+): ChildPiModel | undefined {
+  return model?.provider && model.id
+    ? { provider: model.provider, id: model.id }
+    : undefined;
+}
+
 interface ExecChildPromptOptions {
   signal?: AbortSignal;
+  cwd?: string;
+  model?: ChildPiModel;
   timeoutMs: number;
   retryWithoutOverrides?: boolean;
+  /** Return proposals only: disable model tools and omit the writable Hermes extension. */
+  proposalOnly?: boolean;
 }
 
 interface ExecChildPromptDependencies {
@@ -211,31 +228,39 @@ export function detectAuthAdapterExtensionPaths(roots?: string[]): string[] {
   return detected;
 }
 
-function childExtensionPaths(config: ChildLlmConfig): string[] {
-  const candidates = [
-    OWN_EXTENSION_PATH,
-    ...(config.childExtensionPaths ?? []),
-    ...detectAuthAdapterExtensionPaths(),
-  ];
+function childExtensionSources(config: ChildLlmConfig, proposalOnly = false): string[] {
   const seen = new Set<string>();
-  const paths: string[] = [];
-  for (const candidate of candidates) {
+  const sources: string[] = [];
+  const append = (candidate: string | undefined): void => {
     const trimmed = candidate?.trim();
-    if (!trimmed) continue;
-    const normalized = resolve(trimmed);
-    if (seen.has(normalized) || !existsSync(normalized)) continue;
-    seen.add(normalized);
-    paths.push(normalized);
+    if (!trimmed || seen.has(trimmed)) return;
+    if (proposalOnly && ((OWN_EXTENSION_PATH && (resolve(trimmed) === OWN_EXTENSION_PATH
+      || resolve(trimmed) === dirname(dirname(OWN_EXTENSION_PATH))))
+      || /^npm:pi-hermes-memory(?:@|$)/.test(trimmed))) return;
+    seen.add(trimmed);
+    sources.push(trimmed);
+  };
+
+  // These paths are discovered by Hermes rather than explicitly trusted in
+  // configuration, so keep the local existence check before forwarding them.
+  if (!proposalOnly && OWN_EXTENSION_PATH && existsSync(OWN_EXTENSION_PATH)) append(OWN_EXTENSION_PATH);
+  for (const source of config.childExtensionPaths ?? []) append(source);
+  for (const adapterPath of detectAuthAdapterExtensionPaths()) {
+    const normalized = resolve(adapterPath);
+    if (existsSync(normalized)) append(normalized);
   }
-  return paths;
+  return sources;
 }
 
-function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig): void {
+function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig, proposalOnly = false): void {
   // Skip all packages from settings.json (--no-extensions) — the subprocess
-  // loads only Hermes and explicitly required provider adapters.
+  // loads only Hermes and explicitly trusted provider/auth sources. Leave
+  // configured sources untouched so Pi's -e resolver owns path expansion and
+  // package-source handling exactly as it does for normal CLI invocations.
   args.push("--no-extensions");
-  for (const extensionPath of childExtensionPaths(config)) {
-    args.push("-e", extensionPath);
+  if (proposalOnly) args.push("--no-tools");
+  for (const extensionSource of childExtensionSources(config, proposalOnly)) {
+    args.push("-e", extensionSource);
   }
 }
 
@@ -243,24 +268,30 @@ export function buildChildPiPromptArgs(
   prompt: string,
   config: ChildLlmConfig,
   _argv: string[] = process.argv.slice(2),
+  activeModel?: ChildPiModel,
+  proposalOnly = false,
 ): string[] {
   const args = ["-p", "--no-session"];
-  const model = normalizedModelOverride(config);
+  const model = normalizedModelOverride(config)
+    ?? (activeModel?.provider && activeModel.id ? `${activeModel.provider}/${activeModel.id}` : undefined);
   const thinking = effectiveThinkingOverride(config);
 
   if (model) args.push("--model", model);
   if (thinking) args.push("--thinking", thinking);
-  appendOwnExtensionArgs(args, config);
+  appendOwnExtensionArgs(args, config, proposalOnly);
   args.push(prompt);
 
   return args;
 }
 
-function basePromptArgs(prompt: string, config: ChildLlmConfig): string[] {
+function basePromptArgs(prompt: string, config: ChildLlmConfig, activeModel?: ChildPiModel, proposalOnly = false): string[] {
   // Always use --no-extensions + own path so the retry also avoids loading
   // all settings.json packages — matching the primary code path.
   const args = ["-p", "--no-session"];
-  appendOwnExtensionArgs(args, config);
+  if (activeModel?.provider && activeModel.id) {
+    args.push("--model", `${activeModel.provider}/${activeModel.id}`);
+  }
+  appendOwnExtensionArgs(args, config, proposalOnly);
   args.push(prompt);
   return args;
 }
@@ -402,21 +433,26 @@ export async function execChildPrompt(
   dependencies: ExecChildPromptDependencies = DEFAULT_EXEC_CHILD_PROMPT_DEPENDENCIES,
 ): Promise<PiExecResult> {
   const execOptions = {
+    cwd: options.cwd,
     timeout: options.timeoutMs + WATCHDOG_EXIT_GRACE_MS,
   };
   const temporaryPrompt = await writePromptToTemporaryFile(prompt);
   const promptReference = `@${temporaryPrompt.filePath}`;
   const cancellationPath = join(temporaryPrompt.dir, "cancel");
+  let cancellationRequest: Promise<void> | undefined;
   const requestCancellation = () => {
-    void fs.writeFile(cancellationPath, "", { mode: 0o600 }).catch(() => {});
+    cancellationRequest ??= fs.writeFile(cancellationPath, "", { mode: 0o600 }).catch(() => {});
   };
   options.signal?.addEventListener("abort", requestCancellation, { once: true });
-  if (options.signal?.aborted) requestCancellation();
+  if (options.signal?.aborted) {
+    requestCancellation();
+    await cancellationRequest;
+  }
 
   try {
     try {
       const invocation = resolveWatchedChildPiInvocation(
-        resolveChildPiInvocation(buildChildPiPromptArgs(promptReference, config)),
+        resolveChildPiInvocation(buildChildPiPromptArgs(promptReference, config, process.argv.slice(2), options.model, options.proposalOnly)),
         options.timeoutMs,
         cancellationPath,
       );
@@ -440,7 +476,7 @@ export async function execChildPrompt(
     }
 
     const retryInvocation = resolveWatchedChildPiInvocation(
-      resolveChildPiInvocation(basePromptArgs(promptReference, config)),
+      resolveChildPiInvocation(basePromptArgs(promptReference, config, options.model, options.proposalOnly)),
       options.timeoutMs,
       cancellationPath,
     );

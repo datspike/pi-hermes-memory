@@ -184,8 +184,8 @@ describe('session search memory bounds', () => {
             console.log(JSON.stringify({ error: error.name }));
           }
         `);
-        // Legacy does not materialize entry IDs, so this candidate set remains cheap.
-        assert.deepEqual(result, { error: mode === 'legacy' ? null : 'SessionSearchReadLimitError' });
+        // Canonical legacy now also budgets the exact entry IDs it validates.
+        assert.deepEqual(result, { error: 'SessionSearchReadLimitError' });
       }
     } finally {
       manager.close();

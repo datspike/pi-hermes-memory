@@ -2,6 +2,8 @@
 # Run each test file in its own tsx process to avoid node:test runner hang.
 set -euo pipefail
 PASS=0
+# Test the installed SDK with its own theme assets, not a calling Pi host's newer package directory.
+unset PI_PACKAGE_DIR
 
 TEST_TIMEOUT="${TEST_TIMEOUT:-120}"
 if [[ ! "$TEST_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]]; then

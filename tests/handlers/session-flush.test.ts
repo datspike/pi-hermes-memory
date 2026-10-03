@@ -1,7 +1,7 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { setupSessionFlush } from "../../src/handlers/session-flush.js";
+import { setupSessionFlush, remainingFlushTimeoutMs, resolveFlushHandoff } from "../../src/handlers/session-flush.js";
 import { resolveWatchedChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 import { DIRECT_FLUSH_SYSTEM_PROMPT, FLUSH_PROMPT } from "../../src/constants.js";
 import type { MemoryConfig } from "../../src/types.js";
@@ -64,6 +64,22 @@ function defaultFlushCtx() {
   return { sessionManager: { getBranch: () => mockBranch(8) } };
 }
 
+function flushCtxWithNotify() {
+  const notifications: { message: string; kind?: string }[] = [];
+  return {
+    notifications,
+    ctx: {
+      sessionManager: { getBranch: () => mockBranch(8) },
+      ui: {
+        notify(message: string, kind?: string) {
+          notifications.push({ message, kind });
+        },
+      },
+    },
+  };
+}
+
+
 async function primeFlushReady(handlers: Record<string, Function[]>) {
   await emitUserTurns(handlers, 8);
 }
@@ -83,7 +99,7 @@ async function emitShutdownAndAwaitFlush(
       resolve();
     }
   };
-  await emit(handlers, "session_shutdown", {}, ctx);
+  await emit(handlers, "session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
   await promise;
 }
 
@@ -119,6 +135,7 @@ function defaultConfig(overrides: Partial<MemoryConfig> = {}): MemoryConfig {
     failureInjectionMaxAgeDays: 7,
     failureInjectionMaxEntries: 5,
     nudgeToolCalls: 15,
+    flushCompactTimeoutMs: 60_000,
     ...overrides,
   };
 }
@@ -163,6 +180,62 @@ function flushMessage(call: { args: any[] }): string {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+describe("remainingFlushTimeoutMs", () => {
+  it("gives the full ceiling when nothing has elapsed", () => {
+    assert.equal(remainingFlushTimeoutMs(60_000, 0), 60_000);
+  });
+
+  it("returns leftover after a fast miss, not a second copy of the budget", () => {
+    assert.equal(remainingFlushTimeoutMs(60_000, 2_000), 58_000);
+  });
+
+  it("skips when leftover is below the 5s spawn floor", () => {
+    assert.equal(remainingFlushTimeoutMs(60_000, 56_000), null);
+  });
+
+  it("keeps leftover when it equals the spawn floor", () => {
+    assert.equal(remainingFlushTimeoutMs(60_000, 55_000), 5_000);
+  });
+
+  it("skips when the ceiling is fully spent or overshot", () => {
+    assert.equal(remainingFlushTimeoutMs(60_000, 60_000), null);
+    assert.equal(remainingFlushTimeoutMs(60_000, 65_000), null);
+  });
+
+  it("floors the spawn threshold by the budget so a tiny knob still runs one shot", () => {
+    assert.equal(remainingFlushTimeoutMs(3_000, 0), 3_000);
+  });
+
+  it("does not spawn a doomed child after any spend of a tiny budget", () => {
+    assert.equal(remainingFlushTimeoutMs(3_000, 1), null);
+  });
+
+  it("treats a non-positive budget as exhausted", () => {
+    assert.equal(remainingFlushTimeoutMs(0, 0), null);
+    assert.equal(remainingFlushTimeoutMs(-1, 0), null);
+  });
+});
+
+describe("resolveFlushHandoff", () => {
+  it("skips as session_aborted even when leftover budget remains", () => {
+    assert.deepEqual(resolveFlushHandoff(true, 60_000, 0), { skip: "session_aborted" });
+    assert.deepEqual(resolveFlushHandoff(true, 0, 0), { skip: "session_aborted" });
+  });
+
+  it("skips as budget_exhausted when leftover is below the spawn floor", () => {
+    assert.deepEqual(resolveFlushHandoff(false, 60_000, 56_000), { skip: "budget_exhausted" });
+  });
+
+  it("returns leftover timeoutMs, never a second copy of the budget", () => {
+    assert.deepEqual(resolveFlushHandoff(false, 60_000, 2_000), { timeoutMs: 58_000 });
+  });
+
+  it("treats a non-positive budget as immediately exhausted", () => {
+    assert.deepEqual(resolveFlushHandoff(false, 0, 0), { skip: "budget_exhausted" });
+    assert.deepEqual(resolveFlushHandoff(false, -5, 0), { skip: "budget_exhausted" });
+  });
+});
+
 
 describe("setupSessionFlush", () => {
   let mockPi: MockSessionFlushPi;
@@ -209,6 +282,38 @@ describe("setupSessionFlush", () => {
     const ctx = { sessionManager: { getBranch: () => mockBranch(8) } };
     await emitShutdownAndAwaitFlush(mockPi, mockPi.handlers, ctx);
     assert.equal(mockPi.execCalls.length, 1, "exec should be called once");
+  });
+
+  it("awaits the bounded flush before session_shutdown resolves", async () => {
+    const config = defaultConfig();
+    setupSessionFlush(mockPi.pi, mockStore, null, config);
+
+    await emitUserTurns(mockPi.handlers, 8);
+
+    const { promise: execStarted, resolve: markExecStarted } = Promise.withResolvers<void>();
+    const { promise: releaseExec, resolve: release } = Promise.withResolvers<void>();
+    mockPi.pi.exec = async (...args: unknown[]) => {
+      markExecStarted();
+      await releaseExec;
+      return { code: 0, stdout: "", stderr: "" };
+    };
+
+    const ctx = {
+      sessionManager: { getBranch: () => mockBranch(8) },
+      cwd: "/tmp/active-project",
+      model: undefined,
+      modelRegistry: {},
+    };
+    const shutdown = mockPi.handlers["session_shutdown"][0]({}, ctx);
+    await execStarted;
+
+    let settled = false;
+    void shutdown.then(() => { settled = true; });
+    await Promise.resolve();
+    assert.equal(settled, false, "shutdown handler must await the flush");
+
+    release();
+    await shutdown;
   });
 
   it("session_shutdown does NOT trigger when flushOnShutdown is false", async () => {
@@ -264,8 +369,9 @@ describe("setupSessionFlush", () => {
   // ── Exec args verification ──────────────────────────────────────────
 
   it("Flush uses pi.exec with correct args", async () => {
+    const clock = { t: 0 };
     const config = defaultConfig();
-    setupSessionFlush(mockPi.pi, mockStore, null, config);
+    setupSessionFlush(mockPi.pi, mockStore, null, config, null, null, { now: () => clock.t });
 
     await emitUserTurns(mockPi.handlers, 8);
 
@@ -292,7 +398,29 @@ describe("setupSessionFlush", () => {
 
     // Options should include timeout
     assert.ok(opts, "options should be passed");
-    assert.equal(opts.timeout, 35000);
+    assert.equal(opts.timeout, 65000);
+  });
+
+  it("forwards active cwd and model to flush subprocesses", async () => {
+    const config = defaultConfig();
+    setupSessionFlush(mockPi.pi, mockStore, null, config);
+
+    await emitUserTurns(mockPi.handlers, 8);
+
+    const ctx = {
+      sessionManager: { getBranch: () => mockBranch(4) },
+      cwd: "/tmp/active-project",
+      model: { provider: "local-llama", id: "local-9b" },
+      modelRegistry: {},
+    };
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    const [, , opts] = mockPi.execCalls[0].args;
+    assert.equal(opts.cwd, "/tmp/active-project");
+    const args = logicalChildArgs(mockPi.execCalls[0]);
+    assert.deepStrictEqual(args.slice(0, 4), [
+      "-p", "--no-session", "--model", "local-llama/local-9b",
+    ]);
   });
 
   it("passes child LLM override args to flush subprocesses", async () => {
@@ -457,7 +585,7 @@ describe("setupSessionFlush", () => {
 
     assert.equal(mockPi.execCalls.length, 1);
     const opts = mockPi.execCalls[0].args[2];
-    assert.equal(opts.signal, undefined, "signal must not be forwarded to the watchdog process");
+    assert.strictEqual(opts.signal, undefined, "the watchdog, not pi.exec, owns compact cancellation");
   });
 });
 
@@ -467,6 +595,30 @@ describe("direct transport", () => {
   beforeEach(() => {
     mockPi = createMockPi();
     directCalls = [];
+  });
+
+  it("session_shutdown skips direct and subprocess flush on reload", async () => {
+    const config = defaultConfig({ reviewTransport: "direct" });
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      config,
+      null,
+      null,
+      makeDirectDeps({ ok: true, appliedCount: 1 }),
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(
+      mockPi.handlers,
+      "session_shutdown",
+      { type: "session_shutdown", reason: "reload" },
+      defaultFlushCtx(),
+    );
+
+    assert.equal(directCalls.length, 0, "reload must not use direct completion");
+    assert.equal(mockPi.execCalls.length, 0, "reload must not spawn a subprocess");
   });
 
   it("session_before_compact uses direct transport without subprocess when direct returns ok", async () => {
@@ -488,9 +640,32 @@ describe("direct transport", () => {
     assert.equal(mockPi.execCalls.length, 0, "subprocess must not run on successful direct flush");
 
     const options = directCalls[0][3] as { systemPrompt: string; userPrompt: string };
-    assert.equal(options.systemPrompt, DIRECT_FLUSH_SYSTEM_PROMPT);
+    assert.match(options.systemPrompt, /target routing/i);
+    assert.match(options.systemPrompt, /use target "memory"/i);
+    assert.match(options.systemPrompt, /do not emit target "project"/i);
     assert.match(options.userPrompt, /--- Conversation ---/);
     assert.match(options.userPrompt, /msg 0/);
+  });
+
+  it("routes project facts to project target when a project store is available", async () => {
+    const config = defaultConfig({ reviewTransport: "direct" });
+    const projectStore = { getMemoryEntries: () => ["existing project fact"] } as unknown as Parameters<typeof setupSessionFlush>[2];
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      projectStore,
+      config,
+      null,
+      "project-a",
+      makeDirectDeps({ ok: true, appliedCount: 1 }),
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, defaultFlushCtx());
+
+    const options = directCalls[0][3] as { systemPrompt: string; userPrompt: string };
+    assert.match(options.systemPrompt, /project-specific facts.*target "project"/i);
+    assert.match(options.userPrompt, /--- Current Project Memory ---/);
   });
 
   it("falls back to subprocess with flush message shape when direct returns ok false", async () => {
@@ -572,5 +747,440 @@ describe("direct transport", () => {
 
     assert.equal(directCalls.length, 0, "subprocess transport must not invoke direct completion");
     assert.equal(mockPi.execCalls.length, 1);
+  });
+});
+
+describe("compact flush budget", () => {
+  let mockPi: MockSessionFlushPi;
+
+  beforeEach(() => {
+    mockPi = createMockPi();
+    directCalls = [];
+  });
+
+  it("direct ok uses the compact ceiling and does not exec or notify", async () => {
+    const { ctx, notifications } = flushCtxWithNotify();
+    const config = defaultConfig({ flushCompactTimeoutMs: 120_000 });
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      config,
+      null,
+      null,
+      makeDirectDeps({ ok: true, appliedCount: 1 }),
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 1);
+    const options = directCalls[0][3];
+    assert.ok(options && typeof options === "object" && "timeoutMs" in options);
+    assert.equal(options.timeoutMs, 120_000);
+    assert.equal(mockPi.execCalls.length, 0);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("fast parse_error hands the child leftover, not a second copy of the budget", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      {
+        now: () => clock.t,
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          clock.t += 2_000;
+          return { ok: false, appliedCount: 0, fallbackReason: "parse_error" };
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 1);
+    assert.equal(mockPi.execCalls.length, 1);
+    assert.equal(mockPi.execCalls[0].args[2].timeout, 58_000 + 5_000);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("internal timeout at the ceiling skips the child and notifies once", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      {
+        now: () => clock.t,
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          clock.t += 60_000;
+          return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 1);
+    assert.equal(mockPi.execCalls.length, 0);
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].kind, "warning");
+    assert.match(notifications[0].message, /flushCompactTimeoutMs/);
+    assert.match(notifications[0].message, /timed out after 60000ms/);
+  });
+
+  it("reports the leftover, not a timeout, when the direct call leaves too little budget", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      {
+        now: () => clock.t,
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          clock.t += 58_000;
+          return { ok: false, appliedCount: 0, fallbackReason: "parse_error" };
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 1);
+    assert.equal(mockPi.execCalls.length, 0, "2s of leftover is below the spawn floor");
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0].message, /only 2000ms left of the 60000ms budget/);
+    assert.doesNotMatch(notifications[0].message, /timed out after/);
+  });
+
+  it("Esc during compact skips the child silently", async () => {
+    const abort = new AbortController();
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          abort.abort();
+          return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: abort.signal }, ctx);
+
+    assert.equal(directCalls.length, 1);
+    assert.equal(mockPi.execCalls.length, 0);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("already-aborted session signal skips without an LLM call or notify", async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      makeDirectDeps({ ok: false, appliedCount: 0, fallbackReason: "aborted" }),
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: abort.signal }, ctx);
+
+    assert.equal(directCalls.length, 0);
+    assert.equal(mockPi.execCalls.length, 0);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("direct throw still falls through with leftover", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      {
+        now: () => clock.t,
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          clock.t += 2_000;
+          throw new Error("injected direct flush failure");
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 1);
+    assert.equal(mockPi.execCalls.length, 1);
+    assert.equal(mockPi.execCalls[0].args[2].timeout, 58_000 + 5_000);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("non-positive compact budget skips without an LLM call and stays silent", async () => {
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ flushCompactTimeoutMs: 0 }),
+      null,
+      null,
+      makeDirectDeps({ ok: true, appliedCount: 1 }),
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 0);
+    assert.equal(mockPi.execCalls.length, 0);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("subprocess transport takes one child at the full compact ceiling", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ reviewTransport: "subprocess" }),
+      null,
+      null,
+      { ...makeDirectDeps({ ok: true, appliedCount: 99 }), now: () => clock.t },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(directCalls.length, 0);
+    assert.equal(mockPi.execCalls.length, 1);
+    assert.equal(mockPi.execCalls[0].args[2].timeout, 60_000 + 5_000);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("compact exec throw does not reject and notifies once", async () => {
+    const failingPi = createMockPi();
+    failingPi.pi.exec = async () => {
+      throw new Error("exec failed");
+    };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      failingPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ reviewTransport: "subprocess" }),
+    );
+
+    await primeFlushReady(failingPi.handlers);
+    await assert.doesNotReject(async () => {
+      await emit(failingPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+    });
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0].message, /flushCompactTimeoutMs/);
+  });
+
+  it("default compact ceiling is 60000, not 30000", async () => {
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      makeDirectDeps({ ok: true, appliedCount: 1 }),
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: undefined }, defaultFlushCtx());
+
+    const options = directCalls[0][3];
+    assert.ok(options && typeof options === "object" && "timeoutMs" in options);
+    assert.equal(options.timeoutMs, 60_000);
+  });
+  it("child killed by the watchdog (non-zero exit) notifies once", async () => {
+    const failingPi = createMockPi();
+    failingPi.pi.exec = async () => ({ code: 124, killed: true, stdout: "", stderr: "" });
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      failingPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ reviewTransport: "subprocess" }),
+    );
+
+    await primeFlushReady(failingPi.handlers);
+    await emit(failingPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0].message, /child exited with code 124/);
+    assert.match(notifications[0].message, /flushCompactTimeoutMs/);
+  });
+
+  it("child killed with a zero exit code still notifies", async () => {
+    const failingPi = createMockPi();
+    // The signal-kill shape pi.exec resolves: Node reports no exit code for a
+    // signalled child, so the flag is the only evidence of the kill.
+    failingPi.pi.exec = async () => ({ code: 0, killed: true, stdout: "", stderr: "" });
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      failingPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ reviewTransport: "subprocess" }),
+    );
+
+    await primeFlushReady(failingPi.handlers);
+    await emit(failingPi.handlers, "session_before_compact", { signal: undefined }, ctx);
+
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0].message, /child was killed before it saved/);
+    assert.match(notifications[0].message, /flushCompactTimeoutMs/);
+  });
+
+  it("direct receives the linked budget signal, not the raw session signal", async () => {
+    const { ctx } = flushCtxWithNotify();
+    const sessionController = new AbortController();
+    const seen: AbortSignal[] = [];
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig(),
+      null,
+      null,
+      {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          const options = args[3] as { signal?: AbortSignal };
+          const linked = options.signal;
+          seen.push(linked as AbortSignal);
+          const { promise, resolve } = Promise.withResolvers<{ ok: boolean; appliedCount: number; fallbackReason: string }>();
+          linked?.addEventListener("abort", () => resolve({ ok: false, appliedCount: 0, fallbackReason: "aborted" }), { once: true });
+          sessionController.abort(); // synchronous dispatch forwards through linkBudget
+          return promise;
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_before_compact", { signal: sessionController.signal }, ctx);
+
+    assert.equal(seen.length, 1);
+    assert.notEqual(seen[0], sessionController.signal);
+    assert.equal(seen[0].aborted, true);
+    assert.equal(mockPi.execCalls.length, 0);
+  });
+});
+
+
+describe("shutdown flush budget", () => {
+  let mockPi: MockSessionFlushPi;
+
+  beforeEach(() => {
+    mockPi = createMockPi();
+    directCalls = [];
+  });
+
+  it("uses 10s independent of flushCompactTimeoutMs and does not notify", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig({
+        flushCompactTimeoutMs: 120_000,
+        reviewTransport: "subprocess",
+      }),
+      null,
+      null,
+      { now: () => clock.t },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emitShutdownAndAwaitFlush(mockPi, mockPi.handlers, ctx);
+    assert.equal(mockPi.execCalls.length, 1);
+    assert.equal(mockPi.execCalls[0].args[2].timeout, 10_000 + 5_000);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("does not double-pay after a spent shutdown budget and stays silent", async () => {
+    const clock = { t: 0 };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ flushCompactTimeoutMs: 120_000 }),
+      null,
+      null,
+      {
+        now: () => clock.t,
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          clock.t += 10_000;
+          return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    await emit(mockPi.handlers, "session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+    assert.equal(directCalls.length, 1);
+    assert.equal(mockPi.execCalls.length, 0);
+    assert.equal(notifications.length, 0);
+  });
+
+  it("exec throw on shutdown does not notify", async () => {
+    const failingPi = createMockPi();
+    failingPi.pi.exec = async () => {
+      throw new Error("exec failed");
+    };
+    const { ctx, notifications } = flushCtxWithNotify();
+    setupSessionFlush(
+      failingPi.pi,
+      mockStore,
+      null,
+      defaultConfig({ reviewTransport: "subprocess" }),
+    );
+
+    await primeFlushReady(failingPi.handlers);
+    await assert.doesNotReject(async () => {
+      await emit(failingPi.handlers, "session_shutdown", {}, ctx);
+    });
+    assert.equal(notifications.length, 0);
   });
 });

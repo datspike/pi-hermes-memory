@@ -43,7 +43,7 @@ export async function buildPromptContext(
     return [resolveMemoryPolicyPrompt(config), standingBlock].filter(Boolean).join("\n\n");
   }
 
-  const memoryBlock = store.formatForSystemPrompt();
+  const memoryBlock = store.formatForSystemPrompt(projectName);
   const projectBlock = projectStore ? projectStore.formatProjectBlock(projectName) : "";
 
   const parts: string[] = [];

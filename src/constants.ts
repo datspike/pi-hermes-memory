@@ -16,6 +16,12 @@ export const DEFAULT_USER_CHAR_LIMIT = 5000;
 
 // ─── Learning loop defaults ───
 export const DEFAULT_PROJECT_CHAR_LIMIT = 5000;
+/**
+ * Largest session message stored in SQLite. Tool results are excluded during
+ * parsing, but this cap also protects the database from unexpected large text
+ * blocks in future Pi content formats.
+ */
+export const DEFAULT_MAX_MESSAGE_CONTENT_LENGTH = 100 * 1024;
 
 export const DEFAULT_NUDGE_INTERVAL = 10;
 export const DEFAULT_FLUSH_MIN_TURNS = 6;
@@ -29,13 +35,69 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
 export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 180000;
+/**
+ * Compact flush is one LLM turn over the conversation snapshot, awaited
+ * before compaction. 30s was cutting local-model prompts mid-prefill
+ * (#225); the value is a ceiling (cloud calls return early). Honor
+ * configured values verbatim; loadConfig warns below this.
+ */
+export const DEFAULT_FLUSH_COMPACT_TIMEOUT_MS = 60_000;
+
+/** Shutdown flush cap. Not configurable. */
+export const DEFAULT_FLUSH_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/**
+ * Above this many chars of (metadata-stripped) entries in one consolidation
+ * prompt, the subprocess path splits the work into multiple child runs
+ * ("rounds") that share one overall time budget (consolidationTimeoutMs),
+ * reloading from disk between rounds; the loop stops at the target's capacity
+ * goal. Stores at or below the threshold keep today's single-shot child run.
+ * #P1: one whole-store LLM merge routinely exceeds any sane single-call
+ * timeout at cap scale.
+ */
+export const DEFAULT_CONSOLIDATION_CHUNK_CHARS = 4000;
+/** Whether chunked subprocess consolidation is enabled. Default OFF — the original single-shot timeout was never reproduced on a fast model; the feature is available for users who hit it. Set consolidationChunking: true to enable. */
+export const DEFAULT_CONSOLIDATION_CHUNKING = false;
+
+/** Floor for the consolidationChunkChars config value. */
+export const CONSOLIDATION_CHUNK_CHARS_MIN = 500;
+/**
+ * Safety cap on subprocess consolidation rounds per trigger. In practice the
+ * loop exits earlier: capacity goal met, overall budget exhausted (the trigger
+ * never blocks longer than the old single call — consolidationTimeoutMs), a
+ * round that shrinks nothing, or a child failure.
+ */
+export const MAX_CONSOLIDATION_ROUNDS = 6;
+/** Wall-clock grace after overflow before an automatic consolidation may run. */
+export const DEFAULT_OVERFLOW_GRACE_MS = 180000;
 export const DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS = 7;
 export const DEFAULT_FAILURE_INJECTION_MAX_ENTRIES = 5;
+
+// ─── Session retention defaults ───
+/**
+ * Default session retention window in days. `0` means retention pruning is
+ * DISABLED by default -- existing searchable session history is never silently
+ * deleted. Users opt in by setting `sessionRetentionDays` to a positive value
+ * in their config; setting it back to `0` (or omitting it) disables pruning
+ * (see #183).
+ */
+export const DEFAULT_SESSION_RETENTION_DAYS = 0;
 
 // ─── File names ───
 export const MEMORY_FILE = "MEMORY.md";
 export const USER_FILE = "USER.md";
 export const STANDING_FILE = "STANDING.md";
+
+// ─── Markdown→SQLite sync state ───
+/**
+ * Key prefix for per-scope reconcile fingerprints in `extension_metadata`.
+ * Bump the version whenever `parseMarkdownMemoryEntry` or the reconcile body
+ * changes what a fingerprinted scope should produce — a stored fingerprint
+ * cannot see a parser change, so the prefix is what invalidates every scope.
+ * The corruption-rebuild strip reads this same constant, so bumping it keeps
+ * both sides in step.
+ */
+export const MDSYNC_METADATA_KEY_PREFIX = "mdsync:v1:";
 
 // ─── Standing instructions (#121) ───
 // A hard budget, deliberately separate from memoryCharLimit/userCharLimit.
@@ -58,7 +120,7 @@ Memory write targets:
 - failure: failures, corrections, insights, conventions, preferences, and tool quirks captured as categorized lessons.
 
 memory_search filters:
-- target accepts "memory", "user", or "failure".
+- target accepts "memory", "user", "failure", or "project" (project-attributed memory entries).
 - project filters project-scoped memories by project name.
 - category filters categorized failure/lesson memories only.
 
@@ -72,7 +134,7 @@ Accepted memory categories:
 
 Search guidance:
 - For user preferences, search target="user" with concrete terms from the request.
-- For project conventions or repo decisions, search with the current project filter and concrete terms from the request.
+- For project conventions or repo decisions, search with the current project filter and concrete terms from the request; when the project name is unknown, search target="project" to match project-attributed memories regardless of name.
 - For debugging, test failures, build errors, or repeated mistakes, search target="failure" and categories "failure", "correction", "insight", or "tool-quirk".
 - For general durable learnings, search target="memory" with concrete terms from the request.
 - Use category only for categorized failure/lesson searches; ordinary user, global, and project memories may not have a category.
@@ -93,7 +155,7 @@ If memory conflicts with current evidence, prefer current evidence and mention t
 Procedural skills:
 - Use the skill_manage tool during normal work when a task reveals a reusable how-to workflow, or when the user asks you to remember how to do something later.
 - Always pass scope explicitly on create: scope="global" for portable procedures, scope="project" for workflows tied to this repo's paths, scripts, architecture, deploy steps, or conventions.
-- Prefer structured fields for create/update/patch: when_to_use, procedure_steps, pitfalls, verification_steps. Use patch with the matching structured field for one section, update for a full rewrite, and view before changing an existing skill.
+- Prefer structured fields for create/update/patch: when_to_use, procedure_steps, pitfalls, verification_steps. Use patch with the matching structured field for one section, update for a full rewrite, and view before changing an existing skill. Write the trigger signals a user would actually type into \`description\`: it is the only field Pi indexes for skill discovery, and \`when_to_use\` renders into the body only.
 - Do not create skills for one-off task state, generic summaries, or overly file-specific notes that will create noisy future matches.
 
 Do not use memory_search for generic questions, one-off examples, or explanations where durable memory would not help.
@@ -160,6 +222,21 @@ TOOLS:
 - memory_replace requires target, old_text, and content.
 - memory_remove requires target and old_text.
 - Use the action-specific tool that matches the requested mutation.`;
+// ─── Shared memory target routing guidance ───
+// Review, flush, and correction prompts all inspect the same set of stores.
+// Keep the routing rule in one place so direct and subprocess transports do
+// not silently disagree about where a durable fact belongs.
+export function buildMemoryTargetRoutingGuidance(hasProjectStore: boolean): string {
+  const projectRule = hasProjectStore
+    ? '- Project-specific facts, conventions, and workflows: use target "project" (the current project memory section is available).'
+    : '- No current project memory section is available: do not emit target "project"; use target "memory" for non-user, non-failure facts.';
+
+  return `**Target routing**:
+- User identity, preferences, and profile facts: use target "user".
+- Global or cross-project facts: use target "memory".
+${projectRule}
+- Failures, corrections, insights, and tool quirks: use target "failure" (keep these categorized as failure memories; do not reroute them to project or global memory).`;
+}
 
 // ─── Background review prompt (ported from _COMBINED_REVIEW_PROMPT in run_agent.py ~L2855) ───
 export const COMBINED_REVIEW_PROMPT = `Review the conversation above and consider these aspects:
@@ -183,16 +260,17 @@ Only act if there's something genuinely worth saving. If nothing stands out, jus
 // (review/flush/consolidation/correction all ask the model to respond with
 // this same {"operations":[...]} shape instead of calling the memory tool,
 // since direct mode is a single completeSimple() call with no tool loop).
+//
+// GUARD: this schema must not contain a parseable operations example.
+// The direct transports fall back to parsing the thinking channel (#197),
+// so a model restating this schema in its chain of thought would have any
+// valid example parsed into a live operation. Show the shape only in prose
+// or with a deliberately unparseable placeholder, and keep the empty
+// {"operations":[]} (in the prompts below) as the only literal example.
+// No angle-bracket placeholders either — those are still valid JSON that
+// models copy into real operations.
 const DIRECT_MEMORY_OPERATIONS_SCHEMA = `Respond with JSON only (no markdown fences):
-{
-  "operations": [
-    {
-      "action": "add",
-      "target": "memory",
-      "content": "entry text"
-    }
-  ]
-}
+{"operations": [ /* one operation object per entry, using the fields below */ ]}
 
 Operation fields:
 - action: "add" | "replace" | "remove"
@@ -200,7 +278,9 @@ Operation fields:
 - content: required for add/replace
 - old_text: required for replace/remove (substring match)
 - category: for failure target — failure | correction | insight | convention | tool-quirk | preference
-- failure_reason: optional context for failure entries`;
+- failure_reason: optional context for failure entries
+
+Put the JSON in the assistant text, not only in thinking.`;
 
 export const DIRECT_REVIEW_SYSTEM_PROMPT = `You review coding conversations and extract durable memories worth saving across sessions.
 
@@ -356,10 +436,10 @@ WHEN TO UPDATE A SKILL:
 
 SKILL FORMAT:
 - name: short, descriptive (e.g., "debug-typescript-errors")
-- description: one-line summary of when to use it
+- description: what the skill does and the trigger signals a user would type (error strings, symptoms, phrasings). Pi indexes skills by this field alone, so body-only triggers never surface at discovery time.
 - body: structured with sections — ## When to Use, ## Procedure, ## Pitfalls, ## Verification
 - Prefer structured fields over raw markdown when possible:
-  - when_to_use: trigger conditions and boundaries
+  - when_to_use: expanded trigger conditions and boundaries. Renders into the skill body and does not participate in Pi's skill index — discoverable trigger signals belong in description.
   - procedure_steps: ordered concrete steps
   - pitfalls: caveats or failure modes
   - verification_steps: checks that prove success
@@ -369,9 +449,9 @@ ONE-SHOT EXAMPLE:
 {
   "action": "create",
   "name": "debug-typescript-errors",
-  "description": "Debug TypeScript build failures in this repo",
+  "description": "Debug TypeScript build failures in this repo: tsc --noEmit errors, type-check failures in the workspace or CI.",
   "scope": "project",
-  "when_to_use": "Use when TypeScript fails in this repo's workspace or CI.",
+  "when_to_use": "Use when pnpm tsc --noEmit fails locally or in CI, or when asked to fix TypeScript build errors here. Not for runtime-only type issues.",
   "procedure_steps": [
     "Run pnpm tsc --noEmit to get the full error list.",
     "Fix dependency or config errors before leaf-module errors.",
