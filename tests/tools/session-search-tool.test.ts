@@ -74,6 +74,30 @@ describe("registerSessionSearchTool", () => {
     }
   });
 
+  it('publishes canonical IDs in the default legacy output when JSONL ownership is available', async () => {
+    let captured: any;
+    const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
+    const databaseDir = makeSessionsDir();
+    const sessionsDir = path.join(ROOT_DIR, 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const file = path.join(sessionsDir, 'canonical.jsonl');
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: 'session', id: 'legacy-canonical-session', timestamp: '2026-07-11T00:00:00.000Z', cwd: '/work/project' }),
+      JSON.stringify({ type: 'message', id: 'legacy-canonical-entry', parentId: null, timestamp: '2026-07-11T00:01:00.000Z', message: { role: 'user', content: 'legacy canonical needle' } }),
+    ].join('\n') + '\n');
+    const dbManager = new DatabaseManager(databaseDir);
+    try {
+      indexAllSessions(dbManager, sessionsDir);
+      registerSessionSearchTool(mockPi, dbManager, { variant: 'legacy' }, { sessionsDir });
+      const result = await captured.execute('legacy-canonical', { query: 'needle', limit: 1 });
+      assert.equal(result.details.count, 1);
+      assert.match(result.content[0].text, /session_id=legacy-canonical-session/);
+      assert.match(result.content[0].text, /entry_id=legacy-canonical-entry/);
+    } finally {
+      dbManager.close();
+    }
+  });
+
   it("clamps negative and fractional legacy limits before querying", async () => {
     let captured: any;
     const mockPi = {

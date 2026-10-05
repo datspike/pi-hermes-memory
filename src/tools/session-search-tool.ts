@@ -134,7 +134,7 @@ Examples:
 - "Find the PR where we fixed the test hang"
 - "What approach did we take for the database migration?"
 
-Returns bounded conversation snippets with session dates and project context. Large messages are truncated with their original character count.`,
+Returns bounded conversation snippets with session dates and project context. When canonical JSONL ownership is available, each result also includes session_id and entry_id for session_get. Large messages are truncated with their original character count.`,
     promptSnippet: 'Search past conversations for relevant context',
     promptGuidelines: [
       'Use session_search when the user asks about previous discussions or past work.',

@@ -53,6 +53,28 @@ describe('session_get', () => {
     } finally { db.close(); }
   });
 
+  it('skips service events between a message and the session root when resolving context', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-'));
+    const db = new DatabaseManager(root);
+    try {
+      const file = path.join(root, 'service-interleaved.jsonl');
+      writeSession(file, 'service-interleaved-session', [
+        { type: 'session_info', id: 'session-info', parentId: null, timestamp: '2026-08-09T00:00:30.000Z' },
+        { type: 'custom', id: 'service-event', parentId: 'session-info', timestamp: '2026-08-09T00:00:45.000Z' },
+        { type: 'message', id: 'first', parentId: null, timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'first' } },
+        { type: 'message', id: 'target', parentId: 'first', timestamp: '2026-08-09T00:02:00.000Z', message: { role: 'assistant', content: 'needle target' } },
+        { type: 'message', id: 'last', parentId: 'target', timestamp: '2026-08-09T00:03:00.000Z', message: { role: 'user', content: 'last' } },
+      ]);
+      const parsed = parseSessionFile(file)!;
+      indexSession(db, parsed);
+      upsertSessionFileMetadata(db, file, parsed.id);
+      const result = await capture(db).execute('service-interleaved', { session_id: 'service-interleaved-session', entry_id: 'target', before: 1, after: 1 });
+      assert.equal(result.details.success, true);
+      assert.deepEqual(result.details.before.map((entry: any) => entry.entry_id), ['first']);
+      assert.deepEqual(result.details.after.map((entry: any) => entry.entry_id), ['last']);
+    } finally { db.close(); }
+  });
+
   it('uses a valid older owner when the newest linked path is missing', async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-'));
     const db = new DatabaseManager(root);

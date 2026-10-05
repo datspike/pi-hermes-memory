@@ -143,15 +143,31 @@ function messageEntries(session: ParsedSession): ParsedEntry[] {
 }
 
 function graphContext(session: ParsedSession, targetId: string, before: number, after: number): { before: ParsedEntry[]; after: ParsedEntry[] } | null {
-  const graph = (session.entries ?? []).filter(validEntry).filter((entry) => entry.kind !== 'session_info');
-  const byId = new Map(graph.map((entry) => [entry.entryId as string, entry]));
+  // Service/structural events are not conversational context, but they can sit
+  // between a message and its canonical parent (notably session_info). Resolve
+  // parents through those nodes instead of treating valid messages as orphans.
+  const graph = messageEntries(session);
+  const graphById = new Map(graph.map((entry) => [entry.entryId as string, entry]));
+  const allById = new Map((session.entries ?? []).filter(validEntry).map((entry) => [entry.entryId as string, entry]));
+  const parentOf = new Map<string, string | null>();
+  for (const entry of graph) {
+    let parent: string | null = entry.parentId == null ? null : (entry.parentEntryId ?? null);
+    const seenParents = new Set<string>();
+    while (parent && !graphById.has(parent)) {
+      if (seenParents.has(parent)) return null;
+      seenParents.add(parent);
+      const structuralParent = allById.get(parent);
+      if (!structuralParent) return null;
+      parent = structuralParent.parentId == null ? null : (structuralParent.parentEntryId ?? null);
+    }
+    parentOf.set(entry.entryId as string, parent);
+  }
   const children = new Map<string, ParsedEntry[]>();
   for (const entry of graph) {
-    const parent: string | null = entry.parentId === null ? null : (entry.parentEntryId ?? null);
-    if (parent && !byId.has(parent)) return null;
+    const parent = parentOf.get(entry.entryId as string) ?? null;
     if (parent) children.set(parent, [...(children.get(parent) ?? []), entry]);
   }
-  const target = byId.get(targetId);
+  const target = graphById.get(targetId);
   if (!target) return null;
   const seen = new Set<string>();
   const lineage: string[] = [];
@@ -161,8 +177,8 @@ function graphContext(session: ParsedSession, targetId: string, before: number, 
     if (seen.has(id)) return null;
     seen.add(id);
     lineage.unshift(id);
-    const parent: string | null = cursor.parentId === null ? null : (cursor.parentEntryId ?? null);
-    cursor = parent ? byId.get(parent) : undefined;
+    const parent = parentOf.get(id) ?? null;
+    cursor = parent ? graphById.get(parent) : undefined;
   }
   const descendants = (root: string): string[] | null => {
     const result: string[] = [];
@@ -186,8 +202,8 @@ function graphContext(session: ParsedSession, targetId: string, before: number, 
     let leaf: ParsedEntry | undefined = active[0];
     while (leaf) {
       branch.unshift(leaf.entryId as string);
-      const parent: string | null = leaf.parentId === null ? null : (leaf.parentEntryId ?? null);
-      leaf = parent ? byId.get(parent) : undefined;
+      const parent: string | null = parentOf.get(leaf.entryId as string) ?? null;
+      leaf = parent ? graphById.get(parent) : undefined;
     }
   } else {
     const unique = descendants(targetId);
@@ -195,8 +211,7 @@ function graphContext(session: ParsedSession, targetId: string, before: number, 
     branch = [...lineage, ...unique];
   }
   if (!branch.includes(targetId)) return null;
-  const messages = new Map(messageEntries(session).map((entry) => [entry.entryId as string, entry]));
-  const messageBranch = branch.map((id) => messages.get(id)).filter((entry): entry is ParsedEntry => Boolean(entry));
+  const messageBranch = branch.map((id) => graphById.get(id)).filter((entry): entry is ParsedEntry => Boolean(entry));
   const targetAt = messageBranch.findIndex((entry) => entry.entryId === targetId);
   if (targetAt < 0) return null;
   return {

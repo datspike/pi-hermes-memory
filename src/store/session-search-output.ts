@@ -34,7 +34,10 @@ export function formatLegacySearch(results: SessionSearchResult[], totalMessages
     const truncated = result.snippet.length > snippetChars || originalChars > snippetChars;
     const snippet = truncated ? `${result.snippet.slice(0, snippetChars)}\n... (truncated, ${originalChars} chars total — refine the query or increase snippetChars)` : result.snippet;
     if (truncated) truncatedCount++;
-    blocks.push(['---', `📅 ${date} | 📁 ${result.project} | ${result.role === 'user' ? '👤 User' : '🤖 Assistant'}`, snippet].join('\n'));
+    const anchor = result.entryId
+      ? `🔗 session_id=${result.sessionId} entry_id=${result.entryId}`
+      : `🔗 session_id=${result.sessionId}`;
+    blocks.push(['---', `📅 ${date} | 📁 ${result.project} | ${result.role === 'user' ? '👤 User' : '🤖 Assistant'}`, anchor, snippet].join('\n'));
   }
   const output = capLegacyOutput(blocks.join('\n\n').trim());
   return textResult(output.text, { success: true, count: results.length, truncatedCount, snippetChars, outputChars: output.text.length, outputTruncated: output.truncated });

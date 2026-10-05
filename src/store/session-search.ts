@@ -19,6 +19,8 @@ export interface SessionSearchResult {
   content: string;
   timestamp: string;
   snippet: string;
+  /** Canonical logical entry identity when the search was validated against JSONL. */
+  entryId?: string;
   /** Original SQLite character count, before the bounded payload projection. */
   contentChars?: number;
 }
@@ -87,8 +89,8 @@ const COMPACT_CANDIDATE_FIELDS = `m.rowid AS candidate_rowid, length(m.session_i
 
 function escapeLikePattern(text: string): string { return text.replace(/[\\%_]/g, '\\$&'); }
 
-function mapRows(rows: Array<{ session_id: string; project: string; role: string; content: string; timestamp: string; content_chars: number }>): SessionSearchResult[] {
-  return rows.map(row => ({ sessionId: row.session_id, project: row.project, role: row.role, content: row.content, timestamp: row.timestamp, snippet: row.content, contentChars: row.content_chars }));
+function mapRows(rows: Array<{ session_id: string; entry_id?: string; project: string; role: string; content: string; timestamp: string; content_chars: number }>): SessionSearchResult[] {
+  return rows.map(row => ({ sessionId: row.session_id, project: row.project, role: row.role, content: row.content, timestamp: row.timestamp, snippet: row.content, ...(row.entry_id ? { entryId: row.entry_id } : {}), contentChars: row.content_chars }));
 }
 
 /** Budget compact key sizes before materializing exact keys through any SQLite adapter. */
