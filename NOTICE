@@ -1,0 +1,7 @@
+## Fork provenance
+
+- upstream: `https://github.com/chandra447/pi-hermes-memory`;
+- verified merge base: `26f0acaa7741a81ea28eb992ab7ffcfdb7b50a0c` on `upstream/main`;
+- maintained fork: `https://github.com/datspike/pi-hermes-memory`.
+
+The upstream MIT copyright and permission notice remain in `LICENSE`. Copyright for Datspike modifications is retained by Datspike under the same MIT terms.
