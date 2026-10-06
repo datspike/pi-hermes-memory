@@ -1,4 +1,5 @@
 import { DatabaseManager, getDatabaseCtor } from './db.js';
+import { normalizeSessionSearchSince, matchesSessionSearchSince } from './session-search-since.js';
 import { getSessionFiles, parseSessionFileForSearch, SessionSearchReadLimitError, SESSION_SEARCH_MAX_SCAN_BYTES, type ParsedEntry, type ParsedSession } from './session-parser.js';
 import { canonicalSessionOwners, closePinnedSessionRoot, openPinnedSessionRoot, readContainedSessionFile, type PinnedSessionRoot } from './session-indexer.js';
 import {
@@ -246,6 +247,7 @@ function assertSessionFilter(sessionId: string | undefined): void {
 /** Original FTS/LIKE search. Its ordering and result shape are intentionally unchanged. */
 export function searchSessions(dbManager: DatabaseManager, query: string, options: SessionSearchOptions = {}): SessionSearchResults {
   assertSessionFilter(options.sessionId);
+  options = { ...options, since: normalizeSessionSearchSince(options.since) };
   dbManager.assertSessionEvidenceAvailable();
   if (query.trim().length === 0) return [];
   const db = dbManager.getDb();
@@ -272,7 +274,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     if (!options.sessionsDir) {
       if (project) { conditions.push('s.project = ?'); params.push(project); }
       if (role) { conditions.push('m.role = ?'); params.push(role); }
-      if (since) { conditions.push('m.timestamp >= ?'); params.push(since); }
+      if (since) { conditions.push('julianday(m.timestamp) >= julianday(?)'); params.push(since); }
     }
     // A canonical search cannot publish an ownerless row; reject it before sorting/over-fetch.
     if (options.sessionsDir) conditions.push("m.entry_id IS NOT NULL AND m.entry_id <> '' AND EXISTS (SELECT 1 FROM session_files owned WHERE owned.session_id = m.session_id)");
@@ -336,7 +338,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
             expandedSessions.add(sessionId);
           },
           transformEntry: entry => {
-            const matchesFilters = (!role || entry.role === role) && (!since || (entry.timestamp !== null && entry.timestamp >= since));
+            const matchesFilters = (!role || entry.role === role) && matchesSessionSearchSince(entry.timestamp, since);
             let matchesQuery = false;
             if (matchesFilters) {
               deleteCanonical!.run();
@@ -553,6 +555,7 @@ function canonicalEligibleForRow(row: { session_id: string }, options: SessionSe
  */
 export function searchSessionEvidence(dbManager: DatabaseManager, query: string, options: SessionSearchEvidenceOptions = {}): SessionSearchEvidenceOutcome {
   assertSessionFilter(options.sessionId);
+  options = { ...options, since: normalizeSessionSearchSince(options.since) };
   dbManager.assertSessionEvidenceAvailable();
   if (!query.trim()) return { results: [], ambiguousSessionIds: [] };
   const normalized = normalizeFts5Query(query);
@@ -684,7 +687,7 @@ function searchSessionEvidenceMatch(
           expandedSessions.add(sessionId);
         },
         transformEntry: entry => {
-          const searchMatchesFilters = (!options.role || entry.role === options.role) && (!options.since || (entry.timestamp !== null && entry.timestamp >= options.since));
+          const searchMatchesFilters = (!options.role || entry.role === options.role) && matchesSessionSearchSince(entry.timestamp, options.since);
           let searchMatchesQuery = false;
           if (searchMatchesFilters) {
             deleteCanonical.run();

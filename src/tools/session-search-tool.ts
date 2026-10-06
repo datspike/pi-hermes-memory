@@ -5,6 +5,7 @@ import { StringEnum } from '@earendil-works/pi-ai';
 import type { DatabaseManager } from '../store/db.js';
 import { runSessionSearch, type SessionSearchWorkerRequest, type SessionSearchExecutionOptions } from '../store/session-search-async.js';
 import type { SessionSearchToolResult } from '../store/session-search-output.js';
+import { normalizeSessionSearchSince, SessionSearchSinceError } from '../store/session-search-since.js';
 import type { SessionSearchConfig } from '../types.js';
 import { AGENT_ROOT } from '../paths.js';
 import { createSharedToolResultRenderer } from './shared-output-view.js';
@@ -30,8 +31,10 @@ function executionOptions(options: SessionSearchToolOptions, signal?: AbortSigna
 async function executeIndexedSearch(dbManager: DatabaseManager, request: IndexedRequest, options: SessionSearchExecutionOptions): Promise<SessionSearchToolResult> {
   if (options.signal?.aborted) throw Object.assign(new Error('Session search cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
   try {
-    return await runSessionSearch({ ...request, dbPath: dbManager.getPath() }, options);
+    const since = normalizeSessionSearchSince(request.options.since);
+    return await runSessionSearch({ ...request, options: { ...request.options, since }, dbPath: dbManager.getPath() }, options);
   } catch (error) {
+    if (error instanceof SessionSearchSinceError) return invalidRequest(error.message, error.code.toLowerCase());
     if (error instanceof Error && (error.name === 'SessionEvidenceUnavailableError' || (error as Error & { code?: string }).code === 'SESSION_EVIDENCE_UNAVAILABLE' || /migration pending|evidence unavailable/i.test(error.message))) {
       const result = { success: false, error: 'session_evidence_unavailable' };
       return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result, isError: true };
@@ -109,7 +112,7 @@ function registerStructuredSessionSearchTool(pi: ExtensionAPI, dbManager: Databa
       session_id: Type.Optional(Type.String({ minLength: 1, pattern: '\\S', description: 'Non-blank exact session ID or an unambiguous prefix; omit this field for unrestricted session scope.' })),
       project: Type.Optional(Type.String({ description: 'Conversation project derived from its cwd, not a repository mentioned in messages; omit when uncertain.' })),
       role: Type.Optional(StringEnum(['user', 'assistant', 'system'] as const)),
-      since: Type.Optional(Type.String({ description: 'ISO timestamp lower bound.' })),
+      since: Type.Optional(Type.String({ description: 'Past YYYY-MM-DD (UTC midnight) or ISO timestamp with Z/offset, up to milliseconds. Invalid and future bounds are errors.' })),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
       include_current_session: Type.Optional(Type.Boolean()),
       include_service: Type.Optional(Type.Boolean()),
@@ -158,7 +161,7 @@ Returns bounded primary conversation snippets with session dates and project con
       query: Type.String({ description: 'Search query. Use natural language or specific terms.' }),
       project: Type.Optional(Type.String({ description: 'Conversation project derived from its cwd, not a repository mentioned in messages; omit when uncertain.' })),
       role: Type.Optional(StringEnum(['user', 'assistant'] as const, { description: 'Filter by message role (optional).' })),
-      since: Type.Optional(Type.String({ description: 'ISO timestamp lower bound (optional).' })),
+      since: Type.Optional(Type.String({ description: 'Past YYYY-MM-DD (UTC midnight) or ISO timestamp with Z/offset, up to milliseconds (optional). Invalid and future bounds are errors.' })),
       session_id: Type.Optional(Type.String({ minLength: 1, pattern: '\\S', description: 'Non-blank exact canonical session ID (optional; do not guess a prefix). Omit this field for unrestricted session scope.' })),
       limit: Type.Optional(Type.Number({ description: 'Maximum results to return (default: 10, min: 1, max: 20).', minimum: 1, maximum: 20 })),
       snippetChars: Type.Optional(Type.Number({ description: `Maximum characters per result snippet (default: ${DEFAULT_LEGACY_SNIPPET_CHARS}, max: ${MAX_LEGACY_SNIPPET_CHARS}; never exceed 4000).`, minimum: 100, maximum: MAX_LEGACY_SNIPPET_CHARS })),
