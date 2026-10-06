@@ -20,6 +20,19 @@ function capLegacyOutput(text: string): { text: string; truncated: boolean } {
   return { text: `${text.slice(0, MAX_LEGACY_OUTPUT_CHARS - suffix.length)}${suffix}`, truncated: true };
 }
 
+/** Distinguish authorship from tool/service records without guessing non-user means assistant. */
+function legacyEntryLabel(result: SessionSearchResults[number]): string {
+  const tool = result.toolName ? ` (${result.toolName.replace(/[\r\n|]/g, ' ')})` : '';
+  if (result.kind === 'tool_result') return `🔧 Tool result${tool}`;
+  if (result.kind === 'tool_call') return `🔧 Tool call${tool}`;
+  if (result.toolName) return `🔧 Tool output${tool}`;
+  if (result.kind && result.kind !== 'message') return `⚙️ Service (${result.kind.replace(/[\r\n|]/g, ' ')})`;
+  if (result.role === 'user') return '👤 User';
+  if (result.role === 'assistant') return '🤖 Assistant';
+  if (result.role === 'system') return '⚙️ System';
+  return '⚙️ Service';
+}
+
 /** Format in the child so the parent only decodes the bounded public response. */
 export function formatLegacySearch(results: SessionSearchResults, totalMessages: number, query: string, requestedSnippetChars?: number): SessionSearchToolResult {
   if (totalMessages === 0 && !results.projectNotFound) {
@@ -42,7 +55,7 @@ export function formatLegacySearch(results: SessionSearchResults, totalMessages:
     const anchor = result.entryId
       ? `🔗 session_id=${result.sessionId} entry_id=${result.entryId}`
       : `🔗 session_id=${result.sessionId}`;
-    blocks.push(['---', `📅 ${date} | 📁 ${result.project} | ${result.role === 'user' ? '👤 User' : '🤖 Assistant'}`, anchor, snippet].join('\n'));
+    blocks.push(['---', `📅 ${date} | 📁 ${result.project} | ${legacyEntryLabel(result)}`, anchor, snippet].join('\n'));
   }
   const output = capLegacyOutput(blocks.join('\n\n').trim());
   return textResult(output.text, { success: true, count: results.length, truncatedCount, snippetChars, outputChars: output.text.length, outputTruncated: output.truncated, ...(results.partial ? { partial: true, partialReason: 'read_limit' } : {}) });

@@ -15,12 +15,12 @@ export interface SessionSearchExecutionOptions {
   signal?: AbortSignal;
   /** Internal execution deadline; not a model-controlled search parameter. */
   timeoutMs?: number;
-  onProgress?: () => void;
+  onProgress?: (phase?: 'waiting_for_coverage') => void;
 }
 
 interface WorkerError { name: string; message: string; code?: string }
 interface WorkerReply { type: 'result'; ok: boolean; result?: SessionSearchToolResult; error?: WorkerError }
-type WorkerMessage = WorkerReply | { type: 'progress' };
+type WorkerMessage = WorkerReply | { type: 'progress'; phase?: 'waiting_for_coverage' };
 
 /** Run one tool request in a separate process and reap it before settling. */
 export async function runSessionSearch(request: SessionSearchWorkerRequest, options: SessionSearchExecutionOptions = {}): Promise<SessionSearchToolResult> {
@@ -41,6 +41,7 @@ export async function runSessionSearch(request: SessionSearchWorkerRequest, opti
     let reply: WorkerReply | undefined;
     let failure: Error | undefined;
     let settled = false;
+    let waitingForCoverage = false;
     let stderr = '';
     child.stderr?.on('data', (chunk: Buffer) => { if (stderr.length < 4_096) stderr += chunk.toString('utf8').slice(0, 4_096 - stderr.length); });
     const stop = (error: Error) => {
@@ -50,13 +51,14 @@ export async function runSessionSearch(request: SessionSearchWorkerRequest, opti
       child.kill('SIGKILL');
     };
     const abort = () => stop(cancelled());
-    const timer = setTimeout(() => stop(Object.assign(new Error('Session search timed out; narrow the project, session, or query.'), { name: 'SessionSearchTimeoutError', code: 'SESSION_SEARCH_TIMEOUT' })), timeoutMs);
+    const timer = setTimeout(() => stop(Object.assign(new Error(waitingForCoverage ? 'Session search timed out while waiting for index coverage verification; retry after verification completes.' : 'Session search timed out; narrow the project, session, or query.'), { name: 'SessionSearchTimeoutError', code: 'SESSION_SEARCH_TIMEOUT' })), timeoutMs);
     timer.unref?.();
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     child.on('message', (value: WorkerMessage) => {
       if (value.type === 'progress') {
-        try { options.onProgress?.(); } catch (error) { stop(error instanceof Error ? error : new Error(String(error))); }
+        waitingForCoverage = value.phase === 'waiting_for_coverage';
+        try { options.onProgress?.(value.phase); } catch (error) { stop(error instanceof Error ? error : new Error(String(error))); }
       } else { reply = value; }
     });
     child.once('error', (error: Error) => { failure ??= error; });

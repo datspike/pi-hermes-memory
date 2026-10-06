@@ -22,6 +22,9 @@ export interface SessionSearchResult {
   snippet: string;
   /** Canonical logical entry identity when the search was validated against JSONL. */
   entryId?: string;
+  /** Canonical entry classification and bounded tool name for truthful legacy labels. */
+  kind?: string;
+  toolName?: string | null;
   /** Original SQLite character count, before the bounded payload projection. */
   contentChars?: number;
 }
@@ -103,8 +106,8 @@ const COMPACT_CANDIDATE_FIELDS = `m.rowid AS candidate_rowid, length(m.session_i
 
 function escapeLikePattern(text: string): string { return text.replace(/[\\%_]/g, '\\$&'); }
 
-function mapRows(rows: Array<{ session_id: string; entry_id?: string; project: string; role: string; content: string; timestamp: string; content_chars: number }>): SessionSearchResult[] {
-  return rows.map(row => ({ sessionId: row.session_id, project: row.project, role: row.role, content: row.content, timestamp: row.timestamp, snippet: row.content, ...(row.entry_id ? { entryId: row.entry_id } : {}), contentChars: row.content_chars }));
+function mapRows(rows: Array<{ session_id: string; entry_id?: string; project: string; role: string; kind?: string; tool_name?: string | null; content: string; timestamp: string; content_chars: number }>): SessionSearchResult[] {
+  return rows.map(row => ({ sessionId: row.session_id, project: row.project, role: row.role, content: row.content, timestamp: row.timestamp, snippet: row.content, ...(row.entry_id ? { entryId: row.entry_id } : {}), contentChars: row.content_chars, ...(row.kind ? { kind: row.kind } : {}), ...(row.tool_name ? { toolName: row.tool_name } : {}) }));
 }
 
 /** Budget compact key sizes before materializing exact keys through any SQLite adapter. */
@@ -132,7 +135,7 @@ function readSearchCandidates<T extends { session_id: string; entry_id?: string;
     const batch = candidates.slice(offset, offset + 64);
     const sameSizes = `length(m.session_id) <= wanted.session_chars${exactEntryIdentity ? ' AND m.entry_id IS NOT NULL AND length(m.entry_id) <= wanted.entry_chars' : ''}`;
     const fields = legacy
-      ? `${canonicalLegacy ? `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, ` : ''}substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, ${canonicalLegacy ? "'' AS content, 0 AS content_chars" : `substr(m.content, 1, ${MAX_SNIPPET_CHARS}) AS content, length(m.content) AS content_chars`}, substr(m.timestamp, 1, 200) AS timestamp`
+      ? `${canonicalLegacy ? `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, ` : ''}substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, substr(m.kind, 1, 200) AS kind, substr(m.tool_name, 1, 500) AS tool_name, ${canonicalLegacy ? "'' AS content, 0 AS content_chars" : `substr(m.content, 1, ${MAX_SNIPPET_CHARS}) AS content, length(m.content) AS content_chars`}, substr(m.timestamp, 1, 200) AS timestamp`
       : `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, substr(m.role, 1, 200) AS role, substr(m.kind, 1, 200) AS kind, substr(m.timestamp, 1, 200) AS timestamp`;
     // Recheck sizes in SQL: a concurrent index change must not bypass the first budget.
     const rows = db.prepare(`SELECT m.rowid AS candidate_rowid, CASE WHEN ${sameSizes} THEN m.session_id ELSE '' END AS session_id,
@@ -279,7 +282,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     // A canonical search cannot publish an ownerless row; reject it before sorting/over-fetch.
     if (options.sessionsDir) conditions.push("m.entry_id IS NOT NULL AND m.entry_id <> '' AND EXISTS (SELECT 1 FROM session_files owned WHERE owned.session_id = m.session_id)");
     let verifier: InstanceType<ReturnType<typeof getDatabaseCtor>> | undefined;
-    type LegacyRow = { candidate_rowid: number; session_id: string; entry_id?: string; oversized_identity: number; project: string; role: string; content: string; timestamp: string; content_chars: number };
+    type LegacyRow = { candidate_rowid: number; session_id: string; entry_id?: string; oversized_identity: number; project: string; role: string; kind?: string; tool_name?: string | null; content: string; timestamp: string; content_chars: number };
     const visible: LegacyRow[] = [];
     try {
       // Bound payloads inside SQLite: a row limit does not bound large messages,
@@ -378,7 +381,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
             if (isService && !options.includeService) continue;
             if (isTool && !options.includeToolOutput) continue;
             if (!entry.matchesQuery) continue;
-            visible.push({ ...row, project: session.project, role: entry.role ?? '', timestamp: entry.timestamp ?? '', content: entry.content, content_chars: entry.contentChars });
+            visible.push({ ...row, project: session.project, role: entry.role ?? '', kind: entry.kind, tool_name: entry.toolName, timestamp: entry.timestamp ?? '', content: entry.content, content_chars: entry.contentChars });
           } else visible.push(row);
           if (visible.length >= limit) break;
         }

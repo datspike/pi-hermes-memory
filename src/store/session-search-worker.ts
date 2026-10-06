@@ -25,7 +25,7 @@ function openReadOnly(dbPath: string): DatabaseLike {
 }
 
 /** Run the ordinary search implementation in an isolated runtime, preserving its filters. */
-export function executeSearchWorker(request: SessionSearchWorkerRequest): SessionSearchToolResult {
+export function executeSearchWorker(request: SessionSearchWorkerRequest, onReady?: () => void): SessionSearchToolResult {
   if (request.mode === 'anchors') return formatAnchorSearch(searchSessionAnchors(request.markdown, { sessionsDir: request.sessionsDir }));
   try { statSync(request.dbPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -48,8 +48,37 @@ export function executeSearchWorker(request: SessionSearchWorkerRequest): Sessio
   } as DatabaseManager;
   try {
     manager.assertSessionEvidenceAvailable();
+    onReady?.();
     if (request.mode === 'structured') return formatStructuredSearch(searchSessionEvidence(manager, request.query, request.options));
     const totalMessages = getIndexedMessageCount(manager);
     return formatLegacySearch(totalMessages || request.options.project ? searchSessions(manager, request.query, request.options) : [], totalMessages, request.query, request.snippetChars);
   } finally { db.close(); }
+}
+
+/** Wait only for ordinary coverage revalidation; repair work is never hidden or started here. */
+export async function executeSearchWorkerWhenReady(request: SessionSearchWorkerRequest, onProgress?: (phase?: 'waiting_for_coverage') => void): Promise<SessionSearchToolResult> {
+  let waiting = false;
+  let identity: { dev: number; ino: number } | undefined;
+  for (;;) {
+    if (identity && request.mode !== 'anchors') {
+      const current = statSync(request.dbPath);
+      if (current.dev !== identity.dev || current.ino !== identity.ino) throw new SessionEvidenceUnavailableError();
+    }
+    try { return executeSearchWorker(request, () => { if (waiting) { waiting = false; onProgress?.(); } }); } catch (error) {
+      if (!(error instanceof SessionEvidenceUnavailableError) || request.mode === 'anchors') throw error;
+      const current = statSync(request.dbPath);
+      identity ??= { dev: current.dev, ino: current.ino };
+      const db = openReadOnly(request.dbPath);
+      try {
+        const row = db.prepare("SELECT value FROM extension_metadata WHERE key = 'session_repair_state:v1'").get() as { value?: unknown } | undefined;
+        const state = parseSessionRepairState(row?.value);
+        const schema = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined;
+        if (state?.status === 'complete' && Number(schema?.user_version) === SESSION_REPAIR_VERSION) continue;
+        if (!state || state.phase !== 'coverage' || !['pending', 'running'].includes(state.status) || Number(schema?.user_version) !== SESSION_REPAIR_VERSION) throw error;
+      } catch { throw error; } finally { db.close(); }
+      if (!waiting) { waiting = true; onProgress?.('waiting_for_coverage'); }
+      // The parent's unchanged execution deadline and cancellation reap this child.
+      await new Promise<void>(resolve => setTimeout(resolve, 100));
+    }
+  }
 }

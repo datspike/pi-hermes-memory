@@ -25,9 +25,9 @@ process.once('message', async request => {
         },
       });
     }
-    const { executeSearchWorker } = await import('./session-search-worker.ts');
+    const { executeSearchWorkerWhenReady } = await import('./session-search-worker.ts');
     process.send({ type: 'progress' });
-    reply = { type: 'result', ok: true, result: executeSearchWorker(request) };
+    reply = { type: 'result', ok: true, result: await executeSearchWorkerWhenReady(request, phase => process.send({ type: 'progress', phase })) };
   } catch (error) {
     reply = { type: 'result', ok: false, error: { name: error?.name ?? 'Error', message: error?.message ?? String(error), code: error?.code } };
   }

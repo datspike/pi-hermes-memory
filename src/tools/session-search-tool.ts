@@ -25,7 +25,7 @@ function invalidRequest(message: string, error?: string): SessionSearchToolResul
   return { content: [{ type: 'text', text: message }], details: { success: false, message, ...(error ? { error } : {}) }, isError: true };
 }
 function executionOptions(options: SessionSearchToolOptions, signal?: AbortSignal, onUpdate?: AgentToolUpdateCallback): SessionSearchExecutionOptions {
-  return { signal, timeoutMs: options.timeoutMs, onProgress: () => onUpdate?.({ content: [{ type: 'text', text: 'Searching sessions…' }], details: { success: true, phase: 'searching' } }) };
+  return { signal, timeoutMs: options.timeoutMs, onProgress: phase => onUpdate?.({ content: [{ type: 'text', text: phase === 'waiting_for_coverage' ? 'Waiting for index coverage verification…' : 'Searching sessions…' }], details: { success: true, phase: phase ?? 'searching' } }) };
 }
 /** Check availability in the readonly child, never opening or repairing the managed DB here. */
 async function executeIndexedSearch(dbManager: DatabaseManager, request: IndexedRequest, options: SessionSearchExecutionOptions): Promise<SessionSearchToolResult> {
