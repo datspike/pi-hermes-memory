@@ -764,7 +764,7 @@ describe('session-indexer', () => {
       assert.strictEqual(dbManager.getStats().messages, 0);
     });
 
-    it('uses the live snapshot instead of reparsing a persisted file when entries are available', () => {
+    it('does not publish snapshot rows when the persisted header has a different session identity', () => {
       const filePath = path.join(tmpDir, 'sessions', 'project', 'stale-session.jsonl');
       writeSessionFile(filePath);
       const snapshot = {
@@ -781,9 +781,8 @@ describe('session-indexer', () => {
 
       const result = indexLiveSession(dbManager, snapshot);
 
-      assert.ok(result);
-      assert.strictEqual(result.sessionId, 'live-session-1');
-      assert.strictEqual(result.messagesIndexed, 1);
+      assert.equal(result, null);
+      assert.equal(dbManager.getDb().prepare('SELECT 1 FROM sessions WHERE id = ?').get('live-session-1'), undefined);
       assert.equal(dbManager.getDb().prepare('SELECT 1 FROM sessions WHERE id = ?').get('file-session-1'), undefined);
     });
 

@@ -344,3 +344,24 @@ test('oversized anchors fail explicitly in the child and do not poison later req
     assert.ok(Buffer.byteLength(JSON.stringify({ type: 'result', ok: true, result }), 'utf8') <= 1024 * 1024);
   } finally { clearInterval(timer); fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('public project diagnostics survive an initialized empty index in both variants', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-empty-project-'));
+  const manager = new DatabaseManager(root);
+  manager.getDb();
+  try {
+    for (const variant of ['legacy', 'structured'] as const) {
+      let tool: any;
+      registerSessionSearchTool({registerTool: (definition: any) => {tool = definition;}} as any, manager, {variant}, {sessionsDir:root});
+      const result = await tool.execute('empty-project', {query:'needle',project:'missing-project'}, new AbortController().signal);
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.success, true); assert.equal(result.details.projectNotFound, true);
+      assert.match(result.content[0].text, /conversation cwd/i);
+      const unfiltered = await tool.execute('empty-unfiltered', {query:'needle'}, new AbortController().signal);
+      if (variant === 'legacy') {
+        assert.equal(unfiltered.isError, true); assert.equal(unfiltered.details.success, false);
+        assert.match(unfiltered.content[0].text, /No sessions indexed yet/);
+      } else assert.equal(unfiltered.details.success, true);
+    }
+  } finally {manager.close();fs.rmSync(root,{recursive:true,force:true});}
+});

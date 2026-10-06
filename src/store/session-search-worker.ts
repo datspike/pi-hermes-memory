@@ -50,6 +50,6 @@ export function executeSearchWorker(request: SessionSearchWorkerRequest): Sessio
     manager.assertSessionEvidenceAvailable();
     if (request.mode === 'structured') return formatStructuredSearch(searchSessionEvidence(manager, request.query, request.options));
     const totalMessages = getIndexedMessageCount(manager);
-    return formatLegacySearch(totalMessages ? searchSessions(manager, request.query, request.options) : [], totalMessages, request.query, request.snippetChars);
+    return formatLegacySearch(totalMessages || request.options.project ? searchSessions(manager, request.query, request.options) : [], totalMessages, request.query, request.snippetChars);
   } finally { db.close(); }
 }

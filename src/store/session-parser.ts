@@ -267,18 +267,22 @@ function parseRawSession(content: string): ParsedSession | null {
   let name: string | null = null;
   let title: string | null = null;
   let metadata: Record<string, unknown> | null = null;
+  let headerSeen = false;
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
     if (line.includes('\0')) { nulLines++; continue; }
     try {
       const entry = JSON.parse(line) as JsonlEntry;
       if (!entry || typeof entry !== 'object') { malformedLines++; continue; }
-      if (entry.type === 'session' && typeof entry.id === 'string') {
-        sessionId = entry.id;
-        cwd = typeof entry.cwd === 'string' ? entry.cwd : cwd;
-        startedAt = typeof entry.timestamp === 'string' ? entry.timestamp : startedAt;
+      // Pi SessionManager.getHeader() uses the first session header.
+      const firstHeader = entry.type === 'session' && !headerSeen;
+      if (firstHeader) {
+        headerSeen = true;
+        sessionId = typeof entry.id === 'string' ? entry.id : null;
+        cwd = typeof entry.cwd === 'string' ? entry.cwd : null;
+        startedAt = typeof entry.timestamp === 'string' ? entry.timestamp : null;
       }
-      if (entry.type === 'session_info' || entry.type === 'session') {
+      if (entry.type === 'session_info' || firstHeader) {
         if (entry.type === 'session_info') metadata = { ...entry };
         if (typeof entry.name === 'string' && entry.name.trim()) name = entry.name;
         else if (entry.name === '') name = null;
@@ -339,7 +343,7 @@ const SESSION_SEARCH_MAX_ENTRIES = 100_000;
 
 export class SessionSearchReadLimitError extends Error {
   constructor() {
-    super('Session search read limit reached; narrow the project, session, or date filters.');
+    super('Session search read limit reached. Use limit: 3, an exact session_id, or a recent since date. project is the conversation cwd, not the discussed repository; remove an uncertain project filter.');
     this.name = 'SessionSearchReadLimitError';
   }
 }
@@ -347,6 +351,16 @@ export class SessionSearchReadLimitError extends Error {
 export interface SessionSearchReadOptions {
   sessionId: string;
   entryIds?: ReadonlySet<string>;
+  /** Retain a complete, payload-free graph for a bounded get context window. */
+  retainAllEntries?: boolean;
+  /** Aggregate retained graph/display bytes across aliases and passes. */
+  retainedBudget?: { remainingBytes: number };
+  /** Header-only discovery never treats a filename as identity. */
+  headerOnly?: boolean;
+  /** Reject a different canonical project before reading its payload. */
+  project?: string;
+  /** Expand a bounded entry window only after accepting the source header. */
+  prepareEntries?: () => void;
   /** Shared by all canonical reads in one search, including fallback queries. */
   budget: { remainingBytes: number };
   /** Reduce a matched entry before retaining it; classification uses its full payload. */
@@ -355,10 +369,13 @@ export interface SessionSearchReadOptions {
 
 /** Read canonical metadata and requested entries without retaining the whole transcript. */
 export function parseSessionFileForSearch(filePath: string, options: SessionSearchReadOptions): ParsedSession | null {
+  const retainedBudget = options.retainedBudget ?? (options.retainAllEntries ? { remainingBytes: 8 * 1024 * 1024 } : undefined);
   const fd = fs.openSync(filePath, 'r');
   try {
     const initial = fs.fstatSync(fd);
-    if (initial.size > options.budget.remainingBytes) throw new SessionSearchReadLimitError();
+    const startingBudget = options.budget.remainingBytes;
+    let consumedBytes = 0;
+    if (!options.headerOnly && !options.project && initial.size > startingBudget) throw new SessionSearchReadLimitError();
     const chunk = Buffer.allocUnsafe(64 * 1024);
     let fragments: Buffer[] = [];
     let lineBytes = 0;
@@ -370,9 +387,17 @@ export function parseSessionFileForSearch(filePath: string, options: SessionSear
     let startedAt: string | null = null;
     let name: string | null = null;
     let title: string | null = null;
+    let headerSeen = false;
+    let stopAfterHeader = false;
     const identityByRawId = new Map<string, string | null>();
     const entries = new Map<string, ParsedEntry>();
-    const wantsSynthetic = [...(options.entryIds ?? [])].some(value => value.startsWith('syn:v1:'));
+    const allEntries: ParsedEntry[] = [];
+    const chargeRetained = (value: unknown): void => {
+      if (!retainedBudget) return;
+      retainedBudget.remainingBytes -= Buffer.byteLength(JSON.stringify(value), 'utf8');
+      if (retainedBudget.remainingBytes < 0) throw new SessionSearchReadLimitError();
+    };
+    let wantsSynthetic = [...(options.entryIds ?? [])].some(value => value.startsWith('syn:v1:'));
     const consume = (line: string): void => {
       if (!line.trim()) return;
       if (line.includes('\0')) { nulLines++; return; }
@@ -380,40 +405,60 @@ export function parseSessionFileForSearch(filePath: string, options: SessionSear
       try { raw = JSON.parse(line) as JsonlEntry; } catch { malformedLines++; return; }
       if (!raw || typeof raw !== 'object') { malformedLines++; return; }
       if (++ordinal > SESSION_SEARCH_MAX_ENTRIES) throw new SessionSearchReadLimitError();
-      if (raw.type === 'session' && typeof raw.id === 'string') {
-        id = raw.id;
-        cwd = typeof raw.cwd === 'string' ? raw.cwd : cwd;
-        startedAt = typeof raw.timestamp === 'string' ? raw.timestamp : startedAt;
+      const firstHeader = raw.type === 'session' && !headerSeen;
+      if (firstHeader) {
+        headerSeen = true;
+        id = typeof raw.id === 'string' ? raw.id : null;
+        cwd = typeof raw.cwd === 'string' ? raw.cwd : null;
+        startedAt = typeof raw.timestamp === 'string' ? raw.timestamp : null;
+        stopAfterHeader = Boolean(options.headerOnly || !id || !cwd || !startedAt || id !== options.sessionId || (options.project && (path.basename(cwd) || cwd) !== options.project));
+        if (!stopAfterHeader && initial.size > startingBudget) throw new SessionSearchReadLimitError();
+        if (!stopAfterHeader) {
+          options.prepareEntries?.();
+          wantsSynthetic = [...(options.entryIds ?? [])].some(value => value.startsWith('syn:v1:'));
+        }
       }
-      if (raw.type === 'session_info' || raw.type === 'session') {
+      if (raw.type === 'session_info' || firstHeader) {
         if (typeof raw.name === 'string' && raw.name.trim()) name = raw.name;
         else if (raw.name === '') name = null;
         if (typeof raw.title === 'string' && raw.title.trim()) title = raw.title;
         else if (raw.title === '') title = null;
       }
+      if (stopAfterHeader) return;
       const nativeId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : null;
       // Native parent identities are unchanged. Only synthetic identities need
       // the ordinal map when the requested evidence contains a synthetic ID.
-      if (!options.entryIds?.has(nativeId ?? '') && !(wantsSynthetic && !nativeId)) return;
+      if (!options.retainAllEntries && !options.entryIds?.has(nativeId ?? '') && !(wantsSynthetic && !nativeId)) return;
       const entry = parseEntry(raw, options.sessionId, ordinal - 1, identityByRawId);
-      if (!entry.entryId || !options.entryIds?.has(entry.entryId)) return;
-      if (entries.has(entry.entryId)) {
+      if (!options.retainAllEntries && (!entry.entryId || !options.entryIds?.has(entry.entryId))) return;
+      if (!options.retainAllEntries && entry.entryId && entries.has(entry.entryId)) {
         entries.get(entry.entryId)!.identityStatus = 'ambiguous';
         return;
       }
       const retained = options.transformEntry?.(entry) ?? { ...entry, content: entry.content.slice(0, 4_000) };
       // A sliced string may retain the full parsed body; copy only the bounded UTF-16 units.
       const content = Buffer.from(retained.content.slice(0, 8_000), 'utf16le').toString('utf16le');
-      entries.set(entry.entryId, { ...retained, content });
+      const detached = { ...retained, content };
+      chargeRetained(detached);
+      if (options.retainAllEntries) allEntries.push(detached);
+      else if (entry.entryId) entries.set(entry.entryId, detached);
     };
     const addFragment = (part: Buffer): void => {
       lineBytes += part.length;
       if (lineBytes > SESSION_SEARCH_MAX_LINE_BYTES) throw new SessionSearchReadLimitError();
       if (part.length) fragments.push(Buffer.from(part));
     };
-    for (;;) {
-      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+    scan: for (;;) {
+      if (options.budget.remainingBytes <= 0) {
+        // EOF is known from the opened file's size; do not overshoot a budget
+        // while probing the next foreign header.
+        if (consumedBytes === initial.size) break;
+        throw new SessionSearchReadLimitError();
+      }
+      const window = !headerSeen && (options.headerOnly || options.project) ? 4 * 1024 : chunk.length;
+      const read = fs.readSync(fd, chunk, 0, Math.min(window, options.budget.remainingBytes), null);
       if (!read) break;
+      consumedBytes += read;
       options.budget.remainingBytes -= read;
       if (options.budget.remainingBytes < 0) throw new SessionSearchReadLimitError();
       let start = 0;
@@ -424,16 +469,27 @@ export function parseSessionFileForSearch(filePath: string, options: SessionSear
         fragments = [];
         lineBytes = 0;
         start = end + 1;
+        if (stopAfterHeader) break scan;
       }
       addFragment(chunk.subarray(start, read));
     }
-    if (lineBytes) consume(Buffer.concat(fragments, lineBytes).toString('utf8'));
+    if (lineBytes && !stopAfterHeader) consume(Buffer.concat(fragments, lineBytes).toString('utf8'));
     const final = fs.fstatSync(fd);
-    if (final.size !== initial.size || final.mtimeMs !== initial.mtimeMs) return null;
-    if (id !== options.sessionId || !cwd || !startedAt) return null;
+    if (final.size !== initial.size || final.mtimeMs !== initial.mtimeMs || (!stopAfterHeader && consumedBytes !== initial.size)) return null;
+    if (!id || (!options.headerOnly && id !== options.sessionId) || !cwd || !startedAt) return null;
+    chargeRetained({ id, cwd, name, title, startedAt });
+    if (options.retainAllEntries) {
+      const counts = new Map<string, number>();
+      for (const entry of allEntries) if (entry.entryId) counts.set(entry.entryId, (counts.get(entry.entryId) ?? 0) + 1);
+      for (const entry of allEntries) if (entry.entryId && counts.get(entry.entryId)! > 1) {
+        entry.identityStatus = 'ambiguous';
+        entry.diagnostics = [...(entry.diagnostics ?? []), 'duplicate-entry-id'];
+        chargeRetained('duplicate-entry-id');
+      }
+    }
     return {
-      id, project: path.basename(cwd) || cwd, cwd, startedAt, endedAt: null, name, title, metadata: null,
-      entries: [...entries.values()], messages: [],
+      id, project: path.basename(cwd) || cwd, cwd, startedAt, endedAt: null, name, title, metadata: stopAfterHeader ? { canonicalHeaderOnly: true } : null,
+      entries: options.retainAllEntries ? allEntries : [...entries.values()], messages: [],
       diagnostics: { malformedLines, nulLines, duplicateStructuralIds: [], cycles: [], orphanParents: [], multipleDescendantLeaves: [], messages: [] },
     };
   } finally { fs.closeSync(fd); }

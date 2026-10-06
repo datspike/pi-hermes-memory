@@ -201,7 +201,7 @@ describe('session_get', () => {
         const stat = originalFstat(fd, options);
         if (!options?.bigint && stat.isFile()) {
           overflowInjected = true;
-          return { ...stat, size: Number(stat.size) + 1 };
+          return { ...stat, size: 512 * 1024 * 1024 + 1 };
         }
         return stat;
       }) as typeof fs.fstatSync;

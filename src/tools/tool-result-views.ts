@@ -84,7 +84,8 @@ export function searchResultView(result: unknown): SharedOutputView {
   const data = resultData(result);
   if (!data || data.success === false) return base;
   if (typeof data.count === "number") {
-    return { ...base, summary: data.count === 1 ? "Found 1 result" : `Found ${data.count} results` };
+    const found = data.count === 1 ? "Found 1 result" : `Found ${data.count} results`;
+    return { ...base, summary: data.partial === true ? `${found} · incomplete search` : data.projectNotFound === true ? "No canonical project scope · adjust project" : found };
   }
   return base;
 }

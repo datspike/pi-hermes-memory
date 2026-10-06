@@ -4,7 +4,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { DatabaseManager } from '../store/db.js';
 import { canonicalSessionOwners, closePinnedSessionRoot, containedCanonicalPath, openPinnedSessionRoot, readContainedSessionFile, removeMissingCanonicalFile } from '../store/session-indexer.js';
-import { getSessionFiles, parseSessionFile, SessionFileTooLargeError, SessionSearchReadLimitError, SESSION_SEARCH_MAX_SCAN_BYTES, type ParsedEntry, type ParsedSession } from '../store/session-parser.js';
+import { getSessionFiles, parseSessionFileForSearch, SessionFileTooLargeError, SessionSearchReadLimitError, SESSION_SEARCH_MAX_SCAN_BYTES, type ParsedEntry, type ParsedSession } from '../store/session-parser.js';
 
 export const SESSION_GET_MAX_CONTEXT = 10;
 export const SESSION_GET_MAX_OUTPUT_BYTES = 50 * 1024;
@@ -204,10 +204,9 @@ function graphContext(session: ParsedSession, targetId: string, before: number, 
 
 interface CanonicalSessionLookup { session: ParsedSession | null; error?: 'transcript_ambiguous' | 'transcript_changed' | 'transcript_read_limit'; }
 
-function discoverUnregisteredSession(sessionId: string, sessionsDir: string): CanonicalSessionLookup {
+function discoverUnregisteredSession(sessionId: string, sessionsDir: string, read: (descriptor: string) => ParsedSession | null, budget: { remainingBytes: number }): CanonicalSessionLookup {
   const pinned = openPinnedSessionRoot(sessionsDir);
   if (!pinned) return { session: null };
-  const budget = { remainingBytes: SESSION_SEARCH_MAX_SCAN_BYTES };
   try {
     const files = [...new Set(getSessionFiles(pinned.root))];
     const preferred = path.join(pinned.root, `${sessionId}.jsonl`);
@@ -215,18 +214,20 @@ function discoverUnregisteredSession(sessionId: string, sessionsDir: string): Ca
     const candidates = files.includes(preferred) ? [preferred, ...files.filter(file => file !== preferred)] : files;
     const matches: ParsedSession[] = [];
     for (const file of candidates) {
-      let requestedSessionRead = false;
-      const parsed = readContainedSessionFile(pinned.root, file, descriptor => {
-        // Charge only metadata from the validated, descriptor-relative source.
-        const stat = fs.statSync(descriptor);
-        if (stat.size > budget.remainingBytes) throw new SessionSearchReadLimitError();
-        budget.remainingBytes -= stat.size;
-        const candidate = parseSessionFile(descriptor, stat.size);
-        requestedSessionRead = candidate?.id === sessionId;
+      let requestedHeaderRead = false;
+      const header = readContainedSessionFile(pinned.root, file, descriptor => {
+        const candidate = parseSessionFileForSearch(descriptor, { sessionId, headerOnly: true, budget });
+        requestedHeaderRead = candidate?.id === sessionId;
         return candidate;
       }, pinned);
-      // A parsed target discarded by the descriptor fence changed during this read.
-      if (!parsed && requestedSessionRead) return { session: null, error: 'transcript_changed' };
+      if (!header && requestedHeaderRead) return { session: null, error: 'transcript_changed' };
+      if (header?.id !== sessionId) continue;
+      // Identity is established by Pi's leading header, not the candidate name.
+      // A second contained source is ambiguous even before loading its payload.
+      if (matches.length) return { session: null, error: 'transcript_ambiguous' };
+      const parsed = readContainedSessionFile(pinned.root, file, read, pinned);
+      // The accepted target header disappeared or changed during bounded parsing.
+      if (!parsed) return { session: null, error: 'transcript_changed' };
       if (parsed?.id !== sessionId) continue;
       matches.push(parsed);
       if (matches.length > 1) return { session: null, error: 'transcript_ambiguous' };
@@ -235,9 +236,9 @@ function discoverUnregisteredSession(sessionId: string, sessionsDir: string): Ca
   } finally { closePinnedSessionRoot(pinned); }
 }
 
-function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, sessionsDir?: string): CanonicalSessionLookup {
+function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, sessionsDir: string | undefined, read: (descriptor: string) => ParsedSession | null, budget: { remainingBytes: number }): CanonicalSessionLookup {
   const db = dbManager.getDb();
-  const owners = canonicalSessionOwners(db, sessionId, sessionsDir);
+  const owners = canonicalSessionOwners(db, sessionId, sessionsDir, read);
   // Remove rows that disappeared or became invalid, but never follow an
   // unindexed `${sessionId}.jsonl` fallback or an outside-root symlink.
   const rows = db.prepare('SELECT path FROM session_files WHERE session_id = ?').all(sessionId) as Array<{ path: string }>;
@@ -248,7 +249,7 @@ function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, ses
   if (containedExisting) return { session: null, error: 'transcript_changed' };
   if (sessionsDir) {
     try {
-      const discovered = discoverUnregisteredSession(sessionId, sessionsDir);
+      const discovered = discoverUnregisteredSession(sessionId, sessionsDir, read, budget);
       if (discovered.session || discovered.error) return discovered;
     } catch (error) {
       if (error instanceof SessionSearchReadLimitError || error instanceof SessionFileTooLargeError) return { session: null, error: 'transcript_read_limit' };
@@ -256,6 +257,33 @@ function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, ses
     }
   }
   return { session: null };
+}
+
+/** Retain only a bounded graph and the requested display payload, not the full JSONL. */
+function readSessionForGet(descriptor: string, sessionId: string, entryId: string | undefined, view: SessionGetView, before: number, after: number, budget: { remainingBytes: number }, retainedBudget: { remainingBytes: number }): ParsedSession | null {
+  const projectPayload = (entry: ParsedEntry): ParsedEntry => ({ ...entry, content: truncateUtf8(entry.content, view === 'outline' || !entryId ? 320 : MAX_ENTRY_CONTENT_BYTES) });
+  if (view === 'metadata' || (view === 'context' && entryId && !before && !after)) {
+    return parseSessionFileForSearch(descriptor, { sessionId, entryIds: new Set(entryId && view !== 'metadata' ? [entryId] : []), budget, retainedBudget, transformEntry: projectPayload });
+  }
+  const session = parseSessionFileForSearch(descriptor, {
+    sessionId, retainAllEntries: true, budget, retainedBudget,
+    transformEntry: entry => ({ id: entry.id, entryId: entry.entryId, identityStatus: entry.identityStatus, kind: entry.kind, parentId: entry.parentId, parentEntryId: entry.parentEntryId, ordinal: entry.ordinal, role: entry.role, timestamp: entry.timestamp, diagnostics: entry.diagnostics, content: '' }),
+  });
+  if (!session || session.id !== sessionId) return null;
+  let wanted: ParsedEntry[];
+  if (view === 'outline' || !entryId) wanted = messageEntries(session).slice(0, MAX_OUTLINE_ENTRIES);
+  else {
+    const target = messageEntries(session).find(entry => entry.entryId === entryId);
+    const context = target && graphContext(session, entryId, before, after);
+    if (!target || !context) return session;
+    wanted = [...context.before, target, ...context.after];
+  }
+  if (!wanted.length) return session;
+  const payload = parseSessionFileForSearch(descriptor, { sessionId, entryIds: new Set(wanted.map(entry => entry.entryId!)), budget, retainedBudget, transformEntry: projectPayload });
+  if (!payload || payload.id !== sessionId) return null;
+  const byId = new Map(payload.entries?.map(entry => [entry.entryId, entry]));
+  session.entries = session.entries?.map(entry => byId.get(entry.entryId) ?? entry);
+  return session;
 }
 
 /** Register exact, canonical, branch-aware session evidence access. */
@@ -289,7 +317,10 @@ export function registerSessionGetTool(pi: ExtensionAPI, dbManager: DatabaseMana
       const before = Math.min(Math.max(Number.isFinite(args.before) ? Math.floor(args.before as number) : 0, 0), SESSION_GET_MAX_CONTEXT);
       const after = Math.min(Math.max(Number.isFinite(args.after) ? Math.floor(args.after as number) : 0, 0), SESSION_GET_MAX_CONTEXT);
       let lookup: CanonicalSessionLookup;
-      try { lookup = findCanonicalSession(dbManager, args.session_id, options.sessionsDir); }
+      const budget = { remainingBytes: SESSION_SEARCH_MAX_SCAN_BYTES };
+      const retainedBudget = { remainingBytes: 8 * 1024 * 1024 };
+      const read = (descriptor: string) => readSessionForGet(descriptor, args.session_id, args.entry_id, args.view ?? 'context', before, after, budget, retainedBudget);
+      try { lookup = findCanonicalSession(dbManager, args.session_id, options.sessionsDir, read, budget); }
       catch (error) {
         if (error instanceof SessionSearchReadLimitError) return compactError('transcript_read_limit');
         return compactError('transcript_unavailable');

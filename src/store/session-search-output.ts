@@ -1,4 +1,4 @@
-import type { SessionSearchResult, SessionSearchEvidenceOutcome } from './session-search.js';
+import type { SessionSearchResults, SessionSearchEvidenceOutcome } from './session-search.js';
 import { SESSION_SEARCH_EVIDENCE_MAX_BYTES } from './session-search.js';
 import type { SessionAnchorSearchResult } from './session-anchor-search.js';
 
@@ -11,6 +11,8 @@ const textResult = (text: string, details: Record<string, unknown>): SessionSear
   content: [{ type: 'text', text }], details, ...(details.success === false ? { isError: true } : {}),
 });
 const MAX_LEGACY_OUTPUT_CHARS = 50 * 1024;
+const PROJECT_SCOPE_MESSAGE = 'No readable contained registered session header matched this project filter. project refers to the conversation cwd, not the repository discussed in its messages. Remove an uncertain project filter and use a narrow query or exact session_id.';
+const PARTIAL_SEARCH_MESSAGE = 'Search incomplete: the read limit was reached. These entries are canonically verified, but other matches may exist. Do not infer absence or the newest discussion across the whole archive. Narrow the query, use a session_id, or lower limit to 3.';
 
 function capLegacyOutput(text: string): { text: string; truncated: boolean } {
   if (text.length <= MAX_LEGACY_OUTPUT_CHARS) return { text, truncated: false };
@@ -19,17 +21,17 @@ function capLegacyOutput(text: string): { text: string; truncated: boolean } {
 }
 
 /** Format in the child so the parent only decodes the bounded public response. */
-export function formatLegacySearch(results: SessionSearchResult[], totalMessages: number, query: string, requestedSnippetChars?: number): SessionSearchToolResult {
-  if (totalMessages === 0) {
+export function formatLegacySearch(results: SessionSearchResults, totalMessages: number, query: string, requestedSnippetChars?: number): SessionSearchToolResult {
+  if (totalMessages === 0 && !results.projectNotFound) {
     const message = 'No sessions indexed yet. Run /memory-index-sessions to import past sessions.';
     return textResult(message, { success: false, message });
   }
   if (!results.length) {
-    const output = capLegacyOutput('No results found. Try a different search term or broader query.');
-    return textResult(output.text, { success: true, count: 0, message: output.text, outputChars: output.text.length, outputTruncated: output.truncated });
+    const output = capLegacyOutput(results.projectNotFound ? PROJECT_SCOPE_MESSAGE : 'No results found. Try a different search term or broader query.');
+    return textResult(output.text, { success: true, count: 0, message: output.text, outputChars: output.text.length, outputTruncated: output.truncated, ...(results.projectNotFound ? { projectNotFound: true } : {}) });
   }
   const snippetChars = Math.min(Math.max(Number.isFinite(requestedSnippetChars) ? Math.floor(requestedSnippetChars!) : 1_200, 100), 4_000);
-  const blocks = [`Found ${results.length} results for "${query}":`];
+  const blocks = [...(results.partial ? [PARTIAL_SEARCH_MESSAGE] : []), `Found ${results.length} results for "${query}":`];
   let truncatedCount = 0;
   for (const result of results) {
     const date = new Date(result.timestamp).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
@@ -43,7 +45,7 @@ export function formatLegacySearch(results: SessionSearchResult[], totalMessages
     blocks.push(['---', `📅 ${date} | 📁 ${result.project} | ${result.role === 'user' ? '👤 User' : '🤖 Assistant'}`, anchor, snippet].join('\n'));
   }
   const output = capLegacyOutput(blocks.join('\n\n').trim());
-  return textResult(output.text, { success: true, count: results.length, truncatedCount, snippetChars, outputChars: output.text.length, outputTruncated: output.truncated });
+  return textResult(output.text, { success: true, count: results.length, truncatedCount, snippetChars, outputChars: output.text.length, outputTruncated: output.truncated, ...(results.partial ? { partial: true, partialReason: 'read_limit' } : {}) });
 }
 
 function structuredResponseLimitError(): Error {
@@ -66,7 +68,7 @@ export function formatStructuredSearch(outcome: SessionSearchEvidenceOutcome): S
     role: e.role, kind: e.kind, tool: e.tool, tool_call_id: e.tool_call_id, timestamp: e.timestamp, snippet: e.snippet,
     score: e.score, score_mode: e.scoreMode, anchor: e.anchor,
   }));
-  let output = '';
+  let output = outcome.partial && outcome.results.length ? JSON.stringify({ type: 'search_status', partial: true, reason: 'read_limit', message: PARTIAL_SEARCH_MESSAGE }) : '';
   let count = 0;
   for (const line of lines) {
     const next = output ? `${output}\n${line}` : line;
@@ -76,8 +78,11 @@ export function formatStructuredSearch(outcome: SessionSearchEvidenceOutcome): S
     }
     output = next; count++;
   }
-  return textResult(output || 'No results found.', {
-    success: true, count, outputBytes: Buffer.byteLength(output, 'utf8'), outputTruncated: count < lines.length,
+  const text = output || (outcome.projectNotFound ? PROJECT_SCOPE_MESSAGE : 'No results found.');
+  return textResult(text, {
+    success: true, count, outputBytes: Buffer.byteLength(text, 'utf8'), outputTruncated: count < lines.length,
+    ...(outcome.partial && count ? { partial: true, partialReason: 'read_limit' } : {}),
+    ...(outcome.projectNotFound ? { projectNotFound: true } : {}),
     sessionIds: [...new Set(outcome.results.slice(0, count).map(e => e.sessionId))],
   });
 }

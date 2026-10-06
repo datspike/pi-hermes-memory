@@ -672,6 +672,14 @@ function indexLiveSessionOnce(dbManager: DatabaseManager, sessionManager: Sessio
   if (liveEntries.length > 0) {
     const header = sessionManager.getHeader();
     if (header?.id) {
+      const liveFile = sessionManager.getSessionFile?.();
+      const contained = liveFile && (sessionsDir ? containedCanonicalPath(sessionsDir, liveFile) : canonicalPath(liveFile));
+      // Snapshot rows alone cannot be published as canonical history. Register
+      // the persisted source through the ordinary fenced full-file index path.
+      if (liveFile && !contained) return null;
+      if (contained && !dbManager.getDb().prepare('SELECT 1 FROM session_files WHERE path = ? AND session_id = ?').get(contained, header.id)) {
+        return indexPersistedLiveSessionOnce(dbManager, sessionManager, sessionsDir, header.id);
+      }
       const cursor = getIndexedLiveCursor(dbManager, header.id);
       if (cursor) {
         const cursorIndex = liveEntries.findIndex((entry) => liveEntryId(entry) === cursor.entry_id);
