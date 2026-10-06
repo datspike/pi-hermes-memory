@@ -268,6 +268,40 @@ describe('session-parser', () => {
       assert.strictEqual(result.length, 1);
       assert.ok(result[0].includes('session1.jsonl'));
     });
+    it('does not enumerate an external directory through a project symlink', () => {
+      const sessions = path.join(tmpDir, 'sessions');
+      const external = path.join(tmpDir, 'external');
+      fs.mkdirSync(sessions);
+      fs.mkdirSync(external);
+      fs.writeFileSync(path.join(external, 'outside.jsonl'), '{}');
+      const alias = path.join(sessions, 'external-alias');
+      fs.symlinkSync(external, alias, 'dir');
+      const original = fs.readdirSync;
+      const externalReads: string[] = [];
+      try {
+        fs.readdirSync = ((dir: any, options?: any) => {
+          if (dir === external || dir === alias) externalReads.push(dir);
+          return original(dir, options);
+        }) as typeof fs.readdirSync;
+        assert.deepStrictEqual(getSessionFiles(sessions), []);
+        assert.deepStrictEqual(getSessionFiles(sessions, 'external-alias'), []);
+        assert.deepStrictEqual(externalReads, []);
+      } finally { fs.readdirSync = original; }
+    });
+
+    it('preserves contained file, directory and root aliases', () => {
+      const sessions = path.join(tmpDir, 'sessions');
+      const project = path.join(sessions, 'project');
+      fs.mkdirSync(project, { recursive: true });
+      const file = path.join(project, 'session.jsonl');
+      fs.writeFileSync(file, '{}');
+      fs.symlinkSync(file, path.join(sessions, 'file-alias.jsonl'));
+      fs.symlinkSync(project, path.join(sessions, 'directory-alias'), 'dir');
+      const rootAlias = path.join(tmpDir, 'root-alias');
+      fs.symlinkSync(sessions, rootAlias, 'dir');
+      assert.ok(getSessionFiles(rootAlias).includes(file));
+      assert.deepStrictEqual(getSessionFiles(rootAlias, 'directory-alias'), [file]);
+    });
   });
 
   describe('decodeProjectDir', () => {

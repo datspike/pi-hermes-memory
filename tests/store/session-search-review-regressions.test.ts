@@ -34,6 +34,18 @@ describe('canonical search review regressions', () => {
     const execute = (options: SessionSearchEvidenceOptions) => variant === 'legacy'
       ? searchSessions(manager, 'needle', { sessionsDir: dir, ...options })
       : searchSessionEvidence(manager, 'needle', { sessionsDir: dir, ...options }).results;
+    it(`${variant} rejects explicit blank session filters in the direct store API`, () => {
+      for (const sessionId of ['', '   ', '\t\n']) {
+        assert.throws(() => execute({ sessionId }), { code: 'INVALID_SESSION_ID' });
+        if (variant === 'legacy') {
+          assert.throws(() => searchSessions(manager, 'needle', { sessionId }), { code: 'INVALID_SESSION_ID' });
+        }
+      }
+      assert.equal(execute({}).length, 1);
+      assert.equal(execute({ sessionId: undefined }).length, 1);
+      assert.equal(execute({ sessionId: header.id }).length, 1);
+      assert.equal(execute({ sessionId: 'missing-session' }).length, 0);
+    });
     it(`${variant} finds a newly matching canonical project without reindexing`, () => {
       write({ ...header, cwd: '/new-project' });
       assert.equal(execute({ project: 'new-project' }).length, 1);
@@ -60,7 +72,7 @@ describe('canonical search review regressions', () => {
       const results = variant === 'legacy' ? searchSessions(manager, 'the', options) : searchSessionEvidence(manager, 'the', options).results;
       assert.equal(results.length, 1);
     });
-    it(`${variant} fails explicitly rather than hiding scoped hits beyond its candidate window`, () => {
+    it(`${variant} continues past fresh global matches to find a scoped canonical hit`, () => {
       for (let i = 0; i < 20; i += 1) {
         const id = `foreign-${i}`;
         const foreignFile = path.join(dir, `${id}.jsonl`);
@@ -73,7 +85,9 @@ describe('canonical search review regressions', () => {
         upsertSessionFileMetadata(manager, foreignFile, id);
       }
       write({ ...header, cwd: '/new-project' });
-      assert.throws(() => execute({ project: 'new-project', limit: 1 }), SessionSearchReadLimitError);
+      const results = execute({ project: 'new-project', limit: 1 });
+      assert.equal(results.length, 1);
+      assert.equal(variant === 'legacy' ? results[0].sessionId : results[0].sessionId, 'review-session');
     });
   }
   it('indexed-only legacy callers retain SQL project, role and date filtering', () => {
@@ -259,7 +273,7 @@ describe('canonical search review regressions', () => {
     assert.equal(canonicalSessionOwners(db, header.id, dir)[0].path, expected);
     assert.equal(search()[0].snippet, `needle ${path.basename(expected)}`);
   });
-  it('does not let excluded canonical candidates starve a later visible structured hit', () => {
+  it('returns an intentional empty default result when every canonical hit is tool output', () => {
     for (let i = 0; i < 20; i += 1) {
       const id = `tool-${i}`;
       const toolFile = path.join(dir, `${id}.jsonl`);
@@ -274,7 +288,48 @@ describe('canonical search review regressions', () => {
       } as any);
       upsertSessionFileMetadata(manager, toolFile, id);
     }
-    assert.throws(() => searchSessionEvidence(manager, 'needle', { sessionsDir: dir, limit: 1 }), SessionSearchReadLimitError);
+    assert.deepEqual(searchSessionEvidence(manager, 'needle', { sessionsDir: dir, project: 'tools', limit: 1 }).results, []);
+  });
+  it('does not retry weaker legacy queries after a canonical tool match is excluded', () => {
+    const id = 'private-tool-match';
+    const timestamp = '2026-07-01T00:00:00Z';
+    const toolFile = path.join(dir, `${id}.jsonl`);
+    fs.writeFileSync(toolFile, [
+      JSON.stringify({ type: 'session', id, cwd: '/old-project', timestamp }),
+      JSON.stringify({ type: 'message', id: 'private-tool-entry', timestamp, message: { role: 'toolResult', content: 'needle output' } }),
+    ].join('\n') + '\n');
+    indexSession(manager, {
+      id, project: 'old-project', cwd: '/old-project', startedAt: timestamp, endedAt: null,
+      messages: [{ id: 'private-tool-entry', entryId: 'private-tool-entry', role: 'system', kind: 'tool_result', content: 'needle output', timestamp }],
+    } as any);
+    upsertSessionFileMetadata(manager, toolFile, id);
+    const options = { sessionsDir: dir, limit: 1 };
+    assert.deepEqual(searchSessionEvidence(manager, 'needle output', options).results, []);
+    assert.deepEqual(searchSessions(manager, 'needle output', options), []);
+    assert.equal(searchSessions(manager, 'needle output', { ...options, includeToolOutput: true })[0].entryId, 'private-tool-entry');
+  });
+  for (const privacy of ['service', 'current'] as const) {
+    it(`does not weaken a legacy query after its ${privacy} match is excluded`, () => {
+      const id = `private-${privacy}-match`;
+      const timestamp = '2026-07-01T00:00:00Z';
+      const privateFile = path.join(dir, `${id}.jsonl`);
+      fs.writeFileSync(privateFile, [
+        JSON.stringify({ type: 'session', id, cwd: '/old-project', timestamp, ...(privacy === 'service' ? { name: 'service' } : {}) }),
+        JSON.stringify({ type: 'message', id: 'private-entry', timestamp, message: { role: 'user', content: 'needle output' } }),
+      ].join('\n') + '\n');
+      indexSession(manager, {
+        id, project: 'old-project', cwd: '/old-project', startedAt: timestamp, endedAt: null,
+        messages: [{ id: 'private-entry', entryId: 'private-entry', role: 'user', content: 'needle output', timestamp }],
+      } as any);
+      upsertSessionFileMetadata(manager, privateFile, id);
+      const options = { sessionsDir: dir, currentSessionId: privacy === 'current' ? id : undefined, limit: 1 };
+      assert.deepEqual(searchSessions(manager, 'needle output', options), []);
+      const optIn = privacy === 'service' ? { includeService: true } : { includeCurrentSession: true };
+      assert.equal(searchSessions(manager, 'needle output', { ...options, ...optIn })[0].entryId, 'private-entry');
+    });
+  }
+  it('retains weaker canonical fallback when there is no full query match', () => {
+    assert.equal(searchSessions(manager, 'needle output', { sessionsDir: dir })[0].entryId, 'wanted');
   });
   it('prefers an exact session ID and treats LIKE metacharacters literally in prefixes', () => {
     const add = (id: string) => {

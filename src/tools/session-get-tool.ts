@@ -1,9 +1,10 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { DatabaseManager } from '../store/db.js';
-import { canonicalSessionOwners, removeMissingCanonicalFile } from '../store/session-indexer.js';
-import { type ParsedEntry, type ParsedSession } from '../store/session-parser.js';
+import { canonicalSessionOwners, closePinnedSessionRoot, containedCanonicalPath, openPinnedSessionRoot, readContainedSessionFile, removeMissingCanonicalFile } from '../store/session-indexer.js';
+import { getSessionFiles, parseSessionFile, SessionFileTooLargeError, SessionSearchReadLimitError, SESSION_SEARCH_MAX_SCAN_BYTES, type ParsedEntry, type ParsedSession } from '../store/session-parser.js';
 
 export const SESSION_GET_MAX_CONTEXT = 10;
 export const SESSION_GET_MAX_OUTPUT_BYTES = 50 * 1024;
@@ -52,9 +53,9 @@ function entryToPublic(sessionId: string, entry: ParsedEntry, contentBytes = MAX
 
 function byteSize(value: unknown): number { return Buffer.byteLength(JSON.stringify(value), 'utf8'); }
 
-function compactError(error: string): { content: [{ type: 'text'; text: string }]; details: { success: false; error: string } } {
+function compactError(error: string): { content: [{ type: 'text'; text: string }]; details: { success: false; error: string }; isError: true } {
   const details = { success: false as const, error };
-  return { content: [{ type: 'text' as const, text: JSON.stringify(details) }], details };
+  return { content: [{ type: 'text' as const, text: JSON.stringify(details) }], details, isError: true };
 }
 
 function boundedDetails(value: Record<string, any>): Record<string, any> {
@@ -120,11 +121,11 @@ function boundedDetails(value: Record<string, any>): Record<string, any> {
   return result;
 }
 
-function response(value: Record<string, any>): { content: [{ type: 'text'; text: string }]; details: Record<string, any> } {
+function response(value: Record<string, any>): { content: [{ type: 'text'; text: string }]; details: Record<string, any>; isError?: boolean } {
   const details = boundedDetails(value);
   const serialized = JSON.stringify(details);
   // Never byte-truncate serialized JSON: a UTF-8-safe prefix can still be syntactically invalid.
-  return { content: [{ type: 'text' as const, text: serialized }], details };
+  return { content: [{ type: 'text' as const, text: serialized }], details, ...(details.success === false ? { isError: true } : {}) };
 }
 
 function compactDiagnostics(session: ParsedSession): { malformedLines: number; nulLines: number } {
@@ -143,84 +144,98 @@ function messageEntries(session: ParsedSession): ParsedEntry[] {
 }
 
 function graphContext(session: ParsedSession, targetId: string, before: number, after: number): { before: ParsedEntry[]; after: ParsedEntry[] } | null {
-  // Service/structural events are not conversational context, but they can sit
-  // between a message and its canonical parent (notably session_info). Resolve
-  // parents through those nodes instead of treating valid messages as orphans.
+  // Resolve only the requested window. A distant fork must not make an exact
+  // entry unreadable when the caller requested no context around it.
   const graph = messageEntries(session);
   const graphById = new Map(graph.map((entry) => [entry.entryId as string, entry]));
   const allById = new Map((session.entries ?? []).filter(validEntry).map((entry) => [entry.entryId as string, entry]));
-  const parentOf = new Map<string, string | null>();
-  for (const entry of graph) {
+  const target = graphById.get(targetId);
+  if (!target) return null;
+  const parentCache = new Map<string, { ok: true; parent: string | null } | { ok: false }>();
+  const resolveParent = (entry: ParsedEntry): { ok: true; parent: string | null } | { ok: false } => {
+    const id = entry.entryId as string;
+    const cached = parentCache.get(id);
+    if (cached) return cached;
     let parent: string | null = entry.parentId == null ? null : (entry.parentEntryId ?? null);
     const seenParents = new Set<string>();
     while (parent && !graphById.has(parent)) {
-      if (seenParents.has(parent)) return null;
+      if (seenParents.has(parent)) { const invalid = { ok: false as const }; parentCache.set(id, invalid); return invalid; }
       seenParents.add(parent);
       const structuralParent = allById.get(parent);
-      if (!structuralParent) return null;
+      if (!structuralParent) { const invalid = { ok: false as const }; parentCache.set(id, invalid); return invalid; }
       parent = structuralParent.parentId == null ? null : (structuralParent.parentEntryId ?? null);
     }
-    parentOf.set(entry.entryId as string, parent);
-  }
+    const resolved = { ok: true as const, parent };
+    parentCache.set(id, resolved);
+    return resolved;
+  };
   const children = new Map<string, ParsedEntry[]>();
   for (const entry of graph) {
-    const parent = parentOf.get(entry.entryId as string) ?? null;
-    if (parent) children.set(parent, [...(children.get(parent) ?? []), entry]);
+    const resolved = resolveParent(entry);
+    if (resolved.ok && resolved.parent) children.set(resolved.parent, [...(children.get(resolved.parent) ?? []), entry]);
   }
-  const target = graphById.get(targetId);
-  if (!target) return null;
-  const seen = new Set<string>();
-  const lineage: string[] = [];
-  let cursor: ParsedEntry | undefined = target;
-  while (cursor) {
+  const beforeEntries: ParsedEntry[] = [];
+  const visited = new Set([targetId]);
+  let cursor = target;
+  for (let distance = 0; distance < before; distance += 1) {
+    const resolved = resolveParent(cursor);
+    if (!resolved.ok) return null;
+    if (!resolved.parent) break;
+    const parent = graphById.get(resolved.parent);
+    if (!parent || visited.has(resolved.parent)) return null;
+    visited.add(resolved.parent);
+    beforeEntries.unshift(parent);
+    cursor = parent;
+  }
+  const afterEntries: ParsedEntry[] = [];
+  cursor = target;
+  for (let distance = 0; distance < after; distance += 1) {
+    const next = children.get(cursor.entryId as string) ?? [];
+    if (next.length > 1) return null;
+    if (next.length === 0) break;
+    cursor = next[0];
     const id = cursor.entryId as string;
-    if (seen.has(id)) return null;
-    seen.add(id);
-    lineage.unshift(id);
-    const parent = parentOf.get(id) ?? null;
-    cursor = parent ? graphById.get(parent) : undefined;
+    if (visited.has(id)) return null;
+    visited.add(id);
+    afterEntries.push(cursor);
   }
-  const descendants = (root: string): string[] | null => {
-    const result: string[] = [];
-    const walk = (id: string): boolean => {
-      const next = children.get(id) ?? [];
-      if (next.length > 1) return false;
-      if (next.length === 1) {
-        const child = next[0].entryId as string;
-        result.push(child);
-        return walk(child);
-      }
-      return true;
-    };
-    return walk(root) ? result : null;
-  };
-  const active = graph.filter((entry) => !(children.get(entry.entryId as string)?.length));
-  if (active.length === 0) return null;
-  let branch: string[];
-  if (active.length === 1) {
-    branch = [];
-    let leaf: ParsedEntry | undefined = active[0];
-    while (leaf) {
-      branch.unshift(leaf.entryId as string);
-      const parent: string | null = parentOf.get(leaf.entryId as string) ?? null;
-      leaf = parent ? graphById.get(parent) : undefined;
-    }
-  } else {
-    const unique = descendants(targetId);
-    if (!unique) return null;
-    branch = [...lineage, ...unique];
-  }
-  if (!branch.includes(targetId)) return null;
-  const messageBranch = branch.map((id) => graphById.get(id)).filter((entry): entry is ParsedEntry => Boolean(entry));
-  const targetAt = messageBranch.findIndex((entry) => entry.entryId === targetId);
-  if (targetAt < 0) return null;
-  return {
-    before: messageBranch.slice(Math.max(0, targetAt - before), targetAt),
-    after: messageBranch.slice(targetAt + 1, targetAt + 1 + after),
-  };
+  return { before: beforeEntries, after: afterEntries };
 }
 
-function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, entryId?: string, sessionsDir?: string): ParsedSession | null {
+interface CanonicalSessionLookup { session: ParsedSession | null; error?: 'transcript_ambiguous' | 'transcript_changed' | 'transcript_read_limit'; }
+
+function discoverUnregisteredSession(sessionId: string, sessionsDir: string): CanonicalSessionLookup {
+  const pinned = openPinnedSessionRoot(sessionsDir);
+  if (!pinned) return { session: null };
+  const budget = { remainingBytes: SESSION_SEARCH_MAX_SCAN_BYTES };
+  try {
+    const files = [...new Set(getSessionFiles(pinned.root))];
+    const preferred = path.join(pinned.root, `${sessionId}.jsonl`);
+    // Identity is not a pathname: prioritize only files from the contained inventory.
+    const candidates = files.includes(preferred) ? [preferred, ...files.filter(file => file !== preferred)] : files;
+    const matches: ParsedSession[] = [];
+    for (const file of candidates) {
+      let requestedSessionRead = false;
+      const parsed = readContainedSessionFile(pinned.root, file, descriptor => {
+        // Charge only metadata from the validated, descriptor-relative source.
+        const stat = fs.statSync(descriptor);
+        if (stat.size > budget.remainingBytes) throw new SessionSearchReadLimitError();
+        budget.remainingBytes -= stat.size;
+        const candidate = parseSessionFile(descriptor, stat.size);
+        requestedSessionRead = candidate?.id === sessionId;
+        return candidate;
+      }, pinned);
+      // A parsed target discarded by the descriptor fence changed during this read.
+      if (!parsed && requestedSessionRead) return { session: null, error: 'transcript_changed' };
+      if (parsed?.id !== sessionId) continue;
+      matches.push(parsed);
+      if (matches.length > 1) return { session: null, error: 'transcript_ambiguous' };
+    }
+    return { session: matches[0] ?? null };
+  } finally { closePinnedSessionRoot(pinned); }
+}
+
+function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, sessionsDir?: string): CanonicalSessionLookup {
   const db = dbManager.getDb();
   const owners = canonicalSessionOwners(db, sessionId, sessionsDir);
   // Remove rows that disappeared or became invalid, but never follow an
@@ -228,9 +243,19 @@ function findCanonicalSession(dbManager: DatabaseManager, sessionId: string, ent
   const rows = db.prepare('SELECT path FROM session_files WHERE session_id = ?').all(sessionId) as Array<{ path: string }>;
   // Compare the validated indexed key, not its realpath: historical owners may be lexical aliases.
   for (const row of rows) if (!owners.some((owner) => owner.indexedPath === row.path) && !fs.existsSync(row.path)) removeMissingCanonicalFile(dbManager, row.path);
-  // Owner choice is independent of entry lookup, so stale entry IDs produce a
-  // precise entry_unresolvable response instead of hiding a valid transcript.
-  return owners[0]?.session ?? null;
+  if (owners[0]?.session) return { session: owners[0].session };
+  const containedExisting = sessionsDir && rows.some(row => fs.existsSync(row.path) && containedCanonicalPath(sessionsDir, row.path) !== null);
+  if (containedExisting) return { session: null, error: 'transcript_changed' };
+  if (sessionsDir) {
+    try {
+      const discovered = discoverUnregisteredSession(sessionId, sessionsDir);
+      if (discovered.session || discovered.error) return discovered;
+    } catch (error) {
+      if (error instanceof SessionSearchReadLimitError || error instanceof SessionFileTooLargeError) return { session: null, error: 'transcript_read_limit' };
+      throw error;
+    }
+  }
+  return { session: null };
 }
 
 /** Register exact, canonical, branch-aware session evidence access. */
@@ -238,7 +263,13 @@ export function registerSessionGetTool(pi: ExtensionAPI, dbManager: DatabaseMana
   pi.registerTool({
     name: 'session_get',
     label: 'Session Get',
-    description: 'Open an exact canonical Pi session entry. Use the full session_id and entry_id returned by session_search; stale or ambiguous evidence fails closed.',
+    description: 'Open an exact canonical Pi session entry. Use the separate full session_id and entry_id fields returned by session_search; never pass a pi:// anchor URI as entry_id. Metadata and outline are not proof of a requested entry, and every failure has success:false.',
+    promptSnippet: 'Open one exact session entry after session_search',
+    promptGuidelines: [
+      'Copy session_id and entry_id as separate fields from session_search; do not convert the pi:// anchor URI into entry_id.',
+      'Use before and after only for the requested local context window; a distant fork outside that window must not block an exact entry.',
+      'Treat success:false and its error as a real failure. Metadata or outline alone do not confirm that a requested entry is available.',
+    ],
     parameters: Type.Object({
       session_id: Type.String({ description: 'Full canonical session ID.' }),
       entry_id: Type.Optional(Type.String({ description: 'Full canonical logical entry ID.' })),
@@ -257,8 +288,14 @@ export function registerSessionGetTool(pi: ExtensionAPI, dbManager: DatabaseMana
       }
       const before = Math.min(Math.max(Number.isFinite(args.before) ? Math.floor(args.before as number) : 0, 0), SESSION_GET_MAX_CONTEXT);
       const after = Math.min(Math.max(Number.isFinite(args.after) ? Math.floor(args.after as number) : 0, 0), SESSION_GET_MAX_CONTEXT);
-      const session = findCanonicalSession(dbManager, args.session_id, args.entry_id, options.sessionsDir);
-      if (!session) return compactError('transcript_unavailable');
+      let lookup: CanonicalSessionLookup;
+      try { lookup = findCanonicalSession(dbManager, args.session_id, options.sessionsDir); }
+      catch (error) {
+        if (error instanceof SessionSearchReadLimitError) return compactError('transcript_read_limit');
+        return compactError('transcript_unavailable');
+      }
+      if (!lookup.session) return compactError(lookup.error ?? 'transcript_unavailable');
+      const session = lookup.session;
       const metadata = {
         session_id: session.id, project: session.project, cwd: session.cwd,
         started_at: session.startedAt, ended_at: session.endedAt, name: session.name ?? null, title: session.title ?? null,

@@ -41,6 +41,120 @@ describe("registerSessionSearchTool", () => {
     assert.match(guidelines, /Use session_get when exact canonical source context/);
   });
 
+  for (const variant of ['legacy', 'structured', 'anchors'] as const) {
+    it(`${variant} flags empty and whitespace input as native errors`, async () => {
+      let captured: any;
+      registerSessionSearchTool({ registerTool: (def: any) => { captured = def; } } as any, {} as any, { variant });
+      for (const value of ['', '   ']) {
+        const result = await captured.execute('invalid-input', variant === 'anchors' ? { markdown: value } : { query: value });
+        assert.equal(result.details.success, false);
+        assert.equal(result.isError, true);
+        assert.match(result.details.message, /is required/);
+      }
+    });
+  }
+
+  for (const variant of ['legacy', 'structured'] as const) {
+    it(`${variant} guidance names only include options present in its public schema`, () => {
+      let captured: any;
+      registerSessionSearchTool({ registerTool: (def: any) => { captured = def; } } as any, {} as any, { variant });
+      const names = [...new Set<string>(captured.promptGuidelines.join('\n').match(/\binclude(?:_[a-z_]+|[A-Z]\w*)\b/g) ?? [])];
+      assert.equal(names.length, 3);
+      for (const name of names) assert.ok(name in captured.parameters.properties, `Unavailable public option: ${name}`);
+    });
+    for (const flag of ['include_current_session', 'include_tool_output', 'include_service'] as const) {
+      it(`${variant} honors its public ${flag} opt-in`, async () => {
+        const sessionsDir = makeSessionsDir();
+        const id = 'public-optin-session';
+        const role = flag === 'include_tool_output' ? 'toolResult' : 'user';
+        const rows: any[] = [{ type: 'session', id, cwd: '/work/probe', timestamp: '2026-07-11T00:00:00.000Z' }];
+        if (flag === 'include_service') rows.push({ type: 'session_info', id: 'info', name: 'service optin probe', timestamp: '2026-07-11T00:00:30.000Z' });
+        rows.push({ type: 'message', id: 'optin-entry', timestamp: '2026-07-11T00:01:00.000Z', message: { role, content: 'public optin needle' } });
+        fs.writeFileSync(path.join(sessionsDir, 'source.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+        const db = new DatabaseManager(path.join(sessionsDir, 'db'));
+        try {
+          indexAllSessions(db, sessionsDir);
+          let captured: any;
+          registerSessionSearchTool({ registerTool: (def: any) => { captured = def; } } as any, db, { variant }, { sessionsDir, currentSessionId: flag === 'include_current_session' ? id : undefined });
+          const ordinary = await captured.execute('ordinary-optin', { query: 'public optin needle' });
+          assert.equal(ordinary.details.success, true);
+          assert.equal(ordinary.details.count, 0);
+          const explicit = await captured.execute('explicit-optin', { query: 'public optin needle', [flag]: true });
+          assert.equal(explicit.details.success, true);
+          assert.equal(explicit.details.count, 1);
+          assert.match(explicit.content[0].text, /optin-entry/);
+        } finally { db.close(); }
+      });
+    }
+  }
+
+  for (const variant of ['legacy', 'structured'] as const) {
+    it(`${variant} rejects explicit blank session IDs without widening the search`, async () => {
+      const sessionsDir = makeSessionsDir();
+      for (const id of ['one', 'two']) {
+        fs.writeFileSync(path.join(sessionsDir, `${id}.jsonl`), [
+          JSON.stringify({ type: 'session', id, cwd: '/work/project', timestamp: '2026-07-11T00:00:00.000Z' }),
+          JSON.stringify({ type: 'message', id: `${id}-entry`, timestamp: '2026-07-11T00:01:00.000Z', message: { role: 'user', content: 'filter needle' } }),
+        ].join('\n') + '\n');
+      }
+      const db = new DatabaseManager(path.join(sessionsDir, 'db'));
+      try {
+        indexAllSessions(db, sessionsDir);
+        let captured: any;
+        registerSessionSearchTool({ registerTool: (def: any) => { captured = def; } } as any, db, { variant }, { sessionsDir });
+        for (const session_id of ['', '   ', '\t\n']) {
+          const result = await captured.execute('invalid-filter', { query: 'needle', session_id });
+          assert.equal(result.details.success, false);
+          assert.equal(result.details.error, 'invalid_session_id');
+          assert.equal(result.isError, true);
+          assert.match(result.details.message, /omit|non-empty/);
+        }
+        const ordinary = await captured.execute('omitted-filter', { query: 'needle' });
+        assert.equal(ordinary.details.success, true);
+        assert.equal(ordinary.details.count, 2);
+        const exact = await captured.execute('exact-filter', { query: 'needle', session_id: 'one' });
+        assert.equal(exact.details.count, 1);
+        assert.match(exact.content[0].text, /one-entry/);
+        assert.doesNotMatch(exact.content[0].text, /two-entry/);
+        const schema = captured.parameters.properties.session_id;
+        assert.equal(schema.minLength, 1);
+        assert.equal(new RegExp(schema.pattern).test('   '), false);
+      } finally { db.close(); }
+    });
+  }
+
+  it('keeps ordinary legacy search conversational and exposes current/tool records only by opt-in', async () => {
+    let captured: any;
+    const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
+    const sessionsDir = makeSessionsDir();
+    const databaseDir = path.join(ROOT_DIR, 'db');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const write = (file: string, id: string, entries: unknown[]) => fs.writeFileSync(file, [
+      JSON.stringify({ type: 'session', id, timestamp: '2026-07-11T00:00:00.000Z', cwd: '/work/project' }),
+      ...entries.map((entry) => JSON.stringify(entry)),
+    ].join('\n') + '\n');
+    write(path.join(sessionsDir, 'old.jsonl'), 'old-session', [
+      { type: 'message', id: 'old-user', parentId: null, timestamp: '2026-07-11T00:01:00.000Z', message: { role: 'user', content: 'primary needle' } },
+      { type: 'message', id: 'old-tool', parentId: 'old-user', timestamp: '2026-07-11T00:02:00.000Z', message: { role: 'toolResult', content: [{ type: 'tool_result', content: 'tool needle' }] } },
+    ]);
+    write(path.join(sessionsDir, 'current.jsonl'), 'current-session', [
+      { type: 'message', id: 'current-user', parentId: null, timestamp: '2026-07-11T00:03:00.000Z', message: { role: 'user', content: 'current needle' } },
+    ]);
+    const dbManager = new DatabaseManager(databaseDir);
+    try {
+      indexAllSessions(dbManager, sessionsDir);
+      registerSessionSearchTool(mockPi, dbManager, { variant: 'legacy' }, { sessionsDir, currentSessionId: 'current-session' });
+      const ordinary = await captured.execute('ordinary', { query: 'needle', limit: 20 });
+      assert.equal(ordinary.details.count, 1);
+      assert.match(ordinary.content[0].text, /primary needle/);
+      assert.doesNotMatch(ordinary.content[0].text, /tool needle|current needle/);
+      const explicit = await captured.execute('explicit', { query: 'needle', limit: 20, include_current_session: true, include_tool_output: true });
+      assert.equal(explicit.details.count, 3);
+      assert.match(explicit.content[0].text, /tool needle/);
+      assert.match(explicit.content[0].text, /current needle/);
+    } finally { dbManager.close(); }
+  });
+
   it("enforces the configured sessions root for legacy and structured runtime searches", async () => {
     let captured: any;
     const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
@@ -416,6 +530,8 @@ describe("registerSessionSearchTool", () => {
       assert.ok(Buffer.byteLength(output, "utf8") <= 50 * 1024);
       assert.ok(Buffer.byteLength(JSON.stringify(result.details), "utf8") <= 50 * 1024);
       assert.strictEqual(result.details.count, result.details.candidates.length);
+      assert.equal(result.details.success, false);
+      assert.equal(result.isError, true);
       assert.strictEqual(output.includes(query), false);
     } finally {
       dbManager.close();
@@ -473,5 +589,21 @@ describe("registerSessionSearchTool", () => {
     assert.doesNotMatch(result.content[0].text, /"ranges"/);
     assert.doesNotMatch(result.content[0].text, /"startLine"/);
     assert.doesNotMatch(result.content[0].text, /"sessionId"/);
+  });
+  it('preserves native failure flags from legacy and anchor workers', async () => {
+    const sessionsDir = makeSessionsDir();
+    const db = new DatabaseManager(path.join(sessionsDir, 'db'));
+    try {
+      let captured: any;
+      const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
+      registerSessionSearchTool(mockPi, db, { variant: 'legacy' }, { sessionsDir });
+      const emptyIndex = await captured.execute('empty-index', { query: 'needle' });
+      assert.equal(emptyIndex.details.success, false);
+      assert.equal(emptyIndex.isError, true);
+      registerSessionSearchTool(mockPi, db, { variant: 'anchors' }, { sessionsDir });
+      const invalidAnchor = await captured.execute('invalid-anchor', { markdown: 'from: not-a-date\nany:\n- needle' });
+      assert.equal(invalidAnchor.details.success, false);
+      assert.equal(invalidAnchor.isError, true);
+    } finally { db.close(); }
   });
 });

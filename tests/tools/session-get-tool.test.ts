@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseManager } from '../../src/store/db.js';
 import { indexAllSessions, indexSession, upsertSessionFileMetadata } from '../../src/store/session-indexer.js';
-import { parseSessionFile } from '../../src/store/session-parser.js';
+import { parseSessionFile, SESSION_SEARCH_MAX_SCAN_BYTES } from '../../src/store/session-parser.js';
 import { searchSessionEvidence } from '../../src/store/session-search.js';
 import { registerSessionGetTool } from '../../src/tools/session-get-tool.js';
 
@@ -100,6 +100,129 @@ describe('session_get', () => {
     } finally { db.close(); }
   });
 
+  it('opens an exact existing transcript even when startup indexing did not register its owner', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-unregistered-'));
+    const db = new DatabaseManager(path.join(root, 'db'));
+    try {
+      const file = path.join(root, 'unregistered-session.jsonl');
+      writeSession(file, 'unregistered-session', [{ type: 'message', id: 'unregistered-entry', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'recoverable exact transcript' } }]);
+      const result = await capture(db, root).execute('unregistered', { session_id: 'unregistered-session', entry_id: 'unregistered-entry' });
+      assert.equal(result.details.success, true);
+      assert.equal(result.details.entry.content, 'recoverable exact transcript');
+    } finally { db.close(); }
+  });
+
+  it('treats contained aliases of one unregistered file as a single owner', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-contained-alias-'));
+    const sessionsDir = path.join(root, 'sessions');
+    const source = path.join(sessionsDir, 'project', 'source.jsonl');
+    writeSession(source, 'alias-session', [{ type: 'message', id: 'target', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'one physical owner' } }]);
+    fs.symlinkSync(source, path.join(sessionsDir, 'file-alias.jsonl'));
+    fs.symlinkSync(path.dirname(source), path.join(sessionsDir, 'directory-alias'), 'dir');
+    const rootAlias = path.join(root, 'root-alias');
+    fs.symlinkSync(sessionsDir, rootAlias, 'dir');
+    const db = new DatabaseManager(path.join(root, 'db'));
+    try {
+      const result = await capture(db, rootAlias).execute('aliased-source', { session_id: 'alias-session', entry_id: 'target' });
+      assert.equal(result.details.success, true);
+      assert.equal(result.details.entry.content, 'one physical owner');
+    } finally { db.close(); }
+  });
+
+  for (const shape of ['traversal', 'leaf-symlink', 'directory-symlink'] as const) {
+    it(`ignores external metadata for an unregistered ${shape} session identity`, async () => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-external-budget-'));
+      const sessionsDir = path.join(root, 'sessions');
+      const sessionId = shape === 'traversal' ? '../victim' : shape === 'directory-symlink' ? 'linked/victim' : 'victim';
+      writeSession(path.join(sessionsDir, 'safe.jsonl'), sessionId, [{ type: 'message', id: 'target', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'exact contained source' } }]);
+      const external = path.join(root, 'victim.jsonl');
+      const fd = fs.openSync(external, 'w');
+      try { fs.ftruncateSync(fd, SESSION_SEARCH_MAX_SCAN_BYTES + 1); } finally { fs.closeSync(fd); }
+      if (shape === 'leaf-symlink') fs.symlinkSync(external, path.join(sessionsDir, 'victim.jsonl'));
+      if (shape === 'directory-symlink') fs.symlinkSync(root, path.join(sessionsDir, 'linked'), 'dir');
+      const db = new DatabaseManager(path.join(root, 'db'));
+      const originalStat = fs.statSync;
+      const unsafeStats: string[] = [];
+      const preferred = path.join(sessionsDir, `${sessionId}.jsonl`);
+      try {
+        fs.statSync = ((file: any, options?: any) => {
+          if (file === external || file === preferred) unsafeStats.push(file);
+          return originalStat(file, options);
+        }) as typeof fs.statSync;
+        const result = await capture(db, sessionsDir).execute('contained-source', { session_id: sessionId, entry_id: 'target', before: 0, after: 0 });
+        assert.equal(result.details.success, true);
+        assert.equal(result.details.entry.content, 'exact contained source');
+        assert.deepEqual(unsafeStats, []);
+      } finally { fs.statSync = originalStat; db.close(); }
+    });
+  }
+
+  it('retains the fallback read limit for a contained oversized file', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-contained-budget-'));
+    const sessionsDir = path.join(root, 'sessions');
+    fs.mkdirSync(sessionsDir);
+    const fd = fs.openSync(path.join(sessionsDir, 'large-session.jsonl'), 'w');
+    try { fs.ftruncateSync(fd, SESSION_SEARCH_MAX_SCAN_BYTES + 1); } finally { fs.closeSync(fd); }
+    const db = new DatabaseManager(path.join(root, 'db'));
+    try {
+      const result = await capture(db, sessionsDir).execute('contained-limit', { session_id: 'large-session', entry_id: 'target' });
+      assert.deepEqual(result.details, { success: false, error: 'transcript_read_limit' });
+      assert.equal(result.isError, true);
+    } finally { db.close(); }
+  });
+
+  it('reports a changed unregistered transcript instead of a missing file', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-changed-unregistered-'));
+    const db = new DatabaseManager(path.join(root, 'db'));
+    const originalFstat = fs.fstatSync;
+    let fileChecks = 0;
+    try {
+      writeSession(path.join(root, 'changed.jsonl'), 'changed-session', [{ type: 'message', id: 'target', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'changed source' } }]);
+      fs.fstatSync = ((fd: any, options?: any) => {
+        const stat = originalFstat(fd, options);
+        if (options?.bigint && stat.isFile() && ++fileChecks === 2) return { ...stat, size: (stat.size as bigint) + 1n };
+        return stat;
+      }) as typeof fs.fstatSync;
+      const result = await capture(db, root).execute('changed', { session_id: 'changed-session', entry_id: 'target' });
+      assert.equal(fileChecks, 2);
+      assert.deepEqual(result.details, { success: false, error: 'transcript_changed' });
+      assert.equal(result.isError, true);
+    } finally { fs.fstatSync = originalFstat; db.close(); }
+  });
+
+  it('reports bounded unregistered parser overflow as a read limit', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-unregistered-overflow-'));
+    const db = new DatabaseManager(path.join(root, 'db'));
+    const originalFstat = fs.fstatSync;
+    let overflowInjected = false;
+    try {
+      writeSession(path.join(root, 'source.jsonl'), 'overflow-session', [{ type: 'message', id: 'target', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'bounded source' } }]);
+      fs.fstatSync = ((fd: any, options?: any) => {
+        const stat = originalFstat(fd, options);
+        if (!options?.bigint && stat.isFile()) {
+          overflowInjected = true;
+          return { ...stat, size: Number(stat.size) + 1 };
+        }
+        return stat;
+      }) as typeof fs.fstatSync;
+      const result = await capture(db, root).execute('overflow', { session_id: 'overflow-session', entry_id: 'target' });
+      assert.equal(overflowInjected, true);
+      assert.deepEqual(result.details, { success: false, error: 'transcript_read_limit' });
+      assert.equal(result.isError, true);
+    } finally { fs.fstatSync = originalFstat; db.close(); }
+  });
+
+  it('rejects ambiguous unregistered copies instead of choosing one', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-ambiguous-'));
+    const db = new DatabaseManager(path.join(root, 'db'));
+    try {
+      writeSession(path.join(root, 'copy-a.jsonl'), 'ambiguous-session', [{ type: 'message', id: 'entry-a', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'a' } }]);
+      writeSession(path.join(root, 'copy-b.jsonl'), 'ambiguous-session', [{ type: 'message', id: 'entry-b', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'b' } }]);
+      const result = await capture(db, root).execute('ambiguous', { session_id: 'ambiguous-session', entry_id: 'entry-a' });
+      assert.deepEqual(result.details, { success: false, error: 'transcript_ambiguous' });
+    } finally { db.close(); }
+  });
+
   it('fails closed for unsafe forks and stale entries while round-tripping fail-soft diagnostics', async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-'));
     const db = new DatabaseManager(root);
@@ -114,7 +237,9 @@ describe('session_get', () => {
       indexSession(db, parsed); upsertSessionFileMetadata(db, fork, parsed.id);
       const tool = capture(db);
       assert.equal((await tool.execute('fork', { session_id: 'fork-session', entry_id: 'root', after: 1 })).details.error, 'branch_unresolvable');
-      assert.equal((await tool.execute('stale', { session_id: 'fork-session', entry_id: 'missing' })).details.error, 'entry_unresolvable');
+      const stale = await tool.execute('stale', { session_id: 'fork-session', entry_id: 'missing' });
+      assert.equal(stale.details.error, 'entry_unresolvable');
+      assert.equal(stale.isError, true);
       const malformed = path.join(root, 'malformed.jsonl');
       writeSession(malformed, 'malformed-session', [
         { type: 'message', id: 'first', parentId: null, timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'first' } },
@@ -138,6 +263,27 @@ describe('session_get', () => {
       assert.deepEqual(roundTrip.details.after.map((entry: any) => entry.entry_id), ['last']);
       assert.equal(roundTrip.details.diagnostics.malformedLines, 1);
       assert.equal(roundTrip.details.diagnostics.nulLines, 1);
+    } finally { db.close(); }
+  });
+
+  it('returns an exact fork entry without resolving a distant branch outside the requested window', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-'));
+    const db = new DatabaseManager(root);
+    try {
+      const fork = path.join(root, 'distant-fork.jsonl');
+      writeSession(fork, 'distant-fork-session', [
+        { type: 'message', id: 'root', parentId: null, timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'root' } },
+        { type: 'message', id: 'target', parentId: 'root', timestamp: '2026-08-09T00:02:00.000Z', message: { role: 'assistant', content: 'exact target' } },
+        { type: 'message', id: 'left', parentId: 'target', timestamp: '2026-08-09T00:03:00.000Z', message: { role: 'user', content: 'left branch' } },
+        { type: 'message', id: 'right', parentId: 'target', timestamp: '2026-08-09T00:04:00.000Z', message: { role: 'user', content: 'right branch' } },
+      ]);
+      const parsed = parseSessionFile(fork)!;
+      indexSession(db, parsed); upsertSessionFileMetadata(db, fork, parsed.id);
+      const result = await capture(db).execute('exact-fork-entry', { session_id: 'distant-fork-session', entry_id: 'target', before: 0, after: 0 });
+      assert.equal(result.details.success, true);
+      assert.equal(result.details.entry.entry_id, 'target');
+      assert.deepEqual(result.details.before, []);
+      assert.deepEqual(result.details.after, []);
     } finally { db.close(); }
   });
 
@@ -243,6 +389,7 @@ describe('session_get', () => {
         indexSession(db, parsed); upsertSessionFileMetadata(db, file, parsed.id);
         const result = await capture(db).execute('large-id', { session_id: sessionId, entry_id: entryId });
         assert.deepEqual(result.details, { success: false, error: 'session_get_response_limit' });
+        assert.equal(result.isError, true);
         assert.ok(Buffer.byteLength(result.content[0].text, 'utf8') <= 50 * 1024);
         assert.ok(Buffer.byteLength(JSON.stringify(result.details), 'utf8') <= 50 * 1024);
         assert.deepEqual(JSON.parse(result.content[0].text), result.details);
@@ -254,6 +401,7 @@ describe('session_get', () => {
       indexSession(db, parsed); upsertSessionFileMetadata(db, file, parsed.id);
       const metadata = await capture(db).execute('large-session-id', { session_id: sessionId, view: 'metadata' });
       assert.deepEqual(metadata.details, { success: false, error: 'session_get_response_limit' });
+      assert.equal(metadata.isError, true);
     } finally { db.close(); }
   });
 
@@ -272,6 +420,27 @@ describe('session_get', () => {
       assert.equal(result.details.entry.entry_id, entryId);
       assert.equal(result.details.entry.anchor, `pi://session/${sessionId}#entry=${entryId}`);
       assert.ok(Buffer.byteLength(JSON.stringify(result.details), 'utf8') <= 50 * 1024);
+    } finally { db.close(); }
+  });
+
+  it('rejects cycles within requested context without blocking an exact isolated read', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-get-cycle-'));
+    const db = new DatabaseManager(root);
+    try {
+      const file = path.join(root, 'cycle.jsonl');
+      writeSession(file, 'cycle-session', [
+        { type: 'message', id: 'target', parentId: 'target', timestamp: '2026-08-09T00:01:00.000Z', message: { role: 'user', content: 'exact cyclic record' } },
+      ]);
+      const parsed = parseSessionFile(file)!;
+      indexSession(db, parsed); upsertSessionFileMetadata(db, file, parsed.id);
+      const tool = capture(db);
+      const exact = await tool.execute('cycle-exact', { session_id: 'cycle-session', entry_id: 'target', before: 0, after: 0 });
+      assert.equal(exact.details.success, true);
+      for (const context of [{ before: 1, after: 0 }, { before: 0, after: 1 }]) {
+        const result = await tool.execute('cycle-context', { session_id: 'cycle-session', entry_id: 'target', ...context });
+        assert.equal(result.details.success, false);
+        assert.equal(result.details.error, 'branch_unresolvable');
+      }
     } finally { db.close(); }
   });
 });

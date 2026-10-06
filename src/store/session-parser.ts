@@ -471,6 +471,8 @@ export function getSessionFiles(sessionsDir: string, projectDir?: string): strin
   const root = fs.realpathSync.native(sessionsDir);
   const dir = projectDir ? path.resolve(root, projectDir) : root;
   if (!isWithinRoot(root, dir) || !fs.existsSync(dir)) return [];
+  // A lexical project path may still be a symlink to an external directory.
+  if (!isWithinRoot(root, fs.realpathSync.native(dir))) return [];
   const files: string[] = [];
   const addFile = (filePath: string): void => {
     if (!filePath.endsWith('.jsonl')) return;
@@ -486,7 +488,11 @@ export function getSessionFiles(sessionsDir: string, projectDir?: string): strin
   for (const entry of fs.readdirSync(root)) {
     const entryPath = path.join(root, entry);
     let stat: fs.Stats;
-    try { stat = fs.statSync(entryPath); } catch { continue; }
+    try {
+      const real = fs.realpathSync.native(entryPath);
+      if (!isWithinRoot(root, real)) continue;
+      stat = fs.statSync(real);
+    } catch { continue; }
     if (stat.isDirectory()) {
       for (const child of fs.readdirSync(entryPath)) addFile(path.join(entryPath, child));
     } else if (stat.isFile()) addFile(entryPath);

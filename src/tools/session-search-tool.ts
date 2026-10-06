@@ -20,8 +20,8 @@ const DEFAULT_LEGACY_SNIPPET_CHARS = 1_200;
 const MAX_LEGACY_SNIPPET_CHARS = 4_000;
 
 type IndexedRequest = Omit<Extract<SessionSearchWorkerRequest, { mode: 'legacy' }>, 'dbPath'> | Omit<Extract<SessionSearchWorkerRequest, { mode: 'structured' }>, 'dbPath'>;
-function invalidRequest(message: string): SessionSearchToolResult {
-  return { content: [{ type: 'text', text: message }], details: { success: false, message } };
+function invalidRequest(message: string, error?: string): SessionSearchToolResult {
+  return { content: [{ type: 'text', text: message }], details: { success: false, message, ...(error ? { error } : {}) }, isError: true };
 }
 function executionOptions(options: SessionSearchToolOptions, signal?: AbortSignal, onUpdate?: AgentToolUpdateCallback): SessionSearchExecutionOptions {
   return { signal, timeoutMs: options.timeoutMs, onProgress: () => onUpdate?.({ content: [{ type: 'text', text: 'Searching sessions…' }], details: { success: true, phase: 'searching' } }) };
@@ -34,7 +34,7 @@ async function executeIndexedSearch(dbManager: DatabaseManager, request: Indexed
   } catch (error) {
     if (error instanceof Error && (error.name === 'SessionEvidenceUnavailableError' || (error as Error & { code?: string }).code === 'SESSION_EVIDENCE_UNAVAILABLE' || /migration pending|evidence unavailable/i.test(error.message))) {
       const result = { success: false, error: 'session_evidence_unavailable' };
-      return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result };
+      return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result, isError: true };
     }
     throw error;
   }
@@ -95,14 +95,16 @@ function registerStructuredSessionSearchTool(pi: ExtensionAPI, dbManager: Databa
       'Use this mode when exact session evidence and an entry anchor are needed.',
       'Before acting, search when a specific fact required for the next step is absent from current context but likely exists in the evicted part of the current session or another past session.',
       'Do not guess, repeat completed work, or ask the user to restate prior context before attempting a narrow search.',
-      'Pass includeCurrentSession, includeService, or includeToolOutput explicitly when those rows are required.',
-      'Use session_get when exact canonical source context around a result is needed.',
+      'Pass include_current_session, include_service, or include_tool_output explicitly when those rows are required.',
+      'Use session_get when exact canonical source context around a result is needed; copy session_id and entry_id as separate fields into session_get, never pass the pi:// anchor URI as entry_id.',
+      'A successful recovery requires session_search followed by session_get for the exact entry; metadata or outline alone do not prove the requested fact.',
+      'Inspect success:false and the error code in every tool result; failure is not an empty successful search.',
       'Use session_id for an exact ID or a bounded, unambiguous prefix; do not guess among ambiguous prefixes.',
     ],
     renderResult: createSharedToolResultRenderer(searchResultView),
     parameters: Type.Object({
       query: Type.String({ description: 'Search terms.' }),
-      session_id: Type.Optional(Type.String({ description: 'Exact session ID or an unambiguous prefix.' })),
+      session_id: Type.Optional(Type.String({ minLength: 1, pattern: '\\S', description: 'Non-blank exact session ID or an unambiguous prefix; omit this field for unrestricted session scope.' })),
       project: Type.Optional(Type.String({ description: 'Filter by project.' })),
       role: Type.Optional(StringEnum(['user', 'assistant', 'system'] as const)),
       since: Type.Optional(Type.String({ description: 'ISO timestamp lower bound.' })),
@@ -114,6 +116,7 @@ function registerStructuredSessionSearchTool(pi: ExtensionAPI, dbManager: Databa
     }),
     execute: async (_id: string, args: { query: string; session_id?: string; project?: string; role?: string; since?: string; limit?: number; include_current_session?: boolean; include_service?: boolean; include_tool_output?: boolean; snippet_chars?: number }, signal?: AbortSignal, onUpdate?: AgentToolUpdateCallback) => {
       if (!args.query?.trim()) return invalidRequest('query is required');
+      if (args.session_id !== undefined && !args.session_id.trim()) return invalidRequest('session_id must be non-empty when provided; omit it for unrestricted session scope.', 'invalid_session_id');
       const currentSessionId = typeof options.currentSessionId === 'function' ? options.currentSessionId() : options.currentSessionId;
       return executeIndexedSearch(dbManager, { mode: 'structured', query: args.query, options: {
         sessionId: args.session_id, project: args.project, role: args.role, since: args.since, limit: args.limit, sessionsDir: options.sessionsDir,
@@ -134,25 +137,39 @@ Examples:
 - "Find the PR where we fixed the test hang"
 - "What approach did we take for the database migration?"
 
-Returns bounded conversation snippets with session dates and project context. When canonical JSONL ownership is available, each result also includes session_id and entry_id for session_get. Large messages are truncated with their original character count.`,
+Returns bounded primary conversation snippets with session dates and project context. Tool output, service sessions, and the active chat are excluded by default; set the explicit include flags when the user asks to search the current chat or tool output. When canonical JSONL ownership is available, each result also includes session_id and entry_id for session_get. Large messages are truncated with their original character count.`,
     promptSnippet: 'Search past conversations for relevant context',
     promptGuidelines: [
       'Use session_search when the user asks about previous discussions or past work.',
       'Before acting, search when a specific fact required for the next step is absent from current context but likely exists in the evicted part of the current session or another past session.',
       'Do not guess, repeat completed work, or ask the user to restate prior context before attempting a narrow search.',
-      'Use session_get when exact canonical source context around a result is needed.',
+      'Ordinary search returns primary conversation only; set include_tool_output, include_service, or include_current_session explicitly for those sources.',
+      'Use project, role, since, and exact session_id filters when the relevant scope is known; these filters are applied to canonical transcript facts.',
+      'session_get accepts the separate session_id and entry_id fields from search; never pass a pi:// anchor URI as entry_id.',
+      'Use session_get when exact canonical source context around a result is needed; a successful recovery requires session_search followed by session_get for the exact entry, and metadata or outline alone do not prove the requested fact.',
+      'Inspect success:false and the error code in every tool result; failure is not an empty successful search.',
     ],
     renderResult: createSharedToolResultRenderer(searchResultView),
     parameters: Type.Object({
       query: Type.String({ description: 'Search query. Use natural language or specific terms.' }),
-      project: Type.Optional(Type.String({ description: 'Filter by project name (optional).' })),
+      project: Type.Optional(Type.String({ description: 'Filter by canonical project name (optional).' })),
       role: Type.Optional(StringEnum(['user', 'assistant'] as const, { description: 'Filter by message role (optional).' })),
+      since: Type.Optional(Type.String({ description: 'ISO timestamp lower bound (optional).' })),
+      session_id: Type.Optional(Type.String({ minLength: 1, pattern: '\\S', description: 'Non-blank exact canonical session ID (optional; do not guess a prefix). Omit this field for unrestricted session scope.' })),
       limit: Type.Optional(Type.Number({ description: 'Maximum results to return (default: 10, min: 1, max: 20).', minimum: 1, maximum: 20 })),
-      snippetChars: Type.Optional(Type.Number({ description: `Maximum characters per result snippet (default: ${DEFAULT_LEGACY_SNIPPET_CHARS}, max: ${MAX_LEGACY_SNIPPET_CHARS}).`, minimum: 100, maximum: MAX_LEGACY_SNIPPET_CHARS })),
+      snippetChars: Type.Optional(Type.Number({ description: `Maximum characters per result snippet (default: ${DEFAULT_LEGACY_SNIPPET_CHARS}, max: ${MAX_LEGACY_SNIPPET_CHARS}; never exceed 4000).`, minimum: 100, maximum: MAX_LEGACY_SNIPPET_CHARS })),
+      include_current_session: Type.Optional(Type.Boolean({ description: 'Include the active session only when explicitly requested.' })),
+      include_tool_output: Type.Optional(Type.Boolean({ description: 'Include tool-call and tool-result records only when explicitly requested.' })),
+      include_service: Type.Optional(Type.Boolean({ description: 'Include service and structural records only when explicitly requested.' })),
     }),
-    execute: async (_id: string, args: { query: string; project?: string; role?: string; limit?: number; snippetChars?: number }, signal?: AbortSignal, onUpdate?: AgentToolUpdateCallback) => {
+    execute: async (_id: string, args: { query: string; project?: string; role?: string; since?: string; session_id?: string; limit?: number; snippetChars?: number; include_current_session?: boolean; include_tool_output?: boolean; include_service?: boolean }, signal?: AbortSignal, onUpdate?: AgentToolUpdateCallback) => {
       if (!args.query?.trim()) return invalidRequest('query is required');
-      return executeIndexedSearch(dbManager, { mode: 'legacy', query: args.query, snippetChars: args.snippetChars, options: { project: args.project, role: args.role, limit: args.limit, sessionsDir: options.sessionsDir } }, executionOptions(options, signal, onUpdate));
+      if (args.session_id !== undefined && !args.session_id.trim()) return invalidRequest('session_id must be non-empty when provided; omit it for unrestricted session scope.', 'invalid_session_id');
+      const currentSessionId = typeof options.currentSessionId === 'function' ? options.currentSessionId() : options.currentSessionId;
+      return executeIndexedSearch(dbManager, { mode: 'legacy', query: args.query, snippetChars: args.snippetChars, options: {
+        project: args.project, role: args.role, since: args.since, sessionId: args.session_id, limit: args.limit, sessionsDir: options.sessionsDir, currentSessionId,
+        includeCurrentSession: args.include_current_session === true, includeToolOutput: args.include_tool_output === true, includeService: args.include_service === true,
+      } }, executionOptions(options, signal, onUpdate));
     },
   });
 }

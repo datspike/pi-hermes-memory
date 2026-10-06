@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatAnchorSearch, formatStructuredSearch } from '../../src/store/session-search-output.js';
+import { formatAnchorSearch, formatLegacySearch, formatStructuredSearch } from '../../src/store/session-search-output.js';
 
 const MAX_BYTES = 1024 * 1024;
 const packetBytes = (result: unknown) => Buffer.byteLength(JSON.stringify({ type: 'result', ok: true, result }), 'utf8');
@@ -53,4 +53,25 @@ test('structured search rejects a valid oversized identity instead of returning 
     tool: null, tool_call_id: null, timestamp: '2026-09-30T00:00:00Z', snippet: 'needle', score: 1, scoreMode: 'like',
     anchor: `pi://session/${sessionId}#entry=entry`,
   }], ambiguousSessionIds: [] }), isStructuredLimitError);
+});
+
+test('all formatter failures retain their details and native error status', () => {
+  const failures = [
+    formatLegacySearch([], 0, 'needle'),
+    formatStructuredSearch({ results: [], ambiguousSessionIds: ['session-a', 'session-b'] }),
+    formatAnchorSearch({ success: false, ranges: [], message: 'Invalid control request.' }),
+  ];
+  for (const result of failures) {
+    assert.equal(result.details.success, false);
+    assert.equal(result.isError, true);
+  }
+  const successes = [
+    formatLegacySearch([], 1, 'needle'),
+    formatStructuredSearch({ results: [], ambiguousSessionIds: [] }),
+    formatAnchorSearch({ success: true, ranges: [] }),
+  ];
+  for (const result of successes) {
+    assert.equal(result.details.success, true);
+    assert.notEqual(result.isError, true);
+  }
 });

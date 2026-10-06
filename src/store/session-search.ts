@@ -30,8 +30,16 @@ export interface SessionSearchOptions {
   project?: string;
   role?: string;
   since?: string;
+  /** Exact session ID filter; unlike a prefix it is never guessed. */
+  sessionId?: string;
   /** Configured JSONL root used to reject stale/outside owners. */
   sessionsDir?: string;
+  /** Exclude the active transcript unless explicitly requested. */
+  includeCurrentSession?: boolean;
+  currentSessionId?: string;
+  /** Keep service and tool records opt-in for ordinary conversation search. */
+  includeService?: boolean;
+  includeToolOutput?: boolean;
 }
 
 export interface SessionSearchEvidence {
@@ -96,27 +104,28 @@ function mapRows(rows: Array<{ session_id: string; entry_id?: string; project: s
 /** Budget compact key sizes before materializing exact keys through any SQLite adapter. */
 function readSearchCandidates<T extends { session_id: string; entry_id?: string; oversized_identity: number }>(
   db: ReturnType<DatabaseManager['getDb']>, query: string, params: unknown[], legacy = false, canonicalLegacy = false,
-  window?: { limit: number; hasMore: boolean },
-): T[] {
+  window?: { limit: number; hasMore: boolean }, keyBudget: { remainingBytes: number } = { remainingBytes: MAX_CANDIDATE_KEY_BYTES },
+ ): T[] {
   type CompactRow = { candidate_rowid: number; session_chars: number; entry_chars: number };
   const exactEntryIdentity = !legacy || canonicalLegacy;
   const compact = db.prepare(query).all(...params) as CompactRow[];
   // Only numeric metadata from the extra row detects exhaustion; its keys/payload are never read.
   if (window) window.hasMore = compact.length > window.limit;
   const candidates = window ? compact.slice(0, window.limit) : compact;
-  let remaining = MAX_CANDIDATE_KEY_BYTES;
+  let remaining = keyBudget.remainingBytes;
   for (const row of candidates) {
     if (row.session_chars > MAX_SEARCH_ID_CHARS || (exactEntryIdentity && row.entry_chars > MAX_SEARCH_ID_CHARS)) throw new SessionSearchReadLimitError();
     // SQLite counts code points; four bytes cover the largest UTF-16 representation.
     remaining -= 4 * (row.session_chars + (exactEntryIdentity ? row.entry_chars : 0));
     if (remaining < 0) throw new SessionSearchReadLimitError();
   }
+  keyBudget.remainingBytes = remaining;
   const byRow = new Map<number, T>();
   for (let offset = 0; offset < candidates.length; offset += 64) {
     const batch = candidates.slice(offset, offset + 64);
     const sameSizes = `length(m.session_id) <= wanted.session_chars${exactEntryIdentity ? ' AND m.entry_id IS NOT NULL AND length(m.entry_id) <= wanted.entry_chars' : ''}`;
     const fields = legacy
-      ? `${canonicalLegacy ? `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, ` : ''}substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, substr(m.content, 1, ${MAX_SNIPPET_CHARS}) AS content, length(m.content) AS content_chars, substr(m.timestamp, 1, 200) AS timestamp`
+      ? `${canonicalLegacy ? `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, ` : ''}substr(s.project, 1, 1000) AS project, substr(m.role, 1, 200) AS role, ${canonicalLegacy ? "'' AS content, 0 AS content_chars" : `substr(m.content, 1, ${MAX_SNIPPET_CHARS}) AS content, length(m.content) AS content_chars`}, substr(m.timestamp, 1, 200) AS timestamp`
       : `CASE WHEN ${sameSizes} THEN m.entry_id ELSE '' END AS entry_id, substr(m.role, 1, 200) AS role, substr(m.kind, 1, 200) AS kind, substr(m.timestamp, 1, 200) AS timestamp`;
     // Recheck sizes in SQL: a concurrent index change must not bypass the first budget.
     const rows = db.prepare(`SELECT m.rowid AS candidate_rowid, CASE WHEN ${sameSizes} THEN m.session_id ELSE '' END AS session_id,
@@ -134,8 +143,9 @@ function readSearchCandidates<T extends { session_id: string; entry_id?: string;
 }
 
 type CanonicalOwner = ReturnType<typeof canonicalSessionOwners>[number];
-type CanonicalSnapshot = { owners: CanonicalOwner[]; entries: Map<string, ParsedEntry> };
+type CanonicalSnapshot = { owners: CanonicalOwner[]; entries: Map<string, ParsedEntry>; validatedIds: Set<string> };
 type CanonicalSessionResolver = (sessionId: string) => CanonicalSnapshot;
+type EntryIdsProvider = (sessionId: string) => ReadonlySet<string> | undefined;
 
 /** Cache canonical JSONL validation for the duration of one search operation. */
 function createCanonicalSessionResolver(
@@ -143,11 +153,13 @@ function createCanonicalSessionResolver(
   sessionsDir: string | undefined,
   readSession: (filePath: string, sessionId: string) => ParsedSession | null,
   pinnedDirectory?: PinnedSessionRoot,
-  ): CanonicalSessionResolver {
+  entryIdsProvider?: EntryIdsProvider,
+ ): CanonicalSessionResolver {
   const cache = new Map<string, CanonicalSnapshot>();
   return (sessionId: string): CanonicalSnapshot => {
+    const wanted = entryIdsProvider?.(sessionId);
     const cached = cache.get(sessionId);
-    if (cached) return cached;
+    if (cached && (!wanted || [...wanted].every((entryId) => cached.validatedIds.has(entryId)))) return cached;
     const owners = canonicalSessionOwners(db, sessionId, sessionsDir, file => readSession(file, sessionId), true, undefined, pinnedDirectory);
     const entries = new Map<string, ParsedEntry>();
     const owner = owners[0];
@@ -155,14 +167,22 @@ function createCanonicalSessionResolver(
       if (!entry.entryId || entry.identityStatus === 'ambiguous' || entry.identityStatus === 'unresolvable' || entries.has(entry.entryId)) continue;
       entries.set(entry.entryId, entry);
     }
-    const snapshot = { owners, entries };
+    const snapshot = { owners, entries, validatedIds: new Set(wanted ?? entries.keys()) };
     cache.set(sessionId, snapshot);
     return snapshot;
   };
 }
 
+/** A supplied blank ID is invalid, not permission to widen the session scope. */
+function assertSessionFilter(sessionId: string | undefined): void {
+  if (sessionId !== undefined && !sessionId.trim()) {
+    throw Object.assign(new Error('sessionId must be non-empty when provided; omit it for unrestricted session scope.'), { name: 'SessionSearchInvalidRequestError', code: 'INVALID_SESSION_ID' });
+  }
+}
+
 /** Original FTS/LIKE search. Its ordering and result shape are intentionally unchanged. */
 export function searchSessions(dbManager: DatabaseManager, query: string, options: SessionSearchOptions = {}): SessionSearchResult[] {
+  assertSessionFilter(options.sessionId);
   dbManager.assertSessionEvidenceAvailable();
   if (query.trim().length === 0) return [];
   const db = dbManager.getDb();
@@ -172,6 +192,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
   const sharedPinnedRoot: PinnedSessionRoot | undefined = options.sessionsDir ? (openPinnedSessionRoot(options.sessionsDir) ?? undefined) : undefined;
   if (options.sessionsDir && !sharedPinnedRoot) return [];
   let ftsParseError = false;
+  let canonicalQueryMatched = false;
   const executeSearch = (match: SearchMatch): SessionSearchResult[] => {
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -184,6 +205,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
       for (const term of match.terms) params.push(`%${escapeLikePattern(term)}%`);
     }
     // Indexed facts may be stale; canonical searches filter only after JSONL validation.
+    if (options.sessionId) { conditions.push('m.session_id = ?'); params.push(options.sessionId); }
     if (!options.sessionsDir) {
       if (project) { conditions.push('s.project = ?'); params.push(project); }
       if (role) { conditions.push('m.role = ?'); params.push(role); }
@@ -196,20 +218,26 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
       // Bound payloads inside SQLite: a row limit does not bound large messages,
       // and selecting content twice creates two independent V8 strings.
       type LegacyRow = { candidate_rowid: number; session_id: string; entry_id?: string; oversized_identity: number; project: string; role: string; content: string; timestamp: string; content_chars: number };
-      const window = options.sessionsDir ? { limit: limit * 20, hasMore: false } : undefined;
-      const rows = readSearchCandidates(db, `SELECT ${COMPACT_CANDIDATE_FIELDS} FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?`, [...params, limit * 20 + (window ? 1 : 0)], true, Boolean(options.sessionsDir), window) as LegacyRow[];
-      if (!rows.length) return [];
-      type CanonicalLegacyEntry = ParsedEntry & { contentChars: number; matchesFilters: boolean; matchesQuery: boolean };
-      const bySession = new Map<string, Set<string>>();
-      for (const row of rows) {
-        if (!row.entry_id) continue;
-        if (!bySession.has(row.session_id)) bySession.set(row.session_id, new Set());
-        bySession.get(row.session_id)!.add(row.entry_id);
+      const canonicalSearch = Boolean(options.sessionsDir);
+      if (!canonicalSearch) {
+        if (options.currentSessionId && !options.includeCurrentSession) { conditions.push('s.id <> ?'); params.push(options.currentSessionId); }
+        if (!options.includeToolOutput) conditions.push("coalesce(m.kind, 'message') NOT IN ('tool_call', 'tool_result')");
+        if (!options.includeService) conditions.push("coalesce(m.kind, 'message') = 'message'");
       }
+      const candidateKeyBudget = { remainingBytes: MAX_CANDIDATE_KEY_BYTES };
+      const batchSize = canonicalSearch ? Math.max(64, limit * 4) : limit * 20;
+      const bySession = new Map<string, Set<string>>();
+      const addRequested = (rows: LegacyRow[]) => {
+        for (const row of rows) {
+          if (!row.entry_id) continue;
+          if (!bySession.has(row.session_id)) bySession.set(row.session_id, new Set());
+          bySession.get(row.session_id)!.add(row.entry_id);
+        }
+      };
       // One transient row verifies full canonical text with the actual trigram
       // MATCH/LIKE semantics. It never writes the indexed database, and no full
       // payload survives the parser callback or escapes the search process.
-      if (options.sessionsDir) {
+      if (canonicalSearch) {
         const Sqlite = getDatabaseCtor(false);
         verifier = new Sqlite(':memory:');
         verifier.exec("CREATE VIRTUAL TABLE canonical_match USING fts5(content, tokenize='trigram')");
@@ -220,7 +248,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
         ? 'SELECT 1 FROM canonical_match WHERE canonical_match MATCH ? LIMIT 1'
         : `SELECT 1 FROM canonical_match WHERE ${match.terms.map(() => "content LIKE ? ESCAPE '\\'").join(' OR ')} LIMIT 1`);
       const matchParams = match.type === 'fts' ? [match.query] : match.terms.map(term => `%${escapeLikePattern(term)}%`);
-      const resolveCanonical = options.sessionsDir ? createCanonicalSessionResolver(db, options.sessionsDir, (file, sessionId) => {
+      const resolveCanonical = canonicalSearch ? createCanonicalSessionResolver(db, options.sessionsDir, (file, sessionId) => {
         const session = parseSessionFileForSearch(file, {
           sessionId, budget, entryIds: bySession.get(sessionId),
           transformEntry: entry => {
@@ -233,29 +261,41 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
               matchesFilters: (!role || entry.role === role) && (!since || (entry.timestamp !== null && entry.timestamp >= since)),
               contentChars: codePointCount(entry.content), content: truncateCodePoints(entry.content, MAX_SNIPPET_CHARS),
               timestamp: entry.timestamp === null ? null : truncateCodePoints(entry.timestamp, 200),
-              toolName: null, toolCallId: null, toolCalls: undefined, parentId: null, parentEntryId: null,
+              toolName: entry.toolName == null ? null : truncateCodePoints(entry.toolName, 500), toolCallId: entry.toolCallId == null ? null : truncateCodePoints(entry.toolCallId, 500), toolCalls: undefined, parentId: null, parentEntryId: null,
             };
           },
         });
         return session ? boundSessionForSearch(session, project) : null;
-      }, sharedPinnedRoot) : null;
+      }, sharedPinnedRoot, sessionId => bySession.get(sessionId)) : null;
       const visible: LegacyRow[] = [];
-      let rejectedByFilters = false;
-      for (const row of rows) {
-        if (resolveCanonical) {
-          const snapshot = resolveCanonical(row.session_id);
-          const session = snapshot.owners[0]?.session as CanonicalSearchSession | undefined;
-          const entry = snapshot.entries.get(row.entry_id!) as CanonicalLegacyEntry | undefined;
-          if (!session || !entry) { rejectedByFilters = true; continue; }
-          if (!session.searchMatchesProject || !entry.matchesFilters) { rejectedByFilters = true; continue; }
-          if (!entry.matchesQuery) continue;
-          visible.push({ ...row, project: session.project, role: entry.role ?? '', timestamp: entry.timestamp ?? '', content: entry.content, content_chars: entry.contentChars });
-        } else visible.push(row);
-        if (visible.length >= limit) break;
+      let offset = 0;
+      for (;;) {
+        const page = readSearchCandidates(db, `SELECT ${COMPACT_CANDIDATE_FIELDS} FROM messages m JOIN sessions s ON s.id = m.session_id WHERE ${conditions.join(' AND ')} ORDER BY m.timestamp DESC LIMIT ?${canonicalSearch ? ' OFFSET ?' : ''}`, canonicalSearch ? [...params, batchSize, offset] : [...params, batchSize], true, canonicalSearch, undefined, candidateKeyBudget) as LegacyRow[];
+        if (!page.length) break;
+        addRequested(page);
+        for (const row of page) {
+          if (resolveCanonical) {
+            const snapshot = resolveCanonical(row.session_id);
+            const session = snapshot.owners[0]?.session as CanonicalSearchSession | undefined;
+            const entry = snapshot.entries.get(row.entry_id!) as (ParsedEntry & { contentChars: number; matchesFilters: boolean; matchesQuery: boolean }) | undefined;
+            if (!session || !entry) continue;
+            if (!session.searchMatchesProject || !entry.matchesFilters) continue;
+            // A privacy-excluded canonical match is not a query miss; do not rescan it with weaker fallbacks.
+            if (entry.matchesQuery) canonicalQueryMatched = true;
+            if (row.session_id === options.currentSessionId && !options.includeCurrentSession) continue;
+            const isTool = Boolean(entry.toolName) || entry.kind === 'tool_result' || entry.kind === 'tool_call';
+            const isService = (entry.kind !== 'message' && !isTool) || session.searchIsService;
+            if (isService && !options.includeService) continue;
+            if (isTool && !options.includeToolOutput) continue;
+            if (!entry.matchesQuery) continue;
+            visible.push({ ...row, project: session.project, role: entry.role ?? '', timestamp: entry.timestamp ?? '', content: entry.content, content_chars: entry.contentChars });
+          } else visible.push(row);
+          if (visible.length >= limit) break;
+        }
+        if (visible.length >= limit || !canonicalSearch || page.length < batchSize) break;
+        offset += page.length;
       }
-      // Scope rejection must not turn an exhausted global candidate window into a false empty/partial answer.
-      if (window?.hasMore && rejectedByFilters && visible.length < limit) throw new SessionSearchReadLimitError();
-      return mapRows(visible);
+      return mapRows(visible.slice(0, limit));
     } catch (err) {
       if (match.type === 'fts' && isFts5QueryError(err)) { ftsParseError = true; return []; }
       throw err;
@@ -269,17 +309,17 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
     return executeSearch({ type: 'like', terms: collectLikeTerms(query) });
   }
   const exactResults = executeSearch({ type: 'fts', query: normalizedQuery });
-  if (exactResults.length > 0) return exactResults;
+  if (exactResults.length > 0 || canonicalQueryMatched) return exactResults;
   if (hasExplicitFts5Operator(query)) {
     if (!ftsParseError) return exactResults;
     const nlQuery = normalizeNaturalLanguageFts5Query(query);
     if (nlQuery && nlQuery !== normalizedQuery) {
       const nlResults = executeSearch({ type: 'fts', query: nlQuery });
-      if (nlResults.length > 0) return nlResults;
+      if (nlResults.length > 0 || canonicalQueryMatched) return nlResults;
       const nlFallback = buildNaturalLanguageFallbackQuery(query);
       if (nlFallback && nlFallback !== nlQuery) {
         const fallbackResults = executeSearch({ type: 'fts', query: nlFallback });
-        if (fallbackResults.length > 0) return fallbackResults;
+        if (fallbackResults.length > 0 || canonicalQueryMatched) return fallbackResults;
       }
     }
     return executeSearch({ type: 'like', terms: collectLikeTerms(query) });
@@ -287,7 +327,7 @@ export function searchSessions(dbManager: DatabaseManager, query: string, option
   const fallbackQuery = buildFallbackFts5Query(query);
   if (fallbackQuery && fallbackQuery !== normalizedQuery) {
     const fallbackResults = executeSearch({ type: 'fts', query: fallbackQuery });
-    if (fallbackResults.length > 0) return fallbackResults;
+    if (fallbackResults.length > 0 || canonicalQueryMatched) return fallbackResults;
   }
   return executeSearch({ type: 'like', terms: collectLikeTerms(query) });
   } finally {
@@ -415,6 +455,7 @@ function canonicalEligibleForRow(row: { session_id: string }, options: SessionSe
  * checked against JSONL, then limited, so stale/live rows never consume slots.
  */
 export function searchSessionEvidence(dbManager: DatabaseManager, query: string, options: SessionSearchEvidenceOptions = {}): SessionSearchEvidenceOutcome {
+  assertSessionFilter(options.sessionId);
   dbManager.assertSessionEvidenceAvailable();
   if (!query.trim()) return { results: [], ambiguousSessionIds: [] };
   const normalized = normalizeFts5Query(query);
@@ -461,37 +502,41 @@ function searchSessionEvidenceMatch(
   // Session identity is stable. Mutable project/role/date facts are checked in JSONL.
   const filterSql = resolved.ids?.length ? `AND m.session_id IN (${resolved.ids.map(() => '?').join(',')})` : '';
   const filterParams = resolved.ids ?? [];
-  const window = options.sessionsDir ? { limit: limit * 20, hasMore: false } : undefined;
-  // Ownerless indexed rows cannot consume the bounded canonical candidate window.
-  let candidateRows: CandidateRow[];
+  const canonicalSearch = Boolean(options.sessionsDir);
+  const pageSize = canonicalSearch ? Math.max(64, limit * 4) : limit * 20;
+  const candidateKeyBudget = { remainingBytes: MAX_CANDIDATE_KEY_BYTES };
+  type CandidatePage = CandidateRow[];
   let canonicalMatch = initialMatch;
-  const canonicalOwnershipSql = options.sessionsDir
-    ? 'AND EXISTS (SELECT 1 FROM session_files sf WHERE sf.session_id = m.session_id)'
-    : '';
-  try {
-    candidateRows = readSearchCandidates(db, `
+  const canonicalOwnershipSql = canonicalSearch ? 'AND EXISTS (SELECT 1 FROM session_files sf WHERE sf.session_id = m.session_id)' : '';
+  const requestedEntries = new Map<string, Set<string>>();
+  const addRequested = (rows: CandidatePage): void => {
+    for (const row of rows) {
+      if (!requestedEntries.has(row.session_id)) requestedEntries.set(row.session_id, new Set());
+      requestedEntries.get(row.session_id)!.add(row.entry_id);
+    }
+  };
+  const fetchPage = (offset: number): CandidatePage => readSearchCandidates(db, `
       SELECT ${COMPACT_CANDIDATE_FIELDS}, bm25(message_fts) AS bm25_score
       FROM messages m JOIN sessions s ON s.id = m.session_id
       LEFT JOIN message_fts ON message_fts.rowid = m.rowid
       WHERE m.entry_id IS NOT NULL AND (m.rowid IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?) OR ${terms.length ? terms.map(() => 'm.content LIKE ? ESCAPE \'\\\'').join(' OR ') : '0'}) ${filterSql} ${canonicalOwnershipSql}
       ORDER BY CASE WHEN bm25(message_fts) IS NULL THEN 1 ELSE 0 END, bm25_score ASC, m.timestamp DESC, m.session_id ASC, m.entry_id ASC
-      LIMIT ?`, [canonicalMatch.type === 'fts' ? canonicalMatch.query : '""', ...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20 + (window ? 1 : 0)], false, false, window) as CandidateRow[];
+      LIMIT ?${canonicalSearch ? ' OFFSET ?' : ''}`, canonicalSearch ? [canonicalMatch.type === 'fts' ? canonicalMatch.query : '""', ...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, pageSize, offset] : [canonicalMatch.type === 'fts' ? canonicalMatch.query : '""', ...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, pageSize], false, false, undefined, candidateKeyBudget) as CandidatePage;
+  let candidateRows: CandidatePage;
+  try {
+    candidateRows = fetchPage(0);
   } catch (error) {
     if (!isFts5QueryError(error)) throw error;
     // Malformed MATCH expressions are untrusted input; use a bounded LIKE candidate scan.
     if (!terms.length) return { results: [], ambiguousSessionIds: [] };
     canonicalMatch = { type: 'like', terms };
     candidateRows = readSearchCandidates(db, `
-      SELECT ${COMPACT_CANDIDATE_FIELDS}, NULL AS bm25_score
+      SELECT ${COMPACT_CANDIDATE_FIELDS}
       FROM messages m JOIN sessions s ON s.id = m.session_id
       WHERE m.entry_id IS NOT NULL AND (${terms.map(() => 'm.content LIKE ? ESCAPE \'\\\'').join(' OR ')}) ${filterSql} ${canonicalOwnershipSql}
-      ORDER BY m.timestamp DESC, m.session_id ASC, m.entry_id ASC LIMIT ?`, [...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, limit * 20 + (window ? 1 : 0)], false, false, window) as CandidateRow[];
+      ORDER BY m.timestamp DESC, m.session_id ASC, m.entry_id ASC LIMIT ?${canonicalSearch ? ' OFFSET ?' : ''}`, canonicalSearch ? [...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, pageSize, 0] : [...terms.map(term => `%${escapeLikePattern(term)}%`), ...filterParams, pageSize], false, false, undefined, candidateKeyBudget) as CandidatePage;
   }
-  const requestedEntries = new Map<string, Set<string>>();
-  for (const row of candidateRows) {
-    if (!requestedEntries.has(row.session_id)) requestedEntries.set(row.session_id, new Set());
-    requestedEntries.get(row.session_id)!.add(row.entry_id);
-  }
+  addRequested(candidateRows);
   if (!candidateRows.length) return { results: [], ambiguousSessionIds: [] };
   const Sqlite = getDatabaseCtor(false);
   const verifier = new Sqlite(':memory:');
@@ -516,7 +561,6 @@ function searchSessionEvidenceMatch(
           return {
             ...entry, searchMatchesQuery,
             searchMatchesFilters: (!options.role || entry.role === options.role) && (!options.since || (entry.timestamp !== null && entry.timestamp >= options.since)),
-            // Ranking remains a bounded literal-term score, not indexed bm25.
             searchScore: Math.max(1, terms.reduce((sum, term) => sum + (entry.content.toLocaleLowerCase().includes(term.toLocaleLowerCase()) ? 1 : 0), 0)),
             content: safeSnippet(entry.content, query, snippetChars),
             timestamp: entry.timestamp === null ? null : truncateCodePoints(entry.timestamp, 200),
@@ -527,39 +571,43 @@ function searchSessionEvidenceMatch(
         },
       });
       return session ? boundSessionForSearch(session, options.project) : null;
-    }, sharedPinnedRoot);
+    }, sharedPinnedRoot, sessionId => requestedEntries.get(sessionId));
     const results: SessionSearchEvidence[] = [];
-    let rejectedByFilters = false;
     const hitsBySession = new Map<string, number>();
-    for (const row of candidateRows) {
-      if (!canonicalEligibleForRow(row, options)) { rejectedByFilters = true; continue; }
-      const evidence = canonicalEvidence(db, row.session_id, row.entry_id, options.sessionsDir, resolveCanonical);
-      // A stale owner is a rejected bounded candidate, not a query miss.
-      if (!evidence) { rejectedByFilters = true; continue; }
-      const canonical = evidence.entry as CanonicalSearchEntry;
-      const canonicalSession = evidence.session as CanonicalSearchSession;
-      if (!canonicalSession.searchMatchesProject || !canonical.searchMatchesFilters) { rejectedByFilters = true; continue; }
-      // A privacy exclusion is not a query miss and must not trigger another full scan.
-      if (canonical.searchMatchesQuery) queryState.matched = true;
-      // Privacy classification is derived from the current JSONL, never from
-      // stale SQLite kind/tool/name metadata.
-      const isTool = Boolean(canonical.toolName) || canonical.kind === 'tool_result' || canonical.kind === 'tool_call';
-      const isService = (canonical.kind !== 'message' && !isTool) || canonicalSession.searchIsService;
-      if (isService && !options.includeService) { rejectedByFilters = true; continue; }
-      if (isTool && !options.includeToolOutput) { rejectedByFilters = true; continue; }
-      // A literal ranking score cannot substitute for FTS operator evaluation.
-      if (!canonical.searchMatchesQuery) continue;
-      const sessionHits = hitsBySession.get(row.session_id) ?? 0;
-      if (sessionHits >= MAX_HITS_PER_SESSION) continue;
-      hitsBySession.set(row.session_id, sessionHits + 1);
-      results.push({
-        sessionId: row.session_id, entryId: row.entry_id, project: truncateCodePoints(canonicalSession.project, 1_000), cwd: truncateCodePoints(canonicalSession.cwd, 2_000), name: canonicalSession.name === null || canonicalSession.name === undefined ? null : truncateCodePoints(canonicalSession.name, 1_000),
-        role: canonical.role ?? row.role, kind: canonical.kind ?? row.kind, tool: canonical.toolName === null || canonical.toolName === undefined ? null : truncateCodePoints(canonical.toolName, 500), tool_call_id: canonical.toolCallId === null || canonical.toolCallId === undefined ? null : truncateCodePoints(canonical.toolCallId, 500), timestamp: canonical.timestamp ?? '',
-        snippet: canonical.content, score: canonical.searchScore, scoreMode: 'like',
-        anchor: `pi://session/${row.session_id}#entry=${row.entry_id}`,
-      });
+    const processRows = (rows: CandidatePage): void => {
+      for (const row of rows) {
+        if (!canonicalEligibleForRow(row, options)) continue;
+        const evidence = canonicalEvidence(db, row.session_id, row.entry_id, options.sessionsDir, resolveCanonical);
+        if (!evidence) continue;
+        const canonical = evidence.entry as CanonicalSearchEntry;
+        const canonicalSession = evidence.session as CanonicalSearchSession;
+        if (!canonicalSession.searchMatchesProject || !canonical.searchMatchesFilters) continue;
+        if (canonical.searchMatchesQuery) queryState.matched = true;
+        // Privacy classification is derived from the current JSONL, never from stale SQLite metadata.
+        const isTool = Boolean(canonical.toolName) || canonical.kind === 'tool_result' || canonical.kind === 'tool_call';
+        const isService = (canonical.kind !== 'message' && !isTool) || canonicalSession.searchIsService;
+        if (isService && !options.includeService) continue;
+        if (isTool && !options.includeToolOutput) continue;
+        if (!canonical.searchMatchesQuery) continue;
+        const sessionHits = hitsBySession.get(row.session_id) ?? 0;
+        if (sessionHits >= MAX_HITS_PER_SESSION) continue;
+        hitsBySession.set(row.session_id, sessionHits + 1);
+        results.push({
+          sessionId: row.session_id, entryId: row.entry_id, project: truncateCodePoints(canonicalSession.project, 1_000), cwd: truncateCodePoints(canonicalSession.cwd, 2_000), name: canonicalSession.name === null || canonicalSession.name === undefined ? null : truncateCodePoints(canonicalSession.name, 1_000),
+          role: canonical.role ?? row.role, kind: canonical.kind ?? row.kind, tool: canonical.toolName === null || canonical.toolName === undefined ? null : truncateCodePoints(canonical.toolName, 500), tool_call_id: canonical.toolCallId === null || canonical.toolCallId === undefined ? null : truncateCodePoints(canonical.toolCallId, 500), timestamp: canonical.timestamp ?? '',
+          snippet: canonical.content, score: canonical.searchScore, scoreMode: 'like', anchor: `pi://session/${row.session_id}#entry=${row.entry_id}`,
+        });
+      }
+    };
+    processRows(candidateRows);
+    let offset = candidateRows.length;
+    while (canonicalSearch && candidateRows.length === pageSize && results.length < limit) {
+      candidateRows = fetchPage(offset);
+      if (!candidateRows.length) break;
+      addRequested(candidateRows);
+      processRows(candidateRows);
+      offset += candidateRows.length;
     }
-    if (window?.hasMore && rejectedByFilters && results.length < limit) throw new SessionSearchReadLimitError();
     results.sort((a, b) => b.score - a.score || b.timestamp.localeCompare(a.timestamp) || a.sessionId.localeCompare(b.sessionId) || a.entryId.localeCompare(b.entryId));
     return { results: results.slice(0, limit), ambiguousSessionIds: [] };
   } finally {

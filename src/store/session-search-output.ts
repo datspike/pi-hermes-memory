@@ -5,8 +5,11 @@ import type { SessionAnchorSearchResult } from './session-anchor-search.js';
 export interface SessionSearchToolResult {
   content: Array<{ type: 'text'; text: string }>;
   details: Record<string, unknown>;
+  isError?: boolean;
 }
-const textResult = (text: string, details: Record<string, unknown>): SessionSearchToolResult => ({ content: [{ type: 'text', text }], details });
+const textResult = (text: string, details: Record<string, unknown>): SessionSearchToolResult => ({
+  content: [{ type: 'text', text }], details, ...(details.success === false ? { isError: true } : {}),
+});
 const MAX_LEGACY_OUTPUT_CHARS = 50 * 1024;
 
 function capLegacyOutput(text: string): { text: string; truncated: boolean } {

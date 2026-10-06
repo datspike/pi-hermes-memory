@@ -143,6 +143,7 @@ test('child-side evidence availability errors retain the public error contract',
       registerSessionSearchTool({ registerTool: (definition: any) => { tool = definition; } } as any, parentWithoutGate as any, { variant }, { sessionsDir: f.root });
       const result = await tool.execute('unavailable', { query: 'needle' });
       assert.deepEqual(result.details, { success: false, error: 'session_evidence_unavailable' });
+      assert.equal(result.isError, true);
       assert.equal(result.content[0].text, JSON.stringify(result.details));
     }
   } finally { f.cleanup(); }

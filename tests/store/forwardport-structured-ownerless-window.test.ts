@@ -39,23 +39,22 @@ test('structured scoped search does not let ownerless rows hide a canonical hit'
   }
 });
 
-test('structured scoped search rejects stale owners that exhaust the bounded window', () => {
-  const { root, manager } = createCanonicalFixture();
+test('structured scoped search skips stale owners and returns the canonical hit', () => {
+  const { root, manager, id } = createCanonicalFixture();
   try {
     manager.getDb().prepare(
       'INSERT INTO session_files (path, session_id, size, mtime_ms, indexed_at) VALUES (?, ?, ?, ?, ?)',
     ).run(path.join(root, 'missing.jsonl'), 'ownerless-session', 1, 1, new Date().toISOString());
-    assert.throws(
-      () => searchSessionEvidence(manager, 'needle', { sessionsDir: root, project: 'owned', limit: 1 }),
-      error => error instanceof Error && error.name === 'SessionSearchReadLimitError',
-    );
+    const outcome = searchSessionEvidence(manager, 'needle', { sessionsDir: root, project: 'owned', limit: 1 });
+    assert.equal(outcome.results.length, 1);
+    assert.equal(outcome.results[0].sessionId, id);
   } finally {
     manager.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('legacy scoped search rejects removed stale owners instead of hiding a canonical hit', async () => {
+test('legacy scoped search skips removed stale owners and returns the canonical hit', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-stale-window-'));
   const manager = new DatabaseManager(root);
   const canonicalId = 'canonical-session';
@@ -78,21 +77,11 @@ test('legacy scoped search rejects removed stale owners instead of hiding a cano
       indexLiveSession(manager, { getHeader: () => ({ id, cwd: '/work/owned', timestamp: '2026-09-30T00:00:00Z' }), getEntries: () => [], getSessionFile: () => file }, root);
     }
     for (const file of staleFiles) fs.rmSync(file);
-
-    assert.throws(
-      () => searchSessions(manager, 'needle', { sessionsDir: root, limit: 1 }),
-      error => error instanceof Error && error.name === 'SessionSearchReadLimitError',
-    );
-
-    await assert.rejects(
-      runSessionSearch({ mode: 'legacy', dbPath: manager.getPath(), query: 'needle', options: { sessionsDir: root, limit: 1 } }),
-      error => error instanceof Error && error.name === 'SessionSearchReadLimitError',
-    );
-
-    await assert.rejects(
-      runSessionSearch({ mode: 'structured', dbPath: manager.getPath(), query: 'needle', options: { sessionsDir: root, limit: 1 } }),
-      error => error instanceof Error && error.name === 'SessionSearchReadLimitError',
-    );
+    assert.equal(searchSessions(manager, 'needle', { sessionsDir: root, limit: 1 })[0].sessionId, canonicalId);
+    const legacy = await runSessionSearch({ mode: 'legacy', dbPath: manager.getPath(), query: 'needle', options: { sessionsDir: root, limit: 1 } });
+    assert.equal(legacy.details.count, 1);
+    const structured = await runSessionSearch({ mode: 'structured', dbPath: manager.getPath(), query: 'needle', options: { sessionsDir: root, limit: 1 } });
+    assert.equal(structured.details.count, 1);
   } finally {
     manager.close();
     fs.rmSync(root, { recursive: true, force: true });
